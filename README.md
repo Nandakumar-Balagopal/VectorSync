@@ -329,6 +329,13 @@ your local `~/.m2` cache.
 ./scripts/start-local.sh
 ```
 
+If Postgres, MinIO, and the embedding service are already running locally, skip
+Docker startup entirely:
+
+```bash
+./scripts/start-local.sh --no-infra
+```
+
 This avoids re-downloading Maven dependencies inside Docker on every Java edit.
 
 * * *

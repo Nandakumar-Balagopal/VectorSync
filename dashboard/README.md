@@ -22,6 +22,12 @@ From the repo root, start the backend:
 ./scripts/start-local.sh
 ```
 
+If local infra is already running, use:
+
+```bash
+./scripts/start-local.sh --no-infra
+```
+
 Then start the dashboard:
 
 ```bash
