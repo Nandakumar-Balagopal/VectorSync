@@ -1,0 +1,285 @@
+@use '@carbon/react/scss/spacing' as *;
+@use '@carbon/react/scss/theme' as *;
+@use '@carbon/react/scss/type' as *;
+
+.semantic-search {
+  padding: $spacing-06;
+  max-width: 1600px;
+  margin: 0 auto;
+
+  &__header {
+    margin-bottom: $spacing-07;
+
+    h1 {
+      @include type-style('heading-05');
+      margin-bottom: $spacing-03;
+      color: $text-primary;
+    }
+
+    p {
+      @include type-style('body-01');
+      color: $text-secondary;
+    }
+  }
+
+  &__controls {
+    background: $layer-01;
+    padding: $spacing-05;
+    border-radius: 4px;
+    margin-bottom: $spacing-06;
+  }
+
+  &__input-section {
+    display: flex;
+    flex-direction: column;
+    gap: $spacing-05;
+  }
+
+  &__query-row {
+    display: flex;
+    gap: $spacing-05;
+    align-items: flex-end;
+  }
+
+  &__query-input {
+    flex: 1;
+  }
+
+  &__search-btn {
+    min-width: 140px;
+    height: 40px;
+  }
+
+  &__options-row {
+    display: flex;
+    gap: $spacing-05;
+    align-items: flex-end;
+    flex-wrap: wrap;
+  }
+
+  &__dropdown {
+    min-width: 200px;
+  }
+
+  &__toggle {
+    display: flex;
+    flex-direction: column;
+    gap: $spacing-03;
+  }
+
+  &__notification {
+    margin-bottom: $spacing-05;
+  }
+
+  &__loading {
+    display: flex;
+    justify-content: center;
+    padding: $spacing-09;
+  }
+
+  &__results {
+    background: $layer-01;
+    border-radius: 4px;
+    padding: $spacing-05;
+  }
+
+  &__results-header {
+    margin-bottom: $spacing-05;
+    padding-bottom: $spacing-05;
+    border-bottom: 1px solid $border-subtle-01;
+  }
+
+  &__results-stats {
+    h2 {
+      @include type-style('heading-04');
+      margin-bottom: $spacing-04;
+      color: $text-primary;
+    }
+  }
+
+  &__stats-row {
+    display: flex;
+    gap: $spacing-03;
+    flex-wrap: wrap;
+  }
+
+  &__debug {
+    margin-bottom: $spacing-05;
+  }
+
+  &__debug-content {
+    display: flex;
+    flex-direction: column;
+    gap: $spacing-05;
+    padding: $spacing-04;
+    background: $layer-02;
+    border-radius: 4px;
+  }
+
+  &__debug-section {
+    h4 {
+      @include type-style('heading-01');
+      margin-bottom: $spacing-03;
+      color: $text-primary;
+    }
+
+    pre {
+      @include type-style('code-01');
+      background: $layer-03;
+      padding: $spacing-04;
+      border-radius: 4px;
+      overflow-x: auto;
+      color: $text-primary;
+    }
+
+    p {
+      @include type-style('body-01');
+      color: $text-secondary;
+    }
+  }
+
+  &__text-cell {
+    max-width: 500px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &__metadata {
+    @include type-style('code-01');
+    background: $layer-02;
+    padding: $spacing-03;
+    border-radius: 4px;
+    margin: 0;
+    font-size: 11px;
+    max-width: 300px;
+    overflow-x: auto;
+  }
+
+  &__metadata-compact {
+    @include type-style('label-01');
+    color: $text-secondary;
+  }
+
+  &__no-results {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: $spacing-09;
+    text-align: center;
+
+    svg {
+      color: $icon-secondary;
+      margin-bottom: $spacing-05;
+    }
+
+    h3 {
+      @include type-style('heading-03');
+      margin-bottom: $spacing-03;
+      color: $text-primary;
+    }
+
+    p {
+      @include type-style('body-01');
+      color: $text-secondary;
+    }
+  }
+
+  &__empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: $spacing-09;
+    text-align: center;
+    background: $layer-01;
+    border-radius: 4px;
+    min-height: 400px;
+
+    svg {
+      color: $icon-secondary;
+      margin-bottom: $spacing-06;
+    }
+
+    h3 {
+      @include type-style('heading-04');
+      margin-bottom: $spacing-03;
+      color: $text-primary;
+    }
+
+    p {
+      @include type-style('body-01');
+      color: $text-secondary;
+      margin-bottom: $spacing-06;
+    }
+  }
+
+  &__tips {
+    background: $layer-02;
+    padding: $spacing-05;
+    border-radius: 4px;
+    text-align: left;
+    max-width: 600px;
+
+    h4 {
+      @include type-style('heading-02');
+      margin-bottom: $spacing-04;
+      color: $text-primary;
+    }
+
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+
+      li {
+        @include type-style('body-01');
+        color: $text-secondary;
+        padding-left: $spacing-05;
+        margin-bottom: $spacing-03;
+        position: relative;
+
+        &::before {
+          content: '•';
+          position: absolute;
+          left: 0;
+          color: $icon-secondary;
+        }
+
+        &:last-child {
+          margin-bottom: 0;
+        }
+      }
+    }
+  }
+}
+
+// Responsive adjustments
+@media (max-width: 768px) {
+  .semantic-search {
+    &__query-row {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    &__search-btn {
+      width: 100%;
+    }
+
+    &__options-row {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    &__dropdown {
+      width: 100%;
+    }
+
+    &__text-cell {
+      max-width: 200px;
+    }
+  }
+}
+
+// Made with Bob

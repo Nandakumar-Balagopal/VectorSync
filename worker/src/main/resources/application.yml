@@ -1,0 +1,60 @@
+spring:
+  application:
+    name: ${APP_NAME:vectorsync-worker}
+
+server:
+  port: ${SERVER_PORT:8081}
+  servlet:
+    context-path: /
+
+worker:
+  sync:
+    interval: ${WORKER_SYNC_INTERVAL_MS:30000}
+
+embedding:
+  provider: ${EMBEDDING_PROVIDER:mock}
+  external:
+    type: ${EMBEDDING_EXTERNAL_TYPE:gemini}
+    api-url: ${EMBEDDING_EXTERNAL_API_URL:}
+    api-key: ${EMBEDDING_EXTERNAL_API_KEY:}
+    model: ${EMBEDDING_EXTERNAL_MODEL:}
+    timeout-ms: ${EMBEDDING_EXTERNAL_TIMEOUT_MS:10000}
+    http:
+      api-key-header: ${EMBEDDING_EXTERNAL_HTTP_API_KEY_HEADER:}
+      api-key-prefix: ${EMBEDDING_EXTERNAL_HTTP_API_KEY_PREFIX:}
+      request-template: ${EMBEDDING_EXTERNAL_HTTP_REQUEST_TEMPLATE:}
+      response-json-pointer: ${EMBEDDING_EXTERNAL_HTTP_RESPONSE_JSON_POINTER:}
+  local:
+    model-path: ${EMBEDDING_LOCAL_MODEL_PATH:}
+    model-name: ${EMBEDDING_LOCAL_MODEL_NAME:local-embedding-v1}
+
+control:
+  api:
+    url: ${CONTROL_API_URL}
+
+iceberg:
+  catalog:
+    type: ${ICEBERG_CATALOG_TYPE:hadoop}
+    warehouse: ${ICEBERG_CATALOG_WAREHOUSE}
+  vector:
+    namespace: ${ICEBERG_VECTOR_NAMESPACE:vector}
+  s3:
+    endpoint: ${AWS_S3_ENDPOINT}
+    access-key: ${AWS_S3_ACCESS_KEY}
+    secret-key: ${AWS_S3_SECRET_KEY}
+
+aws:
+  s3:
+    endpoint: ${AWS_S3_ENDPOINT}
+    access-key: ${AWS_S3_ACCESS_KEY}
+    secret-key: ${AWS_S3_SECRET_KEY}
+    path-style-access: ${AWS_S3_PATH_STYLE_ACCESS:true}
+    region: ${AWS_REGION}
+
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    io:
+      vectorsync: ${LOG_LEVEL_APP:DEBUG}
+  pattern:
+    console: ${LOG_PATTERN_CONSOLE:%d{yyyy-MM-dd HH:mm:ss} - %msg%n}

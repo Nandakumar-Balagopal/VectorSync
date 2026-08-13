@@ -1,0 +1,58 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: embedding-worker
+
+# Embedding Provider Configuration
+embedding:
+  provider: mock  # Options: mock, external
+  external:
+    type: gemini  # Options: openai, gemini, http
+    api-url: ${EMBEDDING_API_URL:}
+    api-key: ${EMBEDDING_API_KEY:}
+    model: ${EMBEDDING_MODEL:gemini-embedding-001}
+    # For custom HTTP providers
+    http:
+      api-key-header: ${EMBEDDING_HTTP_API_KEY_HEADER:}
+      api-key-prefix: ${EMBEDDING_HTTP_API_KEY_PREFIX:}
+      request-template: ${EMBEDDING_HTTP_REQUEST_TEMPLATE:}
+      response-json-pointer: ${EMBEDDING_HTTP_RESPONSE_JSON_POINTER:}
+
+# Iceberg Configuration
+iceberg:
+  catalog:
+    type: hadoop
+    warehouse: ${ICEBERG_CATALOG_WAREHOUSE:s3a://warehouse/iceberg}
+  vector:
+    namespace: vector
+
+# AWS/MinIO Configuration
+aws:
+  s3:
+    endpoint: ${AWS_S3_ENDPOINT:http://localhost:9000}
+    access-key: ${AWS_ACCESS_KEY_ID:minioadmin}
+    secret-key: ${AWS_SECRET_ACCESS_KEY:minioadmin}
+    region: ${AWS_REGION:us-east-1}
+    path-style-access: true
+
+# Worker Configuration
+worker:
+  id: ${WORKER_ID:embedding-worker-1}
+  batch-size: ${WORKER_BATCH_SIZE:100}
+  poll-interval: ${WORKER_POLL_INTERVAL:30000}
+
+# TODO: Kafka Consumer Configuration (for future event-driven architecture)
+# kafka:
+#   bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+#   consumer:
+#     group-id: embedding-worker-group
+#     topics:
+#       cdc-events: cdc-events
+#     auto-offset-reset: earliest
+
+logging:
+  level:
+    io.vectorsync: INFO
+    org.apache.iceberg: WARN

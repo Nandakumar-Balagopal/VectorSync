@@ -1,0 +1,47 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+
+# Build
+build/
+dist/
+*.jar
+*.war
+*.ear
+
+# Logs
+logs/
+*.log
+
+# Environment
+.env
+.env.local
+*.properties.local
+
+# Docker
+docker-compose.override.yml
+
+# IDE project files
+*.iml
+*.iws
+*.ipr
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Project specific
+.claude/

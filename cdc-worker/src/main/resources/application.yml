@@ -1,0 +1,38 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: cdc-worker
+
+# Iceberg Configuration
+iceberg:
+  catalog:
+    type: hadoop
+    warehouse: ${ICEBERG_CATALOG_WAREHOUSE:s3a://warehouse/iceberg}
+  vector:
+    namespace: vector
+
+# AWS/MinIO Configuration
+aws:
+  s3:
+    endpoint: ${AWS_S3_ENDPOINT:http://localhost:9000}
+    access-key: ${AWS_ACCESS_KEY_ID:minioadmin}
+    secret-key: ${AWS_SECRET_ACCESS_KEY:minioadmin}
+    region: ${AWS_REGION:us-east-1}
+    path-style-access: true
+
+# Control Plane Configuration
+control-plane:
+  url: ${CONTROL_PLANE_URL:http://localhost:8080}
+
+# Worker Configuration
+worker:
+  id: ${WORKER_ID:cdc-worker-1}
+  poll-interval: ${WORKER_POLL_INTERVAL:30000}
+  heartbeat-interval: ${WORKER_HEARTBEAT_INTERVAL:15000}
+
+logging:
+  level:
+    io.vectorsync: INFO
+    org.apache.iceberg: WARN

@@ -1,0 +1,252 @@
+@use '@carbon/react/scss/spacing' as *;
+
+.semantic-playground {
+  background: #393939 !important;
+  border: 1px solid var(--cds-border-subtle-01, #525252);
+  padding: $spacing-06;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.playground-header {
+  h3 {
+    margin: 0 0 $spacing-02;
+    color: var(--cds-text-primary, #f4f4f4);
+  }
+
+  .subtitle {
+    margin: 0;
+    color: var(--cds-text-secondary, #c6c6c6);
+    font-size: 0.875rem;
+  }
+}
+
+.search-container {
+  display: flex;
+  gap: $spacing-05; // 16px between search and button
+  align-items: stretch;
+  margin-bottom: $spacing-06;
+
+  .cds--search {
+    flex: 1; // Make search bar take all available space
+    min-width: 300px; // Ensure minimum width
+    max-width: 100%; // Allow it to grow
+    background: var(--cds-field-01, #262626) !important;
+    border: 1px solid var(--cds-border-subtle-01, #525252);
+    border-radius: 0;
+    transition: all 0.2s ease;
+
+    &:hover {
+      border-color: var(--cds-border-strong-01, #6f6f6f);
+    }
+
+    &:focus-within {
+      outline: 2px solid var(--cds-focus, #0f62fe);
+      outline-offset: -2px;
+      border-color: var(--cds-focus, #0f62fe);
+    }
+
+    .cds--search-input {
+      color: var(--cds-text-primary, #f4f4f4) !important;
+      font-size: 1rem; // Larger text
+      padding: $spacing-05 $spacing-06; // 16px 24px - more padding
+      height: 48px; // Match button height
+      background: transparent;
+      border-radius: 0 !important;
+
+      &::placeholder {
+        color: var(--cds-text-placeholder, #6f6f6f);
+        font-size: 0.875rem;
+      }
+
+      &:focus {
+        outline: none; // Handled by parent
+      }
+    }
+
+    .cds--search-magnifier-icon {
+      fill: var(--cds-icon-secondary, #c6c6c6);
+      width: 20px;
+      height: 20px;
+    }
+
+    .cds--search-close {
+      &:hover {
+        background: var(--cds-layer-hover-02, #4c4c4c);
+      }
+    }
+  }
+}
+
+// Style the "Run Search" button - hide text, show only icon initially
+.search-action {
+  flex-shrink: 0;
+  
+  // Hide text label, show only icon initially
+  .cds--btn__icon {
+    margin-right: 0;
+    transition: margin-right 0.2s ease 3s;
+  }
+  
+  // Visually hide text but keep for accessibility
+  font-size: 0;
+  line-height: 0;
+  transition: font-size 0.2s ease 3s, line-height 0.2s ease 3s, padding 0.2s ease 3s;
+  
+  // Ensure icon is visible
+  svg {
+    font-size: 1rem;
+  }
+  
+  // Reveal text after 3 seconds of hover
+  &:hover {
+    font-size: 0.875rem;
+    line-height: 1.29;
+    padding: 0 $spacing-05;
+    
+    .cds--btn__icon {
+      margin-right: $spacing-03;
+    }
+  }
+}
+
+.results-container {
+  margin-top: $spacing-06;
+  overflow-y: auto;
+  min-height: 320px;
+}
+
+.loading-state,
+.empty-state,
+.initial-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  text-align: center;
+  padding: $spacing-08 $spacing-06;
+  color: var(--cds-text-secondary, #c6c6c6);
+
+  svg {
+    margin-bottom: $spacing-05;
+    opacity: 0.7;
+  }
+
+  p {
+    margin: 0 0 $spacing-02;
+    color: var(--cds-text-primary, #f4f4f4);
+  }
+
+  span {
+    font-size: 0.875rem;
+  }
+}
+
+.spinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid var(--cds-border-subtle-01, #525252);
+  border-top-color: var(--cds-interactive, #0f62fe);
+  border-radius: 50%;
+  margin-bottom: $spacing-05;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.results-list {
+  display: flex;
+  flex-direction: column;
+  gap: $spacing-05;
+}
+
+.results-header {
+  margin-bottom: $spacing-02;
+
+  .results-count {
+    color: var(--cds-text-secondary, #c6c6c6);
+    font-size: 0.875rem;
+  }
+}
+
+.result-card {
+  background: #262626 !important;
+  border: 1px solid var(--cds-border-subtle-01, #525252);
+  text-decoration: none;
+  color: inherit;
+  border-radius: 0;
+
+  &:hover {
+    background: var(--cds-layer-hover-01, #353535);
+    border-color: var(--cds-border-strong-01, #6f6f6f);
+  }
+
+  .result-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: $spacing-04;
+    margin-bottom: $spacing-04;
+  }
+
+  .result-title {
+    color: var(--cds-text-primary, #f4f4f4);
+    font-size: 0.875rem;
+  }
+
+  .result-meta {
+    display: flex;
+    align-items: center;
+    gap: $spacing-04;
+    margin-bottom: $spacing-04;
+  }
+
+  .result-id {
+    font-size: 0.75rem;
+    color: var(--cds-text-secondary, #c6c6c6);
+  }
+
+  .result-content {
+    font-size: 0.875rem;
+    line-height: 1.5;
+    color: var(--cds-text-secondary, #c6c6c6);
+    margin-bottom: $spacing-04;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .result-metadata {
+    border-top: 1px solid var(--cds-border-subtle-01, #525252);
+    padding-top: $spacing-04;
+    display: flex;
+    flex-direction: column;
+    gap: $spacing-03;
+  }
+
+  .metadata-item {
+    display: flex;
+    gap: $spacing-03;
+    font-size: 0.75rem;
+  }
+
+  .metadata-key {
+    color: var(--cds-text-secondary, #c6c6c6);
+  }
+
+  .metadata-value {
+    color: var(--cds-text-primary, #f4f4f4);
+  }
+}
+
+@media (max-width: 672px) {
+  .search-container {
+    grid-template-columns: 1fr;
+  }
+}

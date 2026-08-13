@@ -1,0 +1,274 @@
+@use '@carbon/react/scss/spacing' as *;
+@use '@carbon/react/scss/theme' as *;
+@use '@carbon/react/scss/type' as *;
+
+.table-details {
+  padding: $spacing-06;
+  max-width: 1600px;
+  margin: 0 auto;
+
+  .cds--breadcrumb {
+    margin-bottom: $spacing-05;
+  }
+
+  .page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: $spacing-07;
+    padding-bottom: $spacing-05;
+    border-bottom: 1px solid $border-subtle-01;
+
+    .header-content {
+      flex: 1;
+
+      .title-section {
+        margin-top: $spacing-03;
+
+        h1 {
+          @include type-style('productive-heading-05');
+          margin-bottom: $spacing-03;
+          font-family: 'IBM Plex Mono', monospace;
+        }
+
+        .header-tags {
+          display: flex;
+          gap: $spacing-03;
+        }
+      }
+    }
+
+    .header-actions {
+      display: flex;
+      gap: $spacing-03;
+    }
+  }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: $spacing-05;
+    margin-bottom: $spacing-07;
+
+    .stat-card {
+      background: $layer-01;
+      border: 1px solid $border-subtle-01;
+      border-radius: 4px;
+      padding: $spacing-05;
+
+      .stat-label {
+        @include type-style('label-01');
+        color: $text-secondary;
+        text-transform: uppercase;
+        margin-bottom: $spacing-02;
+      }
+
+      .stat-value {
+        @include type-style('productive-heading-05');
+        margin-bottom: $spacing-02;
+      }
+
+      .stat-description {
+        @include type-style('helper-text-01');
+        color: $text-secondary;
+      }
+    }
+  }
+
+  .cds--tabs {
+    margin-top: $spacing-06;
+  }
+
+  .timeline-panel,
+  .embedding-panel,
+  .index-panel,
+  .config-panel {
+    padding: $spacing-06 0;
+
+    h3 {
+      @include type-style('productive-heading-03');
+      margin-bottom: $spacing-03;
+    }
+
+    .panel-description {
+      @include type-style('body-01');
+      color: $text-secondary;
+      margin-bottom: $spacing-06;
+    }
+  }
+
+  .timeline {
+    position: relative;
+    padding-left: $spacing-07;
+
+    &::before {
+      content: '';
+      position: absolute;
+      left: 8px;
+      top: 0;
+      bottom: 0;
+      width: 2px;
+      background: $border-subtle-01;
+    }
+
+    .timeline-event {
+      position: relative;
+      margin-bottom: $spacing-06;
+      padding: $spacing-05;
+      background: $layer-01;
+      border: 1px solid $border-subtle-01;
+      border-radius: 4px;
+
+      &.processed {
+        border-left: 3px solid $support-success;
+      }
+
+      &.pending {
+        border-left: 3px solid $support-warning;
+      }
+
+      .event-marker {
+        position: absolute;
+        left: calc(-1 * $spacing-07 - 4px);
+        top: $spacing-05;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: $layer-01;
+        border: 2px solid $border-strong-01;
+      }
+
+      .event-content {
+        .event-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: $spacing-03;
+
+          .event-type {
+            @include type-style('label-01');
+            font-weight: 600;
+          }
+
+          .event-count {
+            @include type-style('body-compact-01');
+            color: $text-secondary;
+          }
+        }
+
+        .event-time {
+          @include type-style('helper-text-01');
+          color: $text-secondary;
+          margin-bottom: $spacing-03;
+        }
+      }
+    }
+  }
+
+  .embedding-stats {
+    .progress-section {
+      background: $layer-01;
+      padding: $spacing-05;
+      border-radius: 4px;
+      margin-bottom: $spacing-05;
+
+      .progress-header {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: $spacing-03;
+        @include type-style('label-01');
+      }
+
+      .progress-details {
+        display: flex;
+        justify-content: space-between;
+        margin-top: $spacing-03;
+        @include type-style('helper-text-01');
+        color: $text-secondary;
+      }
+    }
+
+    .embedding-metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: $spacing-05;
+      margin-bottom: $spacing-05;
+
+      .metric {
+        background: $layer-01;
+        padding: $spacing-05;
+        border-radius: 4px;
+        border: 1px solid $border-subtle-01;
+
+        .metric-label {
+          @include type-style('label-01');
+          color: $text-secondary;
+          margin-bottom: $spacing-02;
+        }
+
+        .metric-value {
+          @include type-style('productive-heading-04');
+
+          &.success {
+            color: $support-success;
+          }
+
+          &.warning {
+            color: $support-warning;
+          }
+
+          &.error {
+            color: $support-error;
+          }
+        }
+      }
+    }
+
+    .last-embedding {
+      @include type-style('helper-text-01');
+      color: $text-secondary;
+      text-align: center;
+    }
+  }
+
+  .index-stats,
+  .config-details {
+    background: $layer-01;
+    padding: $spacing-05;
+    border-radius: 4px;
+
+    .stat-row,
+    .config-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: $spacing-04 0;
+      border-bottom: 1px solid $border-subtle-01;
+
+      &:last-child {
+        border-bottom: none;
+      }
+
+      .stat-label,
+      .config-label {
+        @include type-style('body-01');
+        color: $text-secondary;
+      }
+
+      .stat-value,
+      .config-value {
+        @include type-style('body-compact-01');
+        font-weight: 600;
+      }
+
+      .config-value {
+        font-family: 'IBM Plex Mono', monospace;
+        background: $layer-02;
+        padding: $spacing-02 $spacing-03;
+        border-radius: 2px;
+      }
+    }
+  }
+}
+
+// Made with Bob

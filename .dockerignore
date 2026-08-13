@@ -1,0 +1,6 @@
+**/target
+dashboard/node_modules
+dashboard/dist
+embedding-service/venv
+.git
+.codex-docker-config

@@ -1,0 +1,188 @@
+@use '@carbon/react/scss/spacing' as *;
+@use '@carbon/react/scss/theme' as *;
+@use '@carbon/react/scss/type' as *;
+
+.alerts {
+  padding: $spacing-06;
+  max-width: 1600px;
+  margin: 0 auto;
+
+  &__notification {
+    position: fixed;
+    top: $spacing-09;
+    right: $spacing-05;
+    z-index: 9999;
+    max-width: 400px;
+  }
+
+  &__header {
+    margin-bottom: $spacing-07;
+
+    h1 {
+      @include type-style('heading-05');
+      margin-bottom: $spacing-03;
+      color: $text-primary;
+    }
+
+    p {
+      @include type-style('body-01');
+      color: $text-secondary;
+    }
+  }
+
+  &__stats {
+    margin-bottom: $spacing-07;
+  }
+
+  &__stat-card {
+    display: flex;
+    align-items: center;
+    gap: $spacing-04;
+    padding: $spacing-05;
+    min-height: 100px;
+
+    .stat-icon {
+      color: $icon-primary;
+    }
+
+    .stat-content {
+      flex: 1;
+
+      h3 {
+        @include type-style('heading-04');
+        color: $text-primary;
+        margin-bottom: $spacing-02;
+      }
+
+      p {
+        @include type-style('label-01');
+        color: $text-secondary;
+      }
+    }
+
+    &.unacknowledged {
+      border-left: 4px solid $support-warning;
+
+      .stat-icon {
+        color: $support-warning;
+      }
+    }
+
+    &.critical {
+      border-left: 4px solid $support-error;
+    }
+
+    &.warning {
+      border-left: 4px solid $support-warning;
+    }
+
+    &.info {
+      border-left: 4px solid $support-info;
+    }
+  }
+
+  .cds--tabs {
+    margin-bottom: $spacing-05;
+  }
+
+  .severity-cell {
+    display: flex;
+    align-items: center;
+    gap: $spacing-03;
+  }
+
+  .severity-icon {
+    &.critical {
+      fill: $support-error;
+    }
+
+    &.warning {
+      fill: $support-warning;
+    }
+
+    &.info {
+      fill: $support-info;
+    }
+  }
+
+  .message-cell {
+    @include type-style('body-01');
+    color: $text-primary;
+    max-width: 500px;
+  }
+
+  .empty-state {
+    padding: $spacing-09;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: $spacing-04;
+
+    .empty-icon {
+      fill: $support-success;
+      opacity: 0.5;
+    }
+
+    p {
+      @include type-style('heading-03');
+      color: $text-primary;
+      margin: 0;
+    }
+
+    span {
+      @include type-style('body-01');
+      color: $text-secondary;
+    }
+  }
+
+  // Row styling based on acknowledgment status
+  .cds--data-table tbody tr {
+    &.unacknowledged {
+      background: rgba($support-warning, 0.05);
+      border-left: 3px solid $support-warning;
+    }
+
+    &.acknowledged {
+      opacity: 0.7;
+    }
+  }
+
+  // Carbon component overrides
+  .cds--data-table-container {
+    margin-top: $spacing-05;
+  }
+
+  .cds--tab-content {
+    padding: 0;
+  }
+
+  .cds--inline-notification {
+    max-width: 100%;
+  }
+}
+
+// Responsive adjustments
+@media (max-width: 768px) {
+  .alerts {
+    &__stat-card {
+      flex-direction: column;
+      text-align: center;
+    }
+
+    &__notification {
+      right: $spacing-03;
+      left: $spacing-03;
+      max-width: none;
+    }
+
+    .message-cell {
+      max-width: 200px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  }
+}
+
+// Made with Bob

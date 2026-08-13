@@ -1,0 +1,211 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: vectorsync-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deployment/config/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - vectorsync-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: vectorsync-minio
+    profiles:
+      - local-storage  # Only start if using local MinIO
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - vectorsync-network
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  embedding-service:
+    build:
+      context: ./embedding-service
+      dockerfile: Dockerfile
+    container_name: vectorsync-embedding
+    profiles:
+      - local-embedding  # Only start if using local embedding service
+    ports:
+      - "8000:8000"
+    networks:
+      - vectorsync-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/api/v1/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  # Control Plane - Metadata management, table registration, scheduler
+  control-plane:
+    build:
+      context: .
+      dockerfile: deployment/Dockerfile.control-plane
+    container_name: vectorsync-control-plane
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD}
+      ICEBERG_CATALOG_WAREHOUSE: ${ICEBERG_CATALOG_WAREHOUSE}
+      ICEBERG_VECTOR_NAMESPACE: ${ICEBERG_VECTOR_NAMESPACE}
+      AWS_S3_ENDPOINT: ${AWS_S3_ENDPOINT}
+      AWS_S3_ACCESS_KEY: ${AWS_S3_ACCESS_KEY}
+      AWS_S3_SECRET_KEY: ${AWS_S3_SECRET_KEY}
+      AWS_S3_PATH_STYLE_ACCESS: ${AWS_S3_PATH_STYLE_ACCESS}
+      AWS_REGION: ${AWS_REGION}
+      AWS_DEFAULT_REGION: ${AWS_REGION}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - vectorsync-network
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/8080'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Worker - Iceberg snapshot polling, embedding generation, and vector writes
+  worker:
+    build:
+      context: .
+      dockerfile: deployment/Dockerfile.worker
+    container_name: vectorsync-worker
+    ports:
+      - "8081:8081"
+    environment:
+      CONTROL_API_URL: ${CONTROL_API_URL:-http://control-plane:8080}
+      ICEBERG_CATALOG_WAREHOUSE: ${ICEBERG_CATALOG_WAREHOUSE}
+      ICEBERG_VECTOR_NAMESPACE: ${ICEBERG_VECTOR_NAMESPACE}
+      AWS_S3_ENDPOINT: ${AWS_S3_ENDPOINT}
+      AWS_S3_ACCESS_KEY: ${AWS_S3_ACCESS_KEY}
+      AWS_S3_SECRET_KEY: ${AWS_S3_SECRET_KEY}
+      AWS_S3_PATH_STYLE_ACCESS: ${AWS_S3_PATH_STYLE_ACCESS}
+      AWS_REGION: ${AWS_REGION}
+      AWS_DEFAULT_REGION: ${AWS_REGION}
+      WORKER_ID: ${WORKER_ID:-worker-1}
+      WORKER_SYNC_INTERVAL_MS: ${WORKER_SYNC_INTERVAL_MS:-30000}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-mock}
+      EMBEDDING_EXTERNAL_TYPE: ${EMBEDDING_EXTERNAL_TYPE:-http}
+      EMBEDDING_EXTERNAL_API_URL: ${EMBEDDING_EXTERNAL_API_URL:-http://embedding-service:8000/api/v1/embed-query}
+      EMBEDDING_EXTERNAL_API_KEY: ${EMBEDDING_EXTERNAL_API_KEY:-not-required}
+      EMBEDDING_EXTERNAL_MODEL: ${EMBEDDING_EXTERNAL_MODEL:-all-MiniLM-L6-v2}
+      EMBEDDING_EXTERNAL_TIMEOUT_MS: ${EMBEDDING_EXTERNAL_TIMEOUT_MS:-30000}
+      EMBEDDING_EXTERNAL_HTTP_API_KEY_HEADER: ${EMBEDDING_EXTERNAL_HTTP_API_KEY_HEADER:-}
+      EMBEDDING_EXTERNAL_HTTP_API_KEY_PREFIX: ${EMBEDDING_EXTERNAL_HTTP_API_KEY_PREFIX:-}
+      EMBEDDING_EXTERNAL_HTTP_REQUEST_TEMPLATE: ${EMBEDDING_EXTERNAL_HTTP_REQUEST_TEMPLATE:-{"text":"__TEXT__","model_name":"all-MiniLM-L6-v2","provider":"self_hosted"}}
+      EMBEDDING_EXTERNAL_HTTP_RESPONSE_JSON_POINTER: ${EMBEDDING_EXTERNAL_HTTP_RESPONSE_JSON_POINTER:-/embedding}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      control-plane:
+        condition: service_healthy
+    networks:
+      - vectorsync-network
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/8081'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Search Service - Semantic search and vector retrieval
+  search-service:
+    build:
+      context: .
+      dockerfile: deployment/Dockerfile.search-service
+    container_name: vectorsync-search-service
+    ports:
+      - "8083:8083"
+    environment:
+      ICEBERG_CATALOG_WAREHOUSE: ${ICEBERG_CATALOG_WAREHOUSE}
+      ICEBERG_VECTOR_NAMESPACE: ${ICEBERG_VECTOR_NAMESPACE}
+      AWS_S3_ENDPOINT: ${AWS_S3_ENDPOINT}
+      AWS_S3_ACCESS_KEY: ${AWS_S3_ACCESS_KEY}
+      AWS_S3_SECRET_KEY: ${AWS_S3_SECRET_KEY}
+      AWS_S3_PATH_STYLE_ACCESS: ${AWS_S3_PATH_STYLE_ACCESS}
+      AWS_REGION: ${AWS_REGION}
+      AWS_DEFAULT_REGION: ${AWS_REGION}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-mock}
+      EMBEDDING_EXTERNAL_TYPE: ${EMBEDDING_EXTERNAL_TYPE:-http}
+      EMBEDDING_EXTERNAL_API_URL: ${EMBEDDING_EXTERNAL_API_URL:-http://embedding-service:8000/api/v1/embed-query}
+      EMBEDDING_EXTERNAL_API_KEY: ${EMBEDDING_EXTERNAL_API_KEY:-not-required}
+      EMBEDDING_EXTERNAL_MODEL: ${EMBEDDING_EXTERNAL_MODEL:-all-MiniLM-L6-v2}
+      EMBEDDING_EXTERNAL_TIMEOUT_MS: ${EMBEDDING_EXTERNAL_TIMEOUT_MS:-30000}
+      EMBEDDING_EXTERNAL_HTTP_API_KEY_HEADER: ${EMBEDDING_EXTERNAL_HTTP_API_KEY_HEADER:-}
+      EMBEDDING_EXTERNAL_HTTP_API_KEY_PREFIX: ${EMBEDDING_EXTERNAL_HTTP_API_KEY_PREFIX:-}
+      EMBEDDING_EXTERNAL_HTTP_REQUEST_TEMPLATE: ${EMBEDDING_EXTERNAL_HTTP_REQUEST_TEMPLATE:-{"text":"__TEXT__","model_name":"all-MiniLM-L6-v2","provider":"self_hosted"}}
+      EMBEDDING_EXTERNAL_HTTP_RESPONSE_JSON_POINTER: ${EMBEDDING_EXTERNAL_HTTP_RESPONSE_JSON_POINTER:-/embedding}
+      SEARCH_DEFAULT_LIMIT: ${SEARCH_DEFAULT_LIMIT:-10}
+      SEARCH_MAX_LIMIT: ${SEARCH_MAX_LIMIT:-100}
+      SEARCH_MIN_SIMILARITY: ${SEARCH_MIN_SIMILARITY:-0.7}
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    networks:
+      - vectorsync-network
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/8083'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Dashboard - React frontend
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: vectorsync-dashboard
+    ports:
+      - "3000:80"
+    environment:
+      REACT_APP_CONTROL_PLANE_URL: ${REACT_APP_CONTROL_PLANE_URL:-http://localhost:8080}
+      REACT_APP_SEARCH_SERVICE_URL: ${REACT_APP_SEARCH_SERVICE_URL:-http://localhost:8083}
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+      search-service:
+        condition: service_healthy
+    networks:
+      - vectorsync-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+  minio_data:
+
+networks:
+  vectorsync-network:
+    driver: bridge
+
+# Made with Bob

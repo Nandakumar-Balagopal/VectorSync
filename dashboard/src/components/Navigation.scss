@@ -1,0 +1,30 @@
+@use '@carbon/react/scss/spacing' as *;
+@use '@carbon/react/scss/theme' as *;
+
+.dashboard-sidenav {
+  position: fixed;
+  top: 48px; // Height of Carbon header
+  left: 0;
+  bottom: 0;
+  width: 256px;
+  z-index: 8000;
+  background: $layer-01;
+  border-right: 1px solid $border-subtle-01;
+
+  .cds--side-nav__items {
+    padding-top: $spacing-05;
+  }
+
+  .cds--side-nav__link {
+    &:hover {
+      background: $layer-hover-01;
+    }
+
+    &.cds--side-nav__link--current {
+      background: $layer-selected-01;
+      border-left: 3px solid $border-interactive;
+    }
+  }
+}
+
+// Made with Bob
