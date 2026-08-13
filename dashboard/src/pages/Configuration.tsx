@@ -1170,5 +1170,3 @@ export const Configuration: React.FC = () => {
     </div>
   );
 };
-
-// Made with Bob

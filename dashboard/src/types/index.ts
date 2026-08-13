@@ -52,7 +52,7 @@ export interface SearchResult {
   sourceRowId: string;
   similarity: number;
   text: string;
-  metadata: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
 }
 
 export interface SearchResponse {
@@ -284,5 +284,3 @@ export interface IndexConfig {
   cacheSize: number; // MB
   rebuildThreshold: number; // staleness percentage
 }
-
-// Made with Bob

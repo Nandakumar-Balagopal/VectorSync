@@ -444,5 +444,3 @@ export const DebugPanel: React.FC = () => {
     </div>
   );
 };
-
-// Made with Bob

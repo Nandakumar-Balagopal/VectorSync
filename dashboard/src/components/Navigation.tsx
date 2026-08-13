@@ -59,5 +59,3 @@ export function Navigation() {
     </SideNav>
   );
 }
-
-// Made with Bob

@@ -544,5 +544,3 @@ export const vectorSyncApi = {
     }
   },
 };
-
-// Made with Bob

@@ -63,9 +63,10 @@ export const SemanticSearch: React.FC = () => {
     setError(null);
 
     try {
+      const table = tables.find(t => t.tableId === selectedTable);
       const response = await vectorSyncApi.search(
         query,
-        selectedTable,
+        table?.tableName || selectedTable,
         topK,
         useIndex
       );
@@ -73,24 +74,7 @@ export const SemanticSearch: React.FC = () => {
     } catch (err: any) {
       console.error('Search failed:', err);
       setError(err.message || 'Search failed');
-      
-      // Mock response for development
-      setSearchResponse({
-        query,
-        executionTimeMs: Math.floor(Math.random() * 100) + 20,
-        totalResults: 5,
-        results: Array.from({ length: Math.min(topK, 5) }, (_, i) => ({
-          vectorId: `vec-${i + 1}`,
-          sourceTable: selectedTable,
-          sourceRowId: `row-${i + 1}`,
-          similarity: 0.95 - i * 0.05,
-          text: `Sample result ${i + 1} for query: "${query}"`,
-          metadata: {
-            timestamp: new Date().toISOString(),
-            category: ['electronics', 'books', 'clothing'][i % 3],
-          },
-        })),
-      });
+      setSearchResponse(null);
     } finally {
       setLoading(false);
     }
@@ -399,5 +383,3 @@ export const SemanticSearch: React.FC = () => {
     </div>
   );
 };
-
-// Made with Bob

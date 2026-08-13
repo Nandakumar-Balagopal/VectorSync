@@ -347,5 +347,3 @@ export const GlobalPipeline: React.FC = () => {
     </div>
   );
 };
-
-// Made with Bob

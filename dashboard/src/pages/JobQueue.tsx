@@ -357,5 +357,3 @@ export const JobQueue: React.FC = () => {
     </div>
   );
 };
-
-// Made with Bob

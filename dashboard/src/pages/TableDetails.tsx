@@ -338,5 +338,3 @@ export function TableDetails() {
     </div>
   );
 }
-
-// Made with Bob
