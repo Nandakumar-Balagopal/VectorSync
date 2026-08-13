@@ -45,13 +45,13 @@ VectorSync is currently in **Phase 1: single-cluster MVP**.
 
 Phase 1 uses a combined `worker/` service that performs Iceberg change detection, embedding generation, and vector writes in one process. This keeps the first working version simple enough to test end-to-end while preserving the long-term direction: a distributed coordinator and worker-pool architecture inspired by systems like Presto, Trino, Spark, and Flink.
 
-Phase 1 is not considered complete until full CDC correctness is proven with end-to-end tests for:
+Phase 1 now has a working end-to-end correctness path for:
 
 - `INSERT`: new source rows produce new vector records.
 - `UPDATE`: changed source rows replace or supersede the old vector representation.
 - `DELETE`: removed source rows are removed, tombstoned, or excluded from semantic search results.
 
-The project should avoid claiming production-ready CDC until insert, update, and delete behavior is verified against real Iceberg snapshots.
+The current implementation has been manually verified against real Iceberg snapshots with the live embedding service. The next milestone is to turn that manual flow into an automated integration test and then replace table-level diffing with distributed Iceberg file-level tasks.
 
 * * *
 
@@ -83,7 +83,7 @@ Search Service
 Semantic search results
 ```
 
-In Phase 1, the `worker/` module is the real end-to-end execution path. The older `cdc-worker/` and `embedding-worker/` modules are kept as experimental split-service work, but they are not the default runtime path yet.
+In Phase 1, the `worker/` module is the real end-to-end execution path. Planned distributed coordinator/worker pieces should be added as new modules only when the durable task model exists.
 
 ### Modular Monorepo Structure
 
@@ -94,8 +94,6 @@ vectorsync/
 ├── common/              # Shared DTOs, models, utilities
 ├── control-plane/       # Metadata management, scheduler, APIs
 ├── worker/              # Iceberg CDC polling, embedding generation, vector writes
-├── cdc-worker/          # Experimental split CDC worker
-├── embedding-worker/    # Experimental split embedding worker
 ├── search-service/      # Semantic search and retrieval
 ├── dashboard/           # React frontend (Carbon Design System)
 ├── embedding-service/   # Python embedding service (optional)
@@ -134,7 +132,7 @@ vectorsync/
 - Writes vector records back to Iceberg
 - Exposes demo and vector inspection endpoints
 
-The older `cdc-worker/` and `embedding-worker/` modules are kept as experimental split-service work, but the default Maven build and Docker Compose stack use `worker/` because it is the complete end-to-end path.
+Future split workers should be introduced behind a coordinator/task-lease abstraction rather than as disconnected experimental services.
 
 #### 4. **search-service/** - Semantic Search (Port 8083)
 - Semantic search REST API
@@ -448,8 +446,6 @@ Each module has its own README with detailed information:
 - [common/README.md](common/README.md) - Shared library
 - [control-plane/README.md](control-plane/README.md) - Control & scheduler
 - [worker/](worker/) - End-to-end sync worker
-- [cdc-worker/README.md](cdc-worker/README.md) - Experimental split change detection
-- [embedding-worker/README.md](embedding-worker/README.md) - Experimental split embedding generation
 - [search-service/README.md](search-service/README.md) - Semantic search
 
 * * *
@@ -537,10 +533,9 @@ curl http://localhost:8083/actuator/health  # Search Service
 ### 🚧 Current Limitations
 
 - Brute-force similarity search (ANN index planned)
-- CDC correctness for `INSERT`, `UPDATE`, and `DELETE` still needs automated E2E validation
+- CDC correctness for `INSERT`, `UPDATE`, and `DELETE` has been manually verified; automated E2E validation is still needed
 - Current runtime uses a single combined worker
 - Distributed coordinator, worker leasing, and file-level task assignment are planned
-- Split `cdc-worker/` and `embedding-worker/` modules are experimental until a durable task/event layer exists
 
 * * *
 
@@ -548,10 +543,11 @@ curl http://localhost:8083/actuator/health  # Search Service
 
 ### Phase 1 Completion
 
-- 🔄 **Full CDC E2E Test** - Prove insert, update, and delete correctness against real Iceberg snapshots
+- ✅ **Manual CDC E2E Test** - Prove insert, update, and delete correctness against real Iceberg snapshots
+- 🔄 **Automated CDC E2E Test** - Promote the manual no-mock flow into a repeatable integration test
 - 🔄 **Idempotent Vector Writes** - Ensure retries do not create duplicate live vectors
-- 🔄 **Delete/Tombstone Semantics** - Define how removed source rows disappear from vector reads and search
-- 🔄 **Update Supersession Semantics** - Define how new vectors replace stale vectors for the same source primary key
+- ✅ **Delete/Tombstone Semantics** - Removed source rows are tombstoned and filtered from vector reads/search
+- ✅ **Update Supersession Semantics** - New vectors supersede stale vectors for the same source primary key
 
 ### Phase 2: Distributed Coordinator
 
