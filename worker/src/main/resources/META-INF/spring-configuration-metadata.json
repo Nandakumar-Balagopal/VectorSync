@@ -11,8 +11,6 @@
     { "name": "embedding.external.http.api-key-prefix", "type": "java.lang.String" },
     { "name": "embedding.external.http.request-template", "type": "java.lang.String" },
     { "name": "embedding.external.http.response-json-pointer", "type": "java.lang.String" },
-    { "name": "embedding.local.model-path", "type": "java.lang.String" },
-    { "name": "embedding.local.model-name", "type": "java.lang.String" },
     { "name": "control.api.url", "type": "java.lang.String" },
     { "name": "iceberg.catalog.type", "type": "java.lang.String" },
     { "name": "iceberg.catalog.warehouse", "type": "java.lang.String" },

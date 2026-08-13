@@ -29,6 +29,7 @@ logs/
 # Environment
 .env
 .env.local
+.env.host
 *.properties.local
 
 # Docker

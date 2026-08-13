@@ -97,7 +97,7 @@ vectorsync/
 ├── search-service/      # Semantic search and retrieval
 ├── dashboard/           # React frontend (Carbon Design System)
 ├── embedding-service/   # Python embedding service (optional)
-├── docker-compose.yml   # Multi-service orchestration
+├── docker compose.yml   # Multi-service orchestration
 └── docs/                # Architecture and guides
 ```
 
@@ -303,39 +303,33 @@ See [docs/architecture.md](docs/architecture.md) for detailed flow diagrams.
 
 * * *
 
-## 🚀 Quick Start (Docker)
+## 🚀 Quick Start
 
-### 1. Choose Your Deployment
+### Option A: Full Docker stack
 
-VectorSync supports flexible deployment configurations:
-
-| Scenario | Configuration File | Command |
-| --- | --- | --- |
-| **Local Development** | `.env.local` | `docker-compose --profile local-storage --profile local-embedding up -d` |
-| **Production (SaaS)** | `.env.openai` | `docker-compose up -d` |
-| **Hybrid** | `.env.hybrid` | `docker-compose --profile local-storage up -d` |
-
-📖 **See [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for detailed deployment scenarios.**
-
-* * *
-
-### 2. Quick Local Setup
-
-For a quick local demo with all services:
+Use this when you want every service in containers:
 
 ```bash
-# Copy local configuration
-cp .env.local .env
-
-# Start all services (MinIO + Embedding Service)
-docker-compose --profile local-storage --profile local-embedding up -d --build
+docker compose --profile local-storage --profile local-embedding up -d --build
 
 # Check service health
-docker-compose ps
+docker compose ps
 
 # View logs
-docker-compose logs -f
+docker compose logs -f
 ```
+
+### Option B: Fast host-local Java startup
+
+Use this during development. Docker runs only Postgres, MinIO, and the Python
+embedding service; Java services run on your machine through Maven and reuse
+your local `~/.m2` cache.
+
+```bash
+./scripts/start-local.sh
+```
+
+This avoids re-downloading Maven dependencies inside Docker on every Java edit.
 
 * * *
 
@@ -385,11 +379,9 @@ VectorSync uses Docker Compose profiles for flexible deployment:
 
 ### Configuration Files
 
-Three pre-configured templates are provided:
-
-- **`.env.local`** - Full local stack (MinIO + embedding service)
-- **`.env.openai`** - Production with AWS S3 + OpenAI embeddings
-- **`.env.hybrid`** - Mix local and cloud services
+- **`.env`** - Default all-in-Docker local demo configuration.
+- **`.env.example`** - Template for creating your own environment.
+- **`.env.host.example`** - Template for host-local Java development. `scripts/start-local.sh` copies it to `.env.host` on first run.
 
 ### Required Variables
 
@@ -408,10 +400,8 @@ Three pre-configured templates are provided:
 - `EMBEDDING_EXTERNAL_API_URL` - Embedding service URL
 
 **Embedding Configuration:**
-- `EMBEDDING_PROVIDER` - `mock`, `external`, or `local`
+- `EMBEDDING_PROVIDER` - `mock` or `external`
 - `EMBEDDING_EXTERNAL_TIMEOUT_MS` - API timeout (ms)
-
-📖 **See [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for complete configuration reference.**
 
 * * *
 
@@ -424,6 +414,14 @@ mvn clean install
 ```
 
 ### Run Services Individually
+
+Source `.env.host` first if you want to run Java services directly:
+
+```bash
+set -a
+source .env.host
+set +a
+```
 
 ```bash
 # Control Plane
@@ -486,7 +484,11 @@ The minimum E2E test should:
 8. Verify sync state advances only after successful vector writes.
 9. Repeat at least one sync to confirm idempotency and no duplicate live vectors.
 
-This should become an automated script or integration test, not a manual demo-only checklist.
+Run the current no-mock E2E script:
+
+```bash
+deployment/test-e2e-real-embeddings.sh
+```
 
 * * *
 
@@ -495,15 +497,15 @@ This should become an automated script or integration test, not a manual demo-on
 ### View logs
 
 ```bash
-docker-compose logs -f worker
-docker-compose logs -f search-service
+docker compose logs -f worker
+docker compose logs -f search-service
 ```
 
 ### Reset environment
 
 ```bash
-docker-compose down -v
-docker-compose up -d --build
+docker compose down -v
+docker compose up -d --build
 ```
 
 ### Check service health
@@ -570,16 +572,11 @@ curl http://localhost:8083/actuator/health  # Search Service
 - 📋 **Multi-Model Support** - Multiple embedding models per table
 - 📋 **Auto-Scaling** - Dynamic worker scaling based on load
 
-📖 **See [PERFORMANCE_ROADMAP.md](PERFORMANCE_ROADMAP.md) for detailed optimization plans.**
-
-* * *
-
 ## 📚 Documentation
 
-- **[Deployment Guide](DEPLOYMENT_GUIDE.md)** - Deployment scenarios and configuration
-- **[Embedding Integration](EMBEDDING_INTEGRATION.md)** - Embedding service architecture
-- **[Performance Roadmap](PERFORMANCE_ROADMAP.md)** - Optimization plans
 - **[Architecture](docs/architecture.md)** - System architecture and flow
+- **[Repository Structure](docs/REPOSITORY_STRUCTURE.md)** - Active modules and planned Phase 2 shape
+- **[E2E Test Plan](docs/E2E_TEST_PLAN.md)** - CDC correctness test plan
 - **Module READMEs** - Detailed documentation for each module
 
 * * *

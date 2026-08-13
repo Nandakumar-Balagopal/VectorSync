@@ -64,7 +64,7 @@ echo "Starting services with local storage and embedding service..."
 echo "This will start: PostgreSQL, MinIO, Embedding Service, Control API, Worker, Search API"
 echo ""
 
-docker-compose --profile local-storage --profile local-embedding up -d --build
+docker compose --profile local-storage --profile local-embedding up -d --build
 
 echo ""
 echo "Waiting for services to be healthy..."

@@ -1,7 +1,11 @@
 FROM maven:3.9.9-eclipse-temurin-17 AS builder
 WORKDIR /app
+COPY pom.xml .
+COPY common/pom.xml common/pom.xml
+COPY worker/pom.xml worker/pom.xml
+RUN mvn -q -DskipTests -pl worker -am dependency:go-offline
 COPY . .
-RUN mvn clean package -DskipTests -pl worker -am
+RUN mvn -q -DskipTests -pl worker -am package
 
 FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app

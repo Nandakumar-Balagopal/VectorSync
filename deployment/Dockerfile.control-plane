@@ -1,12 +1,14 @@
 FROM maven:3.9.9-eclipse-temurin-17 AS builder
 WORKDIR /app
+COPY pom.xml .
+COPY common/pom.xml common/pom.xml
+COPY control-plane/pom.xml control-plane/pom.xml
+RUN mvn -q -DskipTests -pl control-plane -am dependency:go-offline
 COPY . .
-RUN mvn clean package -DskipTests -pl control-plane -am
+RUN mvn -q -DskipTests -pl control-plane -am package
 
 FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app
 COPY --from=builder /app/control-plane/target/vectorsync-control-plane-*.jar app.jar
 EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "app.jar"]
-
-# Made with Bob

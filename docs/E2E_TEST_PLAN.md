@@ -31,7 +31,6 @@ Create `.env` file with real embedding service configuration:
 
 ```bash
 # Copy the local configuration
-cp .env.local .env
 
 # Verify embedding service is configured for external provider
 cat .env | grep EMBEDDING
@@ -41,7 +40,7 @@ cat .env | grep EMBEDDING
 ```
 EMBEDDING_PROVIDER=external
 EMBEDDING_EXTERNAL_TYPE=http
-EMBEDDING_EXTERNAL_API_URL=http://embedding-service:8000/api/v1/embed
+EMBEDDING_EXTERNAL_API_URL=http://embedding-service:8000/api/v1/embed-query
 ```
 
 ### Step 2: Verify Docker Resources
@@ -63,7 +62,7 @@ docker system df
 
 ```bash
 # Stop and remove all containers
-docker-compose down -v
+docker compose down -v
 
 # Remove old volumes (fresh start)
 docker volume prune -f
@@ -77,7 +76,7 @@ docker volume ls
 
 ```bash
 # Start with local storage and embedding service
-docker-compose --profile local-storage --profile local-embedding up -d
+docker compose --profile local-storage --profile local-embedding up -d
 
 # This starts:
 # - postgres (database)
@@ -104,10 +103,10 @@ docker-compose --profile local-storage --profile local-embedding up -d
 
 ```bash
 # Watch logs (Ctrl+C to exit)
-docker-compose logs -f
+docker compose logs -f
 
 # Or check specific service
-docker-compose logs -f embedding-service
+docker compose logs -f embedding-service
 ```
 
 **Wait for these messages:**
@@ -149,7 +148,7 @@ curl -s http://localhost:3000
 
 ```bash
 # Check control-plane can connect to PostgreSQL
-docker-compose logs control-plane | grep -i "database"
+docker compose logs control-plane | grep -i "database"
 
 # Should see: "HikariPool-1 - Start completed"
 ```
@@ -158,7 +157,7 @@ docker-compose logs control-plane | grep -i "database"
 
 ```bash
 # Check worker can connect to MinIO
-docker-compose logs worker | grep -i "s3\|minio"
+docker compose logs worker | grep -i "s3\|minio"
 
 # Should see successful S3 client initialization
 ```
@@ -220,7 +219,7 @@ open http://localhost:9001
 # Navigate to: warehouse/iceberg/default.db/products/
 
 # Or check via API
-docker-compose exec worker ls -la /tmp/warehouse/iceberg/default.db/
+docker compose exec worker ls -la /tmp/warehouse/iceberg/default.db/
 ```
 
 **✅ Checkpoint**: Demo table created with 10 products
@@ -317,7 +316,7 @@ curl -X POST http://localhost:8081/api/demo/sync | jq
 
 ```bash
 # Watch worker logs
-docker-compose logs -f worker
+docker compose logs -f worker
 
 # Look for these messages:
 # - "Starting CDC for table: products"
@@ -355,7 +354,7 @@ curl -s http://localhost:8080/api/tables/${TABLE_ID}/status | jq
 # Navigate to: warehouse/iceberg/vector/products_vectors/
 
 # Or check via logs
-docker-compose logs worker | grep "vector table"
+docker compose logs worker | grep "vector table"
 ```
 
 **✅ Checkpoint**: 10 vectors generated and stored
@@ -643,7 +642,7 @@ curl -s http://localhost:8080/api/tables/${TABLE_ID}/status | jq '.lastSnapshotI
 curl -X POST http://localhost:8081/api/demo/sync | jq
 
 # Verify: Only new records processed (incremental)
-docker-compose logs worker | grep "Detected.*new records"
+docker compose logs worker | grep "Detected.*new records"
 ```
 
 ### Test 3: Search Performance
@@ -685,17 +684,17 @@ wait
 
 ```bash
 # Stop all containers
-docker-compose down
+docker compose down
 
 # Or keep data and just stop
-docker-compose stop
+docker compose stop
 ```
 
 ### Step 2: Clean Volumes (Optional)
 
 ```bash
 # Remove all data (fresh start next time)
-docker-compose down -v
+docker compose down -v
 
 # Or remove specific volumes
 docker volume rm vectorsync_postgres_data
@@ -706,7 +705,7 @@ docker volume rm vectorsync_minio_data
 
 ```bash
 # Remove built images
-docker-compose down --rmi local
+docker compose down --rmi local
 
 # Or remove all unused images
 docker image prune -a
@@ -725,13 +724,13 @@ docker image prune -a
 **Solution:**
 ```bash
 # Check logs
-docker-compose logs embedding-service
+docker compose logs embedding-service
 
 # Rebuild with no cache
-docker-compose build --no-cache embedding-service
+docker compose build --no-cache embedding-service
 
 # Restart
-docker-compose up -d embedding-service
+docker compose up -d embedding-service
 ```
 
 ### Issue 2: Sync Fails
@@ -743,13 +742,13 @@ docker-compose up -d embedding-service
 **Solution:**
 ```bash
 # Check worker logs
-docker-compose logs worker | grep -i error
+docker compose logs worker | grep -i error
 
 # Verify embedding service is reachable
-docker-compose exec worker curl http://embedding-service:8000/api/v1/health
+docker compose exec worker curl http://embedding-service:8000/api/v1/health
 
 # Check S3 connection
-docker-compose logs worker | grep -i "s3\|minio"
+docker compose logs worker | grep -i "s3\|minio"
 ```
 
 ### Issue 3: Search Returns No Results
@@ -764,7 +763,7 @@ docker-compose logs worker | grep -i "s3\|minio"
 curl -s http://localhost:8081/api/vectors/count
 
 # Check vector table
-docker-compose logs worker | grep "vector table"
+docker compose logs worker | grep "vector table"
 
 # Rebuild search index
 curl -X POST http://localhost:8083/api/search/index/rebuild

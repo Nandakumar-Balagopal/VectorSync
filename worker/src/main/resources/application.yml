@@ -24,10 +24,6 @@ embedding:
       api-key-prefix: ${EMBEDDING_EXTERNAL_HTTP_API_KEY_PREFIX:}
       request-template: ${EMBEDDING_EXTERNAL_HTTP_REQUEST_TEMPLATE:}
       response-json-pointer: ${EMBEDDING_EXTERNAL_HTTP_RESPONSE_JSON_POINTER:}
-  local:
-    model-path: ${EMBEDDING_LOCAL_MODEL_PATH:}
-    model-name: ${EMBEDDING_LOCAL_MODEL_NAME:local-embedding-v1}
-
 control:
   api:
     url: ${CONTROL_API_URL}
