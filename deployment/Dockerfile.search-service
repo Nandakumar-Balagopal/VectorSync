@@ -2,6 +2,8 @@ FROM maven:3.9.9-eclipse-temurin-17 AS builder
 WORKDIR /app
 COPY pom.xml .
 COPY common/pom.xml common/pom.xml
+COPY control-plane/pom.xml control-plane/pom.xml
+COPY worker/pom.xml worker/pom.xml
 COPY search-service/pom.xml search-service/pom.xml
 RUN mvn -q -DskipTests -pl search-service -am dependency:go-offline
 COPY . .

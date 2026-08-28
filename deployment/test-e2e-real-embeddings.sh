@@ -1,10 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONTROL_URL="${CONTROL_URL:-http://localhost:8080}"
-WORKER_URL="${WORKER_URL:-http://localhost:8081}"
-SEARCH_URL="${SEARCH_URL:-http://localhost:8083}"
-EMBEDDING_URL="${EMBEDDING_URL:-http://localhost:8000}"
+CONTROL_URL="${CONTROL_URL:-http://localhost:18080}"
+WORKER_URL="${WORKER_URL:-http://localhost:18081}"
+SEARCH_URL="${SEARCH_URL:-http://localhost:18083}"
+EMBEDDING_URL="${EMBEDDING_URL:-http://localhost:18000}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-vectorsync-e2e}"
+SKIP_STACK_START="${SKIP_STACK_START:-false}"
+export POSTGRES_HOST_PORT="${POSTGRES_HOST_PORT:-15433}"
+export MINIO_API_HOST_PORT="${MINIO_API_HOST_PORT:-19000}"
+export MINIO_CONSOLE_HOST_PORT="${MINIO_CONSOLE_HOST_PORT:-19001}"
+export EMBEDDING_HOST_PORT="${EMBEDDING_HOST_PORT:-18000}"
+export CONTROL_PLANE_HOST_PORT="${CONTROL_PLANE_HOST_PORT:-18080}"
+export WORKER_HOST_PORT="${WORKER_HOST_PORT:-18081}"
+export SEARCH_SERVICE_HOST_PORT="${SEARCH_SERVICE_HOST_PORT:-18083}"
+export DASHBOARD_HOST_PORT="${DASHBOARD_HOST_PORT:-13000}"
+COMPOSE_FILES=(-f docker-compose.yml -f deployment/docker-compose.e2e.yml)
+COMPOSE_PROFILES=(--profile local-storage --profile local-embedding)
+
+compose() {
+  COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" "$@"
+}
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -56,8 +72,13 @@ assert_not_contains() {
 need curl
 need python3
 
-echo "Starting full local stack..."
-docker compose --profile local-storage --profile local-embedding up -d --build
+if [[ "$SKIP_STACK_START" != "true" ]]; then
+  echo "Resetting local E2E stack state..."
+  compose down -v --remove-orphans
+
+  echo "Starting full local stack..."
+  compose up -d --build
+fi
 
 wait_for "control-plane" "${CONTROL_URL}/actuator/health"
 wait_for "worker" "${WORKER_URL}/actuator/health"
@@ -67,6 +88,12 @@ wait_for "embedding-service" "${EMBEDDING_URL}/api/v1/health"
 echo "Seeding clean demo table and vector table..."
 seed_response="$(curl -fsS --max-time 30 -X POST "${WORKER_URL}/api/demo/seed")"
 assert_contains "$seed_response" '"recordsWritten":4' "seed should create four source rows"
+
+echo "Registering the source table with the control plane..."
+registration_response="$(curl -fsS --max-time 30 -X POST "${CONTROL_URL}/api/tables/register" \
+  -H 'Content-Type: application/json' \
+  -d '{"catalog":"default","tableName":"default.products","embeddingColumns":["name","description"],"modelName":"all-MiniLM-L6-v2","enabled":true}')"
+assert_contains "$registration_response" '"tableName":"default.products"' "source table should register successfully"
 
 echo "Running initial sync..."
 sync_response="$(curl -fsS --max-time 120 -X POST "${WORKER_URL}/api/demo/sync")"
@@ -80,7 +107,7 @@ baseline_count="$(curl -fsS --max-time 20 "${WORKER_URL}/api/vectors/count")"
 
 baseline_search="$(curl -fsS --max-time 30 -X POST "${SEARCH_URL}/api/search" \
   -H 'Content-Type: application/json' \
-  -d '{"query":"lightweight running shoe","topK":8,"sourceTable":"products"}')"
+  -d '{"query":"lightweight running shoe","topK":8,"sourceTable":"default.products"}')"
 assert_contains "$baseline_search" '"sourceRowId":"p-100"' "baseline search should find p-100"
 
 echo "Testing append..."
@@ -91,7 +118,7 @@ sync_response="$(curl -fsS --max-time 120 -X POST "${WORKER_URL}/api/demo/sync")
 assert_contains "$sync_response" '"vectorCount":5' "append sync should create five live vectors"
 append_search="$(curl -fsS --max-time 30 -X POST "${SEARCH_URL}/api/search" \
   -H 'Content-Type: application/json' \
-  -d '{"query":"indoor court pivot grip","topK":8,"sourceTable":"products"}')"
+  -d '{"query":"indoor court pivot grip","topK":8,"sourceTable":"default.products"}')"
 assert_contains "$append_search" '"sourceRowId":"p-e2e-001"' "append search should find new row"
 assert_contains "$append_search" 'Court Trainer' "append search should return appended text"
 
@@ -103,7 +130,7 @@ sync_response="$(curl -fsS --max-time 120 -X POST "${WORKER_URL}/api/demo/sync")
 assert_contains "$sync_response" '"vectorCount":5' "update sync should keep five live vectors"
 update_search="$(curl -fsS --max-time 30 -X POST "${SEARCH_URL}/api/search" \
   -H 'Content-Type: application/json' \
-  -d '{"query":"smoothies soup blender","topK":8,"sourceTable":"products"}')"
+  -d '{"query":"smoothies soup blender","topK":8,"sourceTable":"default.products"}')"
 assert_contains "$update_search" '"sourceRowId":"p-e2e-001"' "update search should find updated row"
 assert_contains "$update_search" 'Kitchen Blender' "update search should return updated text"
 
@@ -113,7 +140,7 @@ sync_response="$(curl -fsS --max-time 120 -X POST "${WORKER_URL}/api/demo/sync")
 assert_contains "$sync_response" '"vectorCount":4' "delete sync should return to four live vectors"
 delete_search="$(curl -fsS --max-time 30 -X POST "${SEARCH_URL}/api/search" \
   -H 'Content-Type: application/json' \
-  -d '{"query":"smoothies soup blender","topK":8,"sourceTable":"products"}')"
+  -d '{"query":"smoothies soup blender","topK":8,"sourceTable":"default.products"}')"
 assert_not_contains "$delete_search" '"sourceRowId":"p-e2e-001"' "delete search should not return deleted row"
 assert_not_contains "$delete_search" 'Kitchen Blender' "delete search should not return deleted text"
 

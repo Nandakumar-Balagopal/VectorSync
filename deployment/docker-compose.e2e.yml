@@ -1,0 +1,29 @@
+services:
+  postgres:
+    container_name: vectorsync-e2e-postgres
+    volumes:
+      - postgres_e2e_data:/var/lib/postgresql/data
+
+  minio:
+    container_name: vectorsync-e2e-minio
+    volumes:
+      - minio_e2e_data:/data
+
+  embedding-service:
+    container_name: vectorsync-e2e-embedding
+
+  control-plane:
+    container_name: vectorsync-e2e-control-plane
+
+  worker:
+    container_name: vectorsync-e2e-worker
+
+  search-service:
+    container_name: vectorsync-e2e-search-service
+
+  dashboard:
+    container_name: vectorsync-e2e-dashboard
+
+volumes:
+  postgres_e2e_data:
+  minio_e2e_data:

@@ -34,6 +34,7 @@ logs/
 
 # Docker
 docker-compose.override.yml
+.codex-docker-config/
 
 # IDE project files
 *.iml

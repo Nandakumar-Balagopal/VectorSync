@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - "5433:5432"
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./deployment/config/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -28,8 +28,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${MINIO_API_HOST_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
     volumes:
       - minio_data:/data
     networks:
@@ -49,7 +49,7 @@ services:
     profiles:
       - local-embedding  # Only start if using local embedding service
     ports:
-      - "8000:8000"
+      - "${EMBEDDING_HOST_PORT:-8000}:8000"
     networks:
       - vectorsync-network
     healthcheck:
@@ -66,7 +66,7 @@ services:
       dockerfile: deployment/Dockerfile.control-plane
     container_name: vectorsync-control-plane
     ports:
-      - "8080:8080"
+      - "${CONTROL_PLANE_HOST_PORT:-8080}:8080"
     environment:
       SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL}
       SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME}
@@ -97,7 +97,7 @@ services:
       dockerfile: deployment/Dockerfile.worker
     container_name: vectorsync-worker
     ports:
-      - "8081:8081"
+      - "${WORKER_HOST_PORT:-8081}:8081"
     environment:
       CONTROL_API_URL: ${CONTROL_API_URL:-http://control-plane:8080}
       ICEBERG_CATALOG_WAREHOUSE: ${ICEBERG_CATALOG_WAREHOUSE}
@@ -140,7 +140,7 @@ services:
       dockerfile: deployment/Dockerfile.search-service
     container_name: vectorsync-search-service
     ports:
-      - "8083:8083"
+      - "${SEARCH_SERVICE_HOST_PORT:-8083}:8083"
     environment:
       ICEBERG_CATALOG_WAREHOUSE: ${ICEBERG_CATALOG_WAREHOUSE}
       ICEBERG_VECTOR_NAMESPACE: ${ICEBERG_VECTOR_NAMESPACE}
@@ -181,7 +181,7 @@ services:
       dockerfile: Dockerfile
     container_name: vectorsync-dashboard
     ports:
-      - "3000:80"
+      - "${DASHBOARD_HOST_PORT:-3000}:80"
     environment:
       REACT_APP_CONTROL_PLANE_URL: ${REACT_APP_CONTROL_PLANE_URL:-http://localhost:8080}
       REACT_APP_SEARCH_SERVICE_URL: ${REACT_APP_SEARCH_SERVICE_URL:-http://localhost:8083}
