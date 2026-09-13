@@ -21,7 +21,6 @@
         <iceberg.version>1.5.0</iceberg.version>
         <lombok.version>1.18.30</lombok.version>
         <mapstruct.version>1.5.5.Final</mapstruct.version>
-        <junit.version>5.10.0</junit.version>
         <hadoop.version>3.3.6</hadoop.version>
         <parquet.version>1.15.2</parquet.version>
         <aws.sdk.version>2.24.8</aws.sdk.version>
@@ -29,6 +28,7 @@
 
     <modules>
         <module>common</module>
+        <module>vectorsync-format</module>
         <module>control-plane</module>
         <module>worker</module>
         <module>search-service</module>
@@ -127,19 +127,12 @@
                 <version>2.16.0</version>
             </dependency>
 
-            <!-- Testing -->
-            <dependency>
-                <groupId>org.junit.jupiter</groupId>
-                <artifactId>junit-jupiter-api</artifactId>
-                <version>${junit.version}</version>
-                <scope>test</scope>
-            </dependency>
-            <dependency>
-                <groupId>org.junit.jupiter</groupId>
-                <artifactId>junit-jupiter-engine</artifactId>
-                <version>${junit.version}</version>
-                <scope>test</scope>
-            </dependency>
+            <!--
+              JUnit versions are intentionally NOT pinned here. The imported Spring Boot BOM
+              already aligns junit-jupiter with junit-platform via junit-bom; pinning only the
+              jupiter artifacts pairs them with a mismatched platform-commons and breaks test
+              discovery with NoSuchMethodError.
+            -->
         </dependencies>
     </dependencyManagement>
 
@@ -167,6 +160,12 @@
                     <source>17</source>
                     <target>17</target>
                 </configuration>
+            </plugin>
+            <!-- Maven 3.6's default Surefire (2.12.4) cannot detect JUnit 5 tests. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
             </plugin>
         </plugins>
     </build>
