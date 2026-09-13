@@ -18,6 +18,22 @@ public enum IndexStatus {
     /** Superseded and retained for rollback or audit. */
     ARCHIVED;
 
+    /**
+     * How far through its lifecycle this status is.
+     *
+     * <p>Used to break ties when two manifest rows for one index id carry the same timestamp,
+     * which happens for the BUILDING and terminal rows of a single build. Without this the winner
+     * depends on scan order and a completed index can read back as still BUILDING.
+     */
+    public int progressionRank() {
+        return switch (this) {
+            case BUILDING -> 0;
+            case FAILED -> 1;
+            case READY -> 2;
+            case ARCHIVED -> 3;
+        };
+    }
+
     public static IndexStatus parse(String value) {
         if (value == null || value.isBlank()) {
             return FAILED;

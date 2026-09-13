@@ -29,25 +29,71 @@ public class VectorSyncReader {
     }
 
     public List<VectorRecord> readAllVectors() {
+        return VectorResolution.latestLiveVectors(readRaw());
+    }
+
+    /**
+     * The live vectors an index should cover: one source table and one model version.
+     *
+     * <p>Scoping an index this way removes the need to filter search results by source table,
+     * which the previous implementation did after top-k and so could under-return.
+     */
+    public List<VectorRecord> readForIndex(String sourceTable, String modelVersion) {
+        return readAllVectors().stream()
+                .filter(vector -> sourceTable.equals(vector.getSourceTable()))
+                .filter(vector -> modelVersion.equals(vector.modelVersion()))
+                .filter(vector -> vector.getEmbedding() != null && !vector.getEmbedding().isEmpty())
+                .toList();
+    }
+
+    /** Live vectors as they stood at a source snapshot, for a reproducible rebuild. */
+    public List<VectorRecord> readForIndexAsOf(String sourceTable, String modelVersion, long sourceSnapshotId) {
+        return VectorResolution.liveVectorsAsOf(readRaw(), sourceSnapshotId).stream()
+                .filter(vector -> sourceTable.equals(vector.getSourceTable()))
+                .filter(vector -> modelVersion.equals(vector.modelVersion()))
+                .filter(vector -> vector.getEmbedding() != null && !vector.getEmbedding().isEmpty())
+                .toList();
+    }
+
+    /** Highest source snapshot observed for a table, i.e. how current its embeddings are. */
+    public long latestSourceSnapshot(String sourceTable) {
+        return readRaw().stream()
+                .filter(vector -> sourceTable.equals(vector.getSourceTable()))
+                .mapToLong(VectorRecord::getSourceSnapshotId)
+                .max()
+                .orElse(0L);
+    }
+
+    /** Distinct model versions materialized for a table. */
+    public List<String> modelVersionsFor(String sourceTable) {
+        return readAllVectors().stream()
+                .filter(vector -> sourceTable.equals(vector.getSourceTable()))
+                .map(VectorRecord::modelVersion)
+                .distinct()
+                .sorted()
+                .toList();
+    }
+
+    /** Full append-only history, before resolution. */
+    public List<VectorRecord> readRaw() {
         Table table = VectorTableSchema.loadIfExists(catalogService.getCatalog(), vectorNamespace);
         if (table == null) {
             return List.of();
         }
 
         List<VectorRecord> records = new ArrayList<>();
-
         try (CloseableIterable<Record> rows = IcebergGenerics.read(table).build()) {
             for (Record row : rows) {
                 try {
                     records.add(VectorRecordCodec.fromIcebergRecord(row));
                 } catch (Exception e) {
-                    log.warn("Skipping unreadable vector row: {}", e.getMessage(), e);
+                    log.warn("Skipping unreadable vector row: {}", e.getMessage());
                 }
             }
         } catch (Exception e) {
-            log.warn("Failed to read vectors from Iceberg: {}", e.getMessage(), e);
+            throw new IllegalStateException("Failed to read vectors from Iceberg", e);
         }
 
-        return VectorResolution.latestLiveVectors(records);
+        return records;
     }
 }

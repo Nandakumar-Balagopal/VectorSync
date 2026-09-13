@@ -53,7 +53,17 @@ public class IndexManifestEntry {
     // --- lifecycle ---
     private IndexStatus status;
     private Map<String, String> evalMetrics;
+
+    /** When the index artifact was built. Never rewritten by later status or eval updates. */
     private Instant builtAt;
+
+    /**
+     * When this manifest row was written. Stamped by the store on every put, and what resolution
+     * orders by, so a later status change or evaluation update supersedes the build row without
+     * losing the original build time.
+     */
+    private Instant updatedAt;
+
     private String errorMessage;
 
     public String modelVersion() {

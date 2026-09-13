@@ -131,6 +131,43 @@ class IndexLifecycleTest {
     }
 
     @Test
+    @DisplayName("a completed build supersedes its own BUILDING row even sharing a built_at")
+    void terminalStatusSupersedesBuilding() {
+        Instant buildStarted = Instant.parse("2026-01-01T00:00:00Z");
+
+        IndexManifestEntry building = entry("idx-tie", 100L, "v1", IndexStatus.BUILDING, Map.of());
+        building.setBuiltAt(buildStarted);
+        manifest.put(building);
+
+        IndexManifestEntry ready = entry("idx-tie", 100L, "v1", IndexStatus.READY, Map.of());
+        ready.setBuiltAt(buildStarted);
+        manifest.put(ready);
+
+        IndexManifestEntry resolved = manifest.findById("idx-tie").orElseThrow();
+        assertEquals(IndexStatus.READY, resolved.getStatus(),
+                "a completed build must not read back as still BUILDING");
+        assertEquals(buildStarted, resolved.getBuiltAt(),
+                "build time is preserved; only the row write time advances");
+    }
+
+    @Test
+    @DisplayName("an evaluation update supersedes the build row without losing build time")
+    void evalUpdateSupersedesBuildRow() {
+        IndexManifestEntry built = entry("idx-eval", 100L, "v1", IndexStatus.READY, Map.of());
+        manifest.put(built);
+        Instant builtAt = manifest.findById("idx-eval").orElseThrow().getBuiltAt();
+
+        IndexManifestEntry evaluated = manifest.findById("idx-eval").orElseThrow();
+        evaluated.setEvalMetrics(Map.of("index_recall@10", "0.81"));
+        manifest.put(evaluated);
+
+        IndexManifestEntry resolved = manifest.findById("idx-eval").orElseThrow();
+        assertEquals("0.81", resolved.getEvalMetrics().get("index_recall@10"));
+        assertEquals(builtAt, resolved.getBuiltAt());
+        assertEquals(1, manifest.findForTable(SOURCE_TABLE).size(), "still one logical index");
+    }
+
+    @Test
     @DisplayName("promote, re-promote and roll back all resolve correctly and stay auditable")
     void promoteAndRollback() {
         manifest.put(entry("idx-v1", 100L, "v1", IndexStatus.READY, Map.of("recall@10", "0.72")));

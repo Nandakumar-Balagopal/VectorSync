@@ -59,6 +59,20 @@ public final class IndexManifestStore {
     private static final String EVAL_METRICS = "eval_metrics";
     private static final String BUILT_AT = "built_at";
     private static final String ERROR_MESSAGE = "error_message";
+    private static final String UPDATED_AT = "updated_at";
+
+    /**
+     * Oldest-first, so a later row supersedes an earlier one for the same index id. Ordered by
+     * row write time rather than build time, because a status change or an evaluation update
+     * writes a new row for an already-built index. Status progression is a defensive tiebreak in
+     * case two rows land within the clock's resolution.
+     */
+    private static final Comparator<IndexManifestEntry> OLDEST_FIRST =
+            Comparator.comparing(IndexManifestEntry::getUpdatedAt,
+                            Comparator.nullsFirst(Comparator.<Instant>naturalOrder()))
+                    .thenComparingInt(entry -> entry.getStatus() == null
+                            ? 0
+                            : entry.getStatus().progressionRank());
 
     private final Catalog catalog;
     private final String namespace;
@@ -90,7 +104,8 @@ public final class IndexManifestStore {
                 Types.NestedField.optional(19, EVAL_METRICS,
                         Types.MapType.ofOptional(20, 21, Types.StringType.get(), Types.StringType.get())),
                 Types.NestedField.required(22, BUILT_AT, Types.TimestampType.withZone()),
-                Types.NestedField.optional(23, ERROR_MESSAGE, Types.StringType.get())
+                Types.NestedField.optional(23, ERROR_MESSAGE, Types.StringType.get()),
+                Types.NestedField.required(24, UPDATED_AT, Types.TimestampType.withZone())
         );
     }
 
@@ -128,6 +143,10 @@ public final class IndexManifestStore {
 
     /** Records a new index artifact. Appends; never mutates an existing entry. */
     public void put(IndexManifestEntry entry) {
+        // Stamped here rather than by callers, so no caller can accidentally write a row that
+        // ties with the one it means to supersede.
+        entry.setUpdatedAt(Instant.now());
+
         Table table = loadOrCreate();
         IcebergAppender.append(table, List.of(toRecord(table.schema(), entry)));
         log.info("Recorded index {} for {} {} status={}",
@@ -163,8 +182,7 @@ public final class IndexManifestStore {
 
         Map<String, IndexManifestEntry> newestById = new LinkedHashMap<>();
         entries.stream()
-                .sorted(Comparator.comparing(IndexManifestEntry::getBuiltAt,
-                        Comparator.nullsFirst(Comparator.naturalOrder())))
+                .sorted(OLDEST_FIRST)
                 .forEach(entry -> newestById.put(entry.getIndexId(), entry));
 
         return List.copyOf(newestById.values());
@@ -214,6 +232,8 @@ public final class IndexManifestStore {
         Instant builtAt = entry.getBuiltAt() == null ? Instant.now() : entry.getBuiltAt();
         record.setField(BUILT_AT, OffsetDateTime.ofInstant(builtAt, ZoneOffset.UTC));
         record.setField(ERROR_MESSAGE, entry.getErrorMessage());
+        Instant updatedAt = entry.getUpdatedAt() == null ? Instant.now() : entry.getUpdatedAt();
+        record.setField(UPDATED_AT, OffsetDateTime.ofInstant(updatedAt, ZoneOffset.UTC));
         return record;
     }
 
@@ -238,6 +258,7 @@ public final class IndexManifestStore {
                 .status(IndexStatus.parse(asString(record.getField(STATUS))))
                 .evalMetrics(toStringMap(record.getField(EVAL_METRICS)))
                 .builtAt(toInstant(record.getField(BUILT_AT)))
+                .updatedAt(toInstant(record.getField(UPDATED_AT)))
                 .errorMessage(asString(record.getField(ERROR_MESSAGE)))
                 .build();
     }
