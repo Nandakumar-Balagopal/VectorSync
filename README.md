@@ -211,7 +211,8 @@ deployment/test-e2e-real-embeddings.sh  # CDC insert/update/delete correctness
 - Text is duplicated across embedding versions of the same row
 - Alias promotion assumes a single writer
 - ANN indexes are not engine-neutral and cannot be; only metadata and embeddings are
-- Dashboard has not been updated for the lifecycle model
+- Dashboard covers overview, lifecycle, search and configuration; there is no evaluation or
+  provenance UI yet (both are API-only)
 
 ## 🗺️ Next
 
@@ -219,7 +220,7 @@ deployment/test-e2e-real-embeddings.sh  # CDC insert/update/delete correctness
 - Chunking: split a row into many chunks, each independently embedded
 - Quantized embeddings (int8) to make very large version coexistence affordable
 - Batch semantic operations on Spark — similarity join, dedup, clustering
-- Dashboard: version registry, manifest browser, evaluation comparison, promote/rollback
+- Dashboard: evaluation comparison and a provenance viewer
 
 * * *
 

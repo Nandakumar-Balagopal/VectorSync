@@ -64,12 +64,9 @@ export const SemanticSearch: React.FC = () => {
 
     try {
       const table = tables.find(t => t.tableId === selectedTable);
-      const response = await vectorSyncApi.search(
-        query,
-        table?.tableName || selectedTable,
-        topK,
-        useIndex
-      );
+      const response = useIndex
+        ? await vectorSyncApi.search(query, table?.tableName || selectedTable, topK)
+        : await vectorSyncApi.searchExact(query, table?.tableName || selectedTable, topK);
       setSearchResponse(response);
     } catch (err: any) {
       console.error('Search failed:', err);
@@ -116,7 +113,7 @@ export const SemanticSearch: React.FC = () => {
     { key: 'similarity', header: 'Similarity' },
     { key: 'text', header: 'Text' },
     { key: 'sourceRowId', header: 'Row ID' },
-    { key: 'metadata', header: 'Metadata' },
+    { key: 'vectorId', header: 'Vector ID' },
   ];
 
   const rows = searchResponse?.results.map((result, index) => ({
@@ -125,7 +122,7 @@ export const SemanticSearch: React.FC = () => {
     similarity: result.similarity,
     text: result.text,
     sourceRowId: result.sourceRowId,
-    metadata: result.metadata,
+    vectorId: result.vectorId,
     result, // Keep full result for debug mode
   })) || [];
 
