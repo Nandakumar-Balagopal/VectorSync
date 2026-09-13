@@ -8,6 +8,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("/api/tables")
@@ -64,6 +65,33 @@ public class TableController {
                     return ResponseEntity.ok(response);
                 })
                 .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /**
+     * Updates a registered table. Changing {@code embeddingVersion} starts a migration: the new
+     * version is materialized alongside the existing one rather than replacing it.
+     */
+    @PutMapping("/{tableId}")
+    public ResponseEntity<?> updateTable(@PathVariable("tableId") String tableId,
+                                         @RequestBody TableConfig update) {
+        try {
+            Optional<TableConfig> result = Optional.empty();
+
+            if (update.getEmbeddingVersion() != null && !update.getEmbeddingVersion().isBlank()) {
+                result = tableConfigService.setEmbeddingVersion(tableId, update.getEmbeddingVersion());
+            }
+
+            return result
+                    .or(() -> tableConfigService.getTableConfig(tableId))
+                    .<ResponseEntity<?>>map(ResponseEntity::ok)
+                    .orElseGet(() -> ResponseEntity.notFound().build());
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
+        } catch (Exception e) {
+            log.error("Failed to update table {}: {}", tableId, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", "Update failed", "message", String.valueOf(e.getMessage())));
+        }
     }
 
     @DeleteMapping("/{tableId}")
