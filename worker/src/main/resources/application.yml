@@ -16,6 +16,8 @@ embedding:
   external:
     type: ${EMBEDDING_EXTERNAL_TYPE:gemini}
     api-url: ${EMBEDDING_EXTERNAL_API_URL:}
+    batch-api-url: ${EMBEDDING_EXTERNAL_BATCH_API_URL:}
+    batch-size: ${EMBEDDING_EXTERNAL_BATCH_SIZE:64}
     api-key: ${EMBEDDING_EXTERNAL_API_KEY:}
     model: ${EMBEDDING_EXTERNAL_MODEL:}
     timeout-ms: ${EMBEDDING_EXTERNAL_TIMEOUT_MS:10000}
