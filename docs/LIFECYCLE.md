@@ -154,6 +154,11 @@ curl -s -X POST localhost:8081/api/admin/vector-table/rebuild
 vector write committed. A failed batch holds the watermark so the changes are retried rather than
 silently skipped.
 
+**Deletes span versions.** Deleting a source row tombstones it under every materialized embedding
+version, not just the configured one — otherwise it would stay discoverable through older versions.
+Already-built index artifacts are immutable and still contain the row, so rebuild an index if it
+must not be reachable there either.
+
 **Cleaning up artifacts.** Superseded indexes stay in the manifest for rollback and audit. Evict a
 cached artifact from a running service with
 `POST /api/lifecycle/index/{indexId}/evict`; this releases handles only and does not delete files.

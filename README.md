@@ -174,17 +174,17 @@ Key variables:
 ## 🧪 Tests
 
 ```bash
-mvn clean verify          # 71 unit + integration tests, no Docker needed
+mvn clean verify          # 74 unit + integration tests, no Docker needed
 ```
 
 The format and search-service suites drive the full lifecycle against a real Iceberg catalog on the
 local filesystem: insert/update/delete resolution, two coexisting embedding versions, index build,
 promote, serve, evaluate, roll back, and provenance.
 
-With Docker, against real embeddings:
+With Docker, against real embeddings (both verified passing on Colima):
 
 ```bash
-deployment/test-e2e-lifecycle.sh        # the full lifecycle loop
+deployment/test-e2e-lifecycle.sh        # the full lifecycle loop, 8 stages
 deployment/test-e2e-real-embeddings.sh  # CDC insert/update/delete correctness
 ```
 
@@ -197,7 +197,8 @@ deployment/test-e2e-real-embeddings.sh  # CDC insert/update/delete correctness
 - Batch embedding generation
 - Format v2: typed lineage columns, float32 vectors, partitioned by model version
 - Deterministic, lineage-derived vector identity — retries are idempotent
-- Snapshot-ordered resolution with point-in-time `asOf` reads
+- Resolution ordered by Iceberg's monotonic snapshot sequence number, with point-in-time `asOf` reads
+- Deletes tombstoned across every materialized embedding version
 - Durable, versioned index artifacts with a queryable manifest
 - Single-commit promotion and rollback with full audit history
 - Index recall and retrieval precision as separate, recorded metrics

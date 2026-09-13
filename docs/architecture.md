@@ -51,14 +51,16 @@ reproducibility, auditability, and interoperability — not ANN latency.
 
 ## The vector table
 
-`vector.vector_embeddings`, format version 2, partitioned by `(source_table, model_version)` so
+`vector.vector_embeddings`, format version 3, partitioned by `(source_table, model_version)` so
 reading one embedding version prunes partitions instead of scanning every version ever built.
 
 | Column | Type | Notes |
 |---|---|---|
 | `vector_id` | string | SHA-256 of the lineage below; deterministic, so retries are idempotent |
 | `source_table`, `source_row_id` | string | Source identity |
-| `source_snapshot_id` | long | Which source snapshot this derives from |
+| `source_snapshot_id` | long | Which source snapshot this derives from. **Identity only — Iceberg snapshot ids are random longs, never an order** |
+| `source_sequence_number` | long | Iceberg's per-table monotonic snapshot sequence. **This is the ordering key** |
+| `source_committed_at` | long | Commit time of the source snapshot, from table metadata. Tiebreak only |
 | `chunk_ordinal` | int | Position in the row's chunk sequence; 0 when the row is one chunk |
 | `embedding_model`, `embedding_version` | string | Model identity; versions coexist |
 | `model_version` | string | Synthetic `model:version` partition value |
@@ -79,13 +81,27 @@ The table is append-only, so readers collapse history to a current view. The rul
 one place, `VectorResolution`, because every reader must agree on it:
 
 - key: `(source_table, source_row_id, chunk_ordinal, model_version)`
-- order: `source_snapshot_id`, then `created_at` only to break ties inside one snapshot
+- order: `source_sequence_number`, then `source_committed_at`, then `created_at`
 - a `deleted` winner hides the row
 
-Ordering by snapshot rather than wall clock is what makes a materialization reproducible:
-`liveVectorsAsOf(snapshotId)` always returns the same set for the same inputs. Wall clock is
-metadata about the pipeline run, is non-deterministic across machines, and cannot answer "what was
-live at snapshot N?".
+**Do not order by `source_snapshot_id`.** Iceberg snapshot ids are random longs, so comparing them
+numerically reverses history roughly half the time: a real run produced snapshot
+`7139976223410259010` followed by `2135807640327332542`, and a delete tombstone lost to the row it
+was meant to remove. The sequence number is the only field the Iceberg spec guarantees to be
+ordered.
+
+Nor wall clock. `created_at` is metadata about the pipeline run, is non-deterministic across
+machines, and cannot answer "what was live at source version N?". It survives only as a final
+tiebreak.
+
+`liveVectorsAsOf(sequenceNumber)` therefore always returns the same set for the same inputs, which
+is what makes a materialization reproducible rather than merely current.
+
+### Deletes span every version
+
+A deleted source row is tombstoned under **every** materialized embedding version, not just the
+configured one. Resolution is keyed by model version, so tombstoning only the current version would
+leave the row live — and discoverable — through every older version and its index.
 
 ## Index artifacts
 
@@ -119,6 +135,10 @@ decisions — a new model can have perfect index recall while retrieving worse d
 
 - **index recall@k** — overlap with an exhaustive cosine scan. No labels needed. Measures the index.
 - **precision@k** — against judged relevance. Measures the embedding model.
+
+The exhaustive scan is scoped to the index's own model version. Scanning every version at once
+mixes embedding spaces — a query embedded with one model scored against vectors from another — and
+returns each row once per version, which understates recall.
 
 Metrics are written back onto the manifest entry, so the numbers a promotion was based on stay
 attached to the artifact.
