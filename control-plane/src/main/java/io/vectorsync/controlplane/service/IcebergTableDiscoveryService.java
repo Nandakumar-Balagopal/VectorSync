@@ -83,7 +83,22 @@ public class IcebergTableDiscoveryService {
             List<DiscoveredTableEntity> discoveredTables = processMetadataFiles(
                     metadataFiles, catalogName, jobId, s3Path, hadoopConf);
             
-            // Step 3: Save discovered tables
+            // Step 3: Save discovered tables, upserting on uuid.
+            // discovered_tables.uuid is UNIQUE and every entity here is new, so a plain saveAll
+            // always INSERTs -- re-running discovery over the same warehouse violated the
+            // constraint and failed the whole job. Carry the existing row's id (and its
+            // registration flags, which are operator state, not crawl output) so the save
+            // becomes an update.
+            for (DiscoveredTableEntity discovered : discoveredTables) {
+                if (discovered.getUuid() == null) {
+                    continue;
+                }
+                discoveredTableRepository.findByUuid(discovered.getUuid()).ifPresent(existing -> {
+                    discovered.setId(existing.getId());
+                    discovered.setRegistered(existing.isRegistered());
+                    discovered.setRegisteredAt(existing.getRegisteredAt());
+                });
+            }
             discoveredTableRepository.saveAll(discoveredTables);
             
             // Step 4: Update sync job status

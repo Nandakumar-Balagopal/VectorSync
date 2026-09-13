@@ -5,6 +5,8 @@ import io.vectorsync.controlplane.entity.SyncJobEntity;
 import io.vectorsync.controlplane.repository.DiscoveredTableRepository;
 import io.vectorsync.controlplane.repository.SyncJobRepository;
 import io.vectorsync.controlplane.service.IcebergTableDiscoveryService;
+import io.vectorsync.controlplane.service.iceberg.IcebergCatalogService;
+import io.vectorsync.format.catalog.IcebergCatalogConfig;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.conf.Configuration;
@@ -23,6 +25,7 @@ public class TableSyncController {
     private final IcebergTableDiscoveryService discoveryService;
     private final SyncJobRepository syncJobRepository;
     private final DiscoveredTableRepository discoveredTableRepository;
+    private final IcebergCatalogService catalogService;
     
     /**
      * Trigger table sync from S3
@@ -49,21 +52,38 @@ public class TableSyncController {
                             .build());
         }
         
-        // Generate job ID
+        // Credentials come from the request when supplied, otherwise from the control plane's
+        // own configuration. Callers such as the dashboard deliberately do not send secrets, and
+        // Hadoop's Configuration.set rejects null values outright -- previously any request
+        // without credentials failed with a 500 rather than a usable message.
+        IcebergCatalogConfig configured = catalogService.config();
+        String accessKey = firstNonBlank(request.getAwsAccessKey(), configured.getS3AccessKey());
+        String secretKey = firstNonBlank(request.getAwsSecretKey(), configured.getS3SecretKey());
+        String endpoint = firstNonBlank(request.getAwsEndpoint(), configured.getS3Endpoint());
+        String region = firstNonBlank(request.getAwsRegion(), configured.getS3Region());
+
+        if (accessKey == null || secretKey == null) {
+            return ResponseEntity.badRequest().body(
+                    SyncResponse.builder()
+                            .success(false)
+                            .message("No object-store credentials: supply awsAccessKey and "
+                                    + "awsSecretKey, or configure AWS_S3_ACCESS_KEY and "
+                                    + "AWS_S3_SECRET_KEY on the control plane")
+                            .build());
+        }
+
         String jobId = UUID.randomUUID().toString();
-        
-        // Create Hadoop configuration
+
         Configuration hadoopConf = new Configuration();
-        hadoopConf.set("fs.s3a.access.key", request.getAwsAccessKey());
-        hadoopConf.set("fs.s3a.secret.key", request.getAwsSecretKey());
-        hadoopConf.set("fs.s3a.endpoint", request.getAwsEndpoint() != null ?
-                request.getAwsEndpoint() : "s3.amazonaws.com");
+        hadoopConf.set("fs.s3a.access.key", accessKey);
+        hadoopConf.set("fs.s3a.secret.key", secretKey);
+        hadoopConf.set("fs.s3a.endpoint", endpoint == null ? "s3.amazonaws.com" : endpoint);
         hadoopConf.set("fs.s3a.path.style.access", "true");
         hadoopConf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem");
-        
-        // Set region if provided (optional, will be auto-detected from endpoint if not provided)
-        if (request.getAwsRegion() != null && !request.getAwsRegion().isEmpty()) {
-            hadoopConf.set("fs.s3a.region", request.getAwsRegion());
+        hadoopConf.set("fs.s3a.connection.ssl.enabled", "false");
+
+        if (region != null) {
+            hadoopConf.set("fs.s3a.region", region);
         }
         
         // Start async discovery
@@ -167,6 +187,13 @@ public class TableSyncController {
                 .orElse(ResponseEntity.notFound().build());
     }
     
+    private static String firstNonBlank(String preferred, String fallback) {
+        if (preferred != null && !preferred.isBlank()) {
+            return preferred;
+        }
+        return fallback == null || fallback.isBlank() ? null : fallback;
+    }
+
     // Request/Response DTOs
     
     @lombok.Data
