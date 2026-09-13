@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS table_configs (
     table_name VARCHAR(255) NOT NULL,
     embedding_columns TEXT NOT NULL,
     model_name VARCHAR(255) NOT NULL,
+    embedding_version VARCHAR(64) NOT NULL DEFAULT 'v1',
     enabled BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP,

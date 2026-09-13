@@ -9,12 +9,12 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -24,74 +24,123 @@ class VectorRecordCodecTest {
     private static final Instant CREATED_AT = Instant.parse("2026-01-02T03:04:05Z");
 
     private static VectorRecord sample(boolean deleted) {
-        Map<String, String> metadata = new HashMap<>();
-        metadata.put("snapshot_id", "102");
-        metadata.put("operation", deleted ? "DELETE" : "INSERT");
-
         return VectorRecord.builder()
                 .vectorId("v-1")
                 .sourceTable("default.products")
                 .sourceRowId("p-100")
+                .sourceSnapshotId(4242L)
+                .chunkOrdinal(3)
+                .embeddingModel("all-MiniLM-L6-v2")
+                .embeddingVersion("v2")
+                .embeddingDim(3)
+                .preprocessingId("pp-abc")
                 .embedding(List.of(0.5, -0.25, 1.0))
                 .text("Trail Runner | Lightweight trail running shoe")
-                .metadata(metadata)
-                .modelName("all-MiniLM-L6-v2")
-                .createdAt(CREATED_AT)
                 .deleted(deleted)
+                .metadata(Map.of("operation", deleted ? "DELETE" : "INSERT"))
+                .createdAt(CREATED_AT)
                 .build();
     }
 
     @Test
-    @DisplayName("a live record survives a write/read round trip")
-    void roundTripsLiveRecord() {
+    @DisplayName("all lineage fields survive a write/read round trip")
+    void roundTripsLineage() {
         VectorRecord decoded = VectorRecordCodec.fromIcebergRecord(
                 VectorRecordCodec.toIcebergRecord(SCHEMA, sample(false)));
 
         assertEquals("v-1", decoded.getVectorId());
         assertEquals("default.products", decoded.getSourceTable());
         assertEquals("p-100", decoded.getSourceRowId());
-        assertEquals(List.of(0.5, -0.25, 1.0), decoded.getEmbedding());
+        assertEquals(4242L, decoded.getSourceSnapshotId());
+        assertEquals(3, decoded.getChunkOrdinal());
+        assertEquals("all-MiniLM-L6-v2", decoded.getEmbeddingModel());
+        assertEquals("v2", decoded.getEmbeddingVersion());
+        assertEquals(3, decoded.getEmbeddingDim());
+        assertEquals("pp-abc", decoded.getPreprocessingId());
         assertEquals("Trail Runner | Lightweight trail running shoe", decoded.getText());
-        assertEquals("all-MiniLM-L6-v2", decoded.getModelName());
         assertEquals(CREATED_AT, decoded.getCreatedAt());
         assertFalse(decoded.isDeleted());
-        assertEquals("102", decoded.getMetadata().get("snapshot_id"));
+        assertEquals("INSERT", decoded.getMetadata().get("operation"));
     }
 
     @Test
-    @DisplayName("the deleted flag survives the round trip via metadata")
-    void roundTripsTombstone() {
+    @DisplayName("the synthetic model_version partition column is written")
+    void writesModelVersionPartitionColumn() {
+        Record encoded = VectorRecordCodec.toIcebergRecord(SCHEMA, sample(false));
+
+        assertEquals("all-MiniLM-L6-v2:v2", encoded.getField(Constants.MODEL_VERSION_COLUMN));
+    }
+
+    @Test
+    @DisplayName("embeddings are narrowed to float32 on write")
+    void narrowsEmbeddingToFloat() {
+        Record encoded = VectorRecordCodec.toIcebergRecord(SCHEMA, sample(false));
+
+        Object embedding = encoded.getField(Constants.EMBEDDING_COLUMN);
+        assertTrue(embedding instanceof List<?>);
+        assertEquals(List.of(0.5f, -0.25f, 1.0f), embedding);
+    }
+
+    @Test
+    @DisplayName("float32 values widen back without drift for representable values")
+    void widensFloatBackToDouble() {
         VectorRecord decoded = VectorRecordCodec.fromIcebergRecord(
-                VectorRecordCodec.toIcebergRecord(SCHEMA, sample(true)));
+                VectorRecordCodec.toIcebergRecord(SCHEMA, sample(false)));
 
-        assertTrue(decoded.isDeleted());
-        assertEquals("true", decoded.getMetadata().get("deleted"));
+        assertEquals(List.of(0.5, -0.25, 1.0), decoded.getEmbedding());
     }
 
     @Test
-    @DisplayName("source table falls back to metadata when the column is absent")
-    void fallsBackToMetadataSourceTable() {
-        Record record = GenericRecord.create(SCHEMA);
-        record.setField(Constants.VECTOR_ID_COLUMN, "v-2");
-        record.setField(Constants.METADATA_COLUMN, Map.of(
-                "source_table", "default.reviews",
-                "id", "r-9"));
-        record.setField(Constants.MODEL_NAME_COLUMN, "m1");
+    @DisplayName("deleted is a typed column, not a metadata string")
+    void deletedIsTypedColumn() {
+        Record encoded = VectorRecordCodec.toIcebergRecord(SCHEMA, sample(true));
 
-        VectorRecord decoded = VectorRecordCodec.fromIcebergRecord(record);
+        assertEquals(Boolean.TRUE, encoded.getField(Constants.DELETED_COLUMN));
+        assertTrue(VectorRecordCodec.fromIcebergRecord(encoded).isDeleted());
+    }
 
-        assertEquals("default.reviews", decoded.getSourceTable());
-        assertEquals("r-9", decoded.getSourceRowId());
+    @Test
+    @DisplayName("a tombstone carries no text and no embedding")
+    void tombstoneHasNoPayload() {
+        VectorRecord tombstone = VectorRecord.builder()
+                .vectorId("v-del")
+                .sourceTable("default.products")
+                .sourceRowId("p-100")
+                .sourceSnapshotId(99L)
+                .embeddingModel("m")
+                .embeddingVersion("v1")
+                .embeddingDim(0)
+                .preprocessingId("pp")
+                .embedding(List.of())
+                .text(null)
+                .deleted(true)
+                .createdAt(CREATED_AT)
+                .build();
+
+        VectorRecord decoded = VectorRecordCodec.fromIcebergRecord(
+                VectorRecordCodec.toIcebergRecord(SCHEMA, tombstone));
+
+        assertNull(decoded.getText());
+        assertEquals(List.of(), decoded.getEmbedding());
+        assertTrue(decoded.isDeleted());
     }
 
     @Test
     @DisplayName("epoch-microsecond timestamps decode, as produced by some projected scans")
     void decodesEpochMicrosTimestamp() {
-        Record record = GenericRecord.create(SCHEMA);
-        record.setField(Constants.VECTOR_ID_COLUMN, "v-3");
-        record.setField(Constants.CREATED_AT_COLUMN, CREATED_AT.getEpochSecond() * 1_000_000L);
+        assertEquals(CREATED_AT, VectorRecordCodec.toInstant(CREATED_AT.getEpochSecond() * 1_000_000L));
+    }
 
-        assertEquals(CREATED_AT, VectorRecordCodec.fromIcebergRecord(record).getCreatedAt());
+    @Test
+    @DisplayName("a null createdAt is stamped at write time rather than failing a required column")
+    void stampsMissingCreatedAt() {
+        VectorRecord noTimestamp = sample(false);
+        noTimestamp.setCreatedAt(null);
+
+        Record encoded = VectorRecordCodec.toIcebergRecord(SCHEMA, noTimestamp);
+
+        assertNotNull(encoded.getField(Constants.CREATED_AT_COLUMN));
+        assertNotNull(VectorRecordCodec.fromIcebergRecord(encoded).getCreatedAt());
     }
 
     @Test
@@ -105,26 +154,6 @@ class VectorRecordCodecTest {
         assertEquals(List.of(), decoded.getEmbedding());
         assertNull(decoded.getCreatedAt());
         assertFalse(decoded.isDeleted());
-    }
-
-    @Test
-    @DisplayName("a null metadata map on the DTO still yields the deleted marker on write")
-    void writesDeletedMarkerWithNullMetadata() {
-        VectorRecord withoutMetadata = VectorRecord.builder()
-                .vectorId("v-5")
-                .sourceTable("default.products")
-                .sourceRowId("p-1")
-                .embedding(List.of(1.0))
-                .text("t")
-                .metadata(null)
-                .modelName("m1")
-                .createdAt(CREATED_AT)
-                .deleted(true)
-                .build();
-
-        VectorRecord decoded = VectorRecordCodec.fromIcebergRecord(
-                VectorRecordCodec.toIcebergRecord(SCHEMA, withoutMetadata));
-
-        assertTrue(decoded.isDeleted());
+        assertEquals(0L, decoded.getSourceSnapshotId());
     }
 }

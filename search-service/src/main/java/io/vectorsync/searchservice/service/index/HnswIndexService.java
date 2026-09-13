@@ -253,7 +253,7 @@ public class HnswIndexService {
                         nullSafe(record.getVectorId()),
                         nullSafe(record.getSourceTable()),
                         nullSafe(record.getSourceRowId()),
-                        nullSafe(record.getModelName()),
+                        nullSafe(record.modelVersion()),
                         nullSafe(record.getCreatedAt() == null ? null : record.getCreatedAt().toString())))
                 .sorted()
                 .collect(Collectors.joining("\n"));

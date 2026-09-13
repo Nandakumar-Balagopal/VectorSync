@@ -3,12 +3,17 @@ package io.vectorsync.worker.service;
 import io.vectorsync.common.dto.ChangeEvent;
 import io.vectorsync.common.dto.TableConfig;
 import io.vectorsync.common.dto.VectorRecord;
+import io.vectorsync.format.vector.VectorIds;
 import io.vectorsync.worker.service.embedding.EmbeddingException;
 import io.vectorsync.worker.service.embedding.EmbeddingService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+
 import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 @Service
 @Slf4j
@@ -43,45 +48,44 @@ public class CDCService {
         log.debug("Processing change event for table: {}", tableConfig.getTableName());
 
         String sourceRowId = extractRowId(event);
-        Map<String, String> metadata = extractMetadata(event);
-        metadata.put("source_table", tableConfig.getTableName());
-        metadata.put("source_row_id", sourceRowId);
-        metadata.put("id", sourceRowId);
-        metadata.put("operation", event.getOperation());
+        String preprocessingId = preprocessingId(tableConfig);
+        boolean delete = ChangeEvent.OPERATION_DELETE.equals(event.getOperation());
 
-        if (ChangeEvent.OPERATION_DELETE.equals(event.getOperation())) {
-            return VectorRecord.builder()
-                    .vectorId(UUID.randomUUID().toString())
-                    .sourceTable(tableConfig.getTableName())
-                    .sourceRowId(sourceRowId)
-                    .embedding(Collections.emptyList())
-                    .text("")
-                    .metadata(metadata)
-                    .modelName(tableConfig.getModelName())
-                    .createdAt(Instant.now())
-                    .deleted(true)
-                    .build();
+        String textContent = null;
+        List<Double> embedding = List.of();
+
+        if (!delete) {
+            textContent = extractTextContent(tableConfig, event);
+            if (textContent == null || textContent.isBlank()) {
+                log.warn("No text content found for event in table {}", tableConfig.getTableName());
+                return null;
+            }
+            embedding = embeddingService.generateEmbedding(textContent);
         }
 
-        String textContent = extractTextContent(tableConfig, event);
-        if (textContent == null || textContent.isBlank()) {
-            log.warn("No text content found for event in table {}", tableConfig.getTableName());
-            return null;
-        }
-
-        List<Double> embedding = embeddingService.generateEmbedding(textContent);
-
-        return VectorRecord.builder()
-                .vectorId(UUID.randomUUID().toString())
+        VectorRecord record = VectorRecord.builder()
                 .sourceTable(tableConfig.getTableName())
                 .sourceRowId(sourceRowId)
+                .sourceSnapshotId(event.getSnapshotId())
+                .chunkOrdinal(0)
+                .embeddingModel(tableConfig.getModelName())
+                .embeddingVersion(tableConfig.embeddingVersionOrDefault())
+                .embeddingDim(embedding.size())
+                .preprocessingId(preprocessingId)
                 .embedding(embedding)
                 .text(textContent)
-                .metadata(metadata)
-                .modelName(tableConfig.getModelName())
+                .deleted(delete)
+                .metadata(extractMetadata(event))
                 .createdAt(Instant.now())
-                .deleted(false)
                 .build();
+
+        // Identity is derived from lineage, so re-materializing a snapshot is idempotent.
+        record.setVectorId(VectorIds.vectorId(record));
+        return record;
+    }
+
+    private String preprocessingId(TableConfig tableConfig) {
+        return VectorIds.preprocessingId(tableConfig.getEmbeddingColumns(), TableConfig.TEXT_JOIN_SEPARATOR);
     }
 
     private String extractTextContent(TableConfig tableConfig, ChangeEvent event) {
@@ -92,9 +96,9 @@ public class CDCService {
             Object value = event.getRowData().get(column);
             if (value != null) {
                 if (sb.length() > 0) {
-                    sb.append(" | ");
+                    sb.append(TableConfig.TEXT_JOIN_SEPARATOR);
                 }
-                sb.append(value.toString());
+                sb.append(value);
             }
         }
 
@@ -103,17 +107,26 @@ public class CDCService {
 
     private String extractRowId(ChangeEvent event) {
         Object rowId = event.getRowData().get("id");
-        if (rowId != null) {
-            return rowId.toString();
+        if (rowId == null) {
+            rowId = event.getRowData().get("ID");
         }
-        return UUID.randomUUID().toString();
+        if (rowId == null) {
+            throw new IllegalArgumentException(
+                    "Source rows must contain an id column; cannot derive a stable vector identity without one");
+        }
+        return rowId.toString();
     }
 
+    /**
+     * Only non-lineage extras belong here. Snapshot, model, version, and row identity are typed
+     * columns in format v2 so they can be partitioned and range-pruned.
+     */
     private Map<String, String> extractMetadata(ChangeEvent event) {
         Map<String, String> metadata = new HashMap<>();
-        metadata.put("snapshot_id", String.valueOf(event.getSnapshotId()));
-        metadata.put("previous_snapshot_id", String.valueOf(event.getPreviousSnapshotId()));
-        metadata.put("detected_at", event.getDetectedAt().toString());
+        metadata.put("operation", event.getOperation());
+        if (event.getDetectedAt() != null) {
+            metadata.put("detected_at", event.getDetectedAt().toString());
+        }
         return metadata;
     }
 }

@@ -6,44 +6,44 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.util.List;
-import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Pins the resolution semantics that every reader of the vector table must agree on.
+ * Pins the resolution semantics every reader of the vector table must agree on.
  */
 class VectorResolutionTest {
 
-    private static final Instant T1 = Instant.parse("2026-01-01T00:00:00Z");
-    private static final Instant T2 = Instant.parse("2026-01-02T00:00:00Z");
-    private static final Instant T3 = Instant.parse("2026-01-03T00:00:00Z");
-
     private static VectorRecord record(String vectorId,
                                        String sourceRowId,
-                                       String modelName,
-                                       Instant createdAt,
+                                       long snapshotId,
+                                       String model,
+                                       String version,
                                        boolean deleted) {
         return VectorRecord.builder()
                 .vectorId(vectorId)
                 .sourceTable("default.products")
                 .sourceRowId(sourceRowId)
+                .sourceSnapshotId(snapshotId)
+                .chunkOrdinal(0)
+                .embeddingModel(model)
+                .embeddingVersion(version)
+                .embeddingDim(2)
+                .preprocessingId("pp1")
                 .embedding(List.of(1.0, 0.0))
                 .text("text-" + vectorId)
-                .metadata(Map.of())
-                .modelName(modelName)
-                .createdAt(createdAt)
                 .deleted(deleted)
+                .createdAt(Instant.parse("2026-01-01T00:00:00Z"))
                 .build();
     }
 
     @Test
-    @DisplayName("newest record wins for the same source row and model")
-    void newestWins() {
+    @DisplayName("the newest source snapshot wins for the same key")
+    void newestSnapshotWins() {
         List<VectorRecord> resolved = VectorResolution.latestLiveVectors(List.of(
-                record("v1", "p-100", "m1", T1, false),
-                record("v2", "p-100", "m1", T2, false)
+                record("v1", "p-100", 100L, "m", "v1", false),
+                record("v2", "p-100", 200L, "m", "v1", false)
         ));
 
         assertEquals(1, resolved.size());
@@ -54,32 +54,58 @@ class VectorResolutionTest {
     @DisplayName("input ordering does not affect the winner")
     void orderIndependent() {
         List<VectorRecord> resolved = VectorResolution.latestLiveVectors(List.of(
-                record("v2", "p-100", "m1", T2, false),
-                record("v1", "p-100", "m1", T1, false)
+                record("v2", "p-100", 200L, "m", "v1", false),
+                record("v1", "p-100", 100L, "m", "v1", false)
         ));
 
-        assertEquals(1, resolved.size());
         assertEquals("v2", resolved.get(0).getVectorId());
+    }
+
+    @Test
+    @DisplayName("wall-clock createdAt does not override snapshot ordering")
+    void snapshotBeatsWallClock() {
+        VectorRecord older = record("v-old", "p-100", 100L, "m", "v1", false);
+        older.setCreatedAt(Instant.parse("2026-06-01T00:00:00Z"));
+
+        VectorRecord newer = record("v-new", "p-100", 200L, "m", "v1", false);
+        newer.setCreatedAt(Instant.parse("2026-01-01T00:00:00Z"));
+
+        List<VectorRecord> resolved = VectorResolution.latestLiveVectors(List.of(older, newer));
+
+        assertEquals(1, resolved.size());
+        assertEquals("v-new", resolved.get(0).getVectorId(), "higher snapshot must win despite an older clock");
+    }
+
+    @Test
+    @DisplayName("createdAt breaks ties only within one snapshot")
+    void createdAtBreaksTiesWithinSnapshot() {
+        VectorRecord first = record("v-first", "p-100", 100L, "m", "v1", false);
+        first.setCreatedAt(Instant.parse("2026-01-01T00:00:00Z"));
+
+        VectorRecord second = record("v-second", "p-100", 100L, "m", "v1", false);
+        second.setCreatedAt(Instant.parse("2026-01-02T00:00:00Z"));
+
+        List<VectorRecord> resolved = VectorResolution.latestLiveVectors(List.of(first, second));
+
+        assertEquals("v-second", resolved.get(0).getVectorId());
     }
 
     @Test
     @DisplayName("a tombstone hides the source row")
     void tombstoneHidesRow() {
-        List<VectorRecord> resolved = VectorResolution.latestLiveVectors(List.of(
-                record("v1", "p-100", "m1", T1, false),
-                record("v2", "p-100", "m1", T2, true)
-        ));
-
-        assertTrue(resolved.isEmpty());
+        assertTrue(VectorResolution.latestLiveVectors(List.of(
+                record("v1", "p-100", 100L, "m", "v1", false),
+                record("v2", "p-100", 200L, "m", "v1", true)
+        )).isEmpty());
     }
 
     @Test
-    @DisplayName("a re-insert after a tombstone revives the source row")
+    @DisplayName("a re-insert at a later snapshot revives the source row")
     void reinsertAfterTombstone() {
         List<VectorRecord> resolved = VectorResolution.latestLiveVectors(List.of(
-                record("v1", "p-100", "m1", T1, false),
-                record("v2", "p-100", "m1", T2, true),
-                record("v3", "p-100", "m1", T3, false)
+                record("v1", "p-100", 100L, "m", "v1", false),
+                record("v2", "p-100", 200L, "m", "v1", true),
+                record("v3", "p-100", 300L, "m", "v1", false)
         ));
 
         assertEquals(1, resolved.size());
@@ -87,29 +113,54 @@ class VectorResolutionTest {
     }
 
     @Test
-    @DisplayName("different models coexist rather than superseding each other")
-    void modelsCoexist() {
+    @DisplayName("embedding versions coexist rather than superseding each other")
+    void versionsCoexist() {
         List<VectorRecord> resolved = VectorResolution.latestLiveVectors(List.of(
-                record("v1", "p-100", "model-v1", T1, false),
-                record("v2", "p-100", "model-v2", T2, false)
+                record("v1", "p-100", 100L, "minilm", "v1", false),
+                record("v2", "p-100", 100L, "mpnet", "v2", false)
         ));
 
         assertEquals(2, resolved.size());
         assertEquals(
-                List.of("model-v1", "model-v2"),
-                resolved.stream().map(VectorRecord::getModelName).sorted().toList());
+                List.of("minilm:v1", "mpnet:v2"),
+                resolved.stream().map(VectorRecord::modelVersion).sorted().toList());
     }
 
     @Test
-    @DisplayName("a tombstone for one model does not hide another model's vector")
-    void tombstoneIsPerModel() {
+    @DisplayName("a tombstone in one version does not hide another version")
+    void tombstoneIsPerModelVersion() {
         List<VectorRecord> resolved = VectorResolution.latestLiveVectors(List.of(
-                record("v1", "p-100", "model-v1", T1, true),
-                record("v2", "p-100", "model-v2", T2, false)
+                record("v1", "p-100", 200L, "minilm", "v1", true),
+                record("v2", "p-100", 200L, "mpnet", "v2", false)
         ));
 
         assertEquals(1, resolved.size());
-        assertEquals("model-v2", resolved.get(0).getModelName());
+        assertEquals("mpnet:v2", resolved.get(0).modelVersion());
+    }
+
+    @Test
+    @DisplayName("chunks of the same row resolve independently")
+    void chunksResolveIndependently() {
+        VectorRecord chunk0 = record("v-c0", "p-100", 100L, "m", "v1", false);
+        VectorRecord chunk1 = record("v-c1", "p-100", 100L, "m", "v1", false);
+        chunk1.setChunkOrdinal(1);
+
+        assertEquals(2, VectorResolution.latestLiveVectors(List.of(chunk0, chunk1)).size());
+    }
+
+    @Test
+    @DisplayName("asOf ignores embeddings derived from later snapshots")
+    void asOfSnapshotIsReproducible() {
+        List<VectorRecord> history = List.of(
+                record("v1", "p-100", 100L, "m", "v1", false),
+                record("v2", "p-100", 200L, "m", "v1", false),
+                record("v3", "p-100", 300L, "m", "v1", true)
+        );
+
+        assertEquals("v1", VectorResolution.liveVectorsAsOf(history, 100L).get(0).getVectorId());
+        assertEquals("v2", VectorResolution.liveVectorsAsOf(history, 200L).get(0).getVectorId());
+        assertEquals("v2", VectorResolution.liveVectorsAsOf(history, 250L).get(0).getVectorId());
+        assertTrue(VectorResolution.liveVectorsAsOf(history, 300L).isEmpty());
     }
 
     @Test
@@ -119,47 +170,20 @@ class VectorResolutionTest {
                 .vectorId("v-keyless")
                 .sourceTable(null)
                 .sourceRowId(null)
+                .embeddingModel("m")
+                .embeddingVersion("v1")
                 .embedding(List.of(1.0))
-                .metadata(Map.of())
-                .modelName("m1")
-                .createdAt(T1)
+                .createdAt(Instant.now())
                 .build();
 
         assertTrue(VectorResolution.latestLiveVectors(List.of(keyless)).isEmpty());
     }
 
     @Test
-    @DisplayName("source key falls back to metadata source_row_id then id")
-    void sourceKeyFallsBackToMetadata() {
-        VectorRecord viaSourceRowId = VectorRecord.builder()
-                .vectorId("v1")
-                .sourceRowId(null)
-                .metadata(Map.of("source_table", "default.products", "source_row_id", "p-100"))
-                .modelName("m1")
-                .createdAt(T1)
-                .build();
-
-        VectorRecord viaId = VectorRecord.builder()
-                .vectorId("v2")
-                .sourceRowId(null)
-                .metadata(Map.of("source_table", "default.products", "id", "p-200"))
-                .modelName("m1")
-                .createdAt(T1)
-                .build();
-
-        assertEquals("default.products::p-100::m1", VectorResolution.sourceKey(viaSourceRowId));
-        assertEquals("default.products::p-200::m1", VectorResolution.sourceKey(viaId));
-    }
-
-    @Test
-    @DisplayName("a null createdAt sorts oldest so a timestamped record supersedes it")
-    void nullCreatedAtSortsFirst() {
-        List<VectorRecord> resolved = VectorResolution.latestLiveVectors(List.of(
-                record("v-null", "p-100", "m1", null, false),
-                record("v-dated", "p-100", "m1", T1, false)
-        ));
-
-        assertEquals(1, resolved.size());
-        assertEquals("v-dated", resolved.get(0).getVectorId());
+    @DisplayName("the source key spans table, row, chunk, and model version")
+    void sourceKeyShape() {
+        assertEquals(
+                "default.products::p-100::0::m:v1",
+                VectorResolution.sourceKey(record("v1", "p-100", 100L, "m", "v1", false)));
     }
 }

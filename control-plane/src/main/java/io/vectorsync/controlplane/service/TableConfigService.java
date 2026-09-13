@@ -44,6 +44,7 @@ public class TableConfigService {
                     .tableName(config.getTableName())
                     .embeddingColumns(config.getEmbeddingColumns() == null ? "" : String.join(",", config.getEmbeddingColumns()))
                     .modelName(config.getModelName())
+                    .embeddingVersion(config.embeddingVersionOrDefault())
                     .enabled(config.isEnabled())
                     .createdAt(Instant.now())
                     .updatedAt(Instant.now())
@@ -125,6 +126,7 @@ public class TableConfigService {
                 .tableName(entity.getTableName())
                 .embeddingColumns(columns)
                 .modelName(entity.getModelName())
+                .embeddingVersion(entity.getEmbeddingVersion())
                 .enabled(entity.isEnabled())
                 .createdAt(entity.getCreatedAt())
                 .build();
