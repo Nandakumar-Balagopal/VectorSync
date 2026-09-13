@@ -61,7 +61,7 @@ public class SearchService {
         }
 
         log.info("No promoted index for {}; falling back to exact search", sourceTable);
-        return searchExact(queryEmbedding, k, sourceTable);
+        return searchExact(queryEmbedding, k, sourceTable, null);
     }
 
     /** Searches a specific index version, which is how a candidate is evaluated before promotion. */
@@ -108,14 +108,25 @@ public class SearchService {
     /**
      * Exhaustive cosine scan. Slower, but exact, so it doubles as the ground truth that index
      * recall is measured against.
+     *
+     * @param modelVersion when set, restricts the scan to one embedding version. Leaving it null
+     *        scans every version materialized for the table, which mixes embedding spaces: a query
+     *        embedded with one model scored against vectors from another is meaningless, and the
+     *        same row appears once per version. Always scope it when comparing against an index.
      */
-    public List<SearchResult> searchExact(List<Double> queryEmbedding, int k, String sourceTable) {
+    public List<SearchResult> searchExact(List<Double> queryEmbedding,
+                                          int k,
+                                          String sourceTable,
+                                          String modelVersion) {
         long startTime = System.currentTimeMillis();
 
         List<VectorRecord> candidates = vectorSyncReader.readAllVectors().stream()
                 .filter(vector -> sourceTable == null
                         || sourceTable.isBlank()
                         || sourceTable.equals(vector.getSourceTable()))
+                .filter(vector -> modelVersion == null
+                        || modelVersion.isBlank()
+                        || modelVersion.equals(vector.modelVersion()))
                 .filter(vector -> vector.getEmbedding() != null && !vector.getEmbedding().isEmpty())
                 .toList();
 
@@ -131,13 +142,15 @@ public class SearchService {
                 .limit(k)
                 .toList();
 
-        log.info("Exact search returned {} of {} candidates in {}ms",
+        log.info("Exact search over {} returned {} of {} candidates in {}ms",
+                modelVersion == null ? "all versions" : modelVersion,
                 results.size(), candidates.size(), System.currentTimeMillis() - startTime);
         return results;
     }
 
-    public List<SearchResult> searchExact(String query, int k, String sourceTable) throws Exception {
-        return searchExact(embeddingClientService.generateEmbedding(query), k, sourceTable);
+    public List<SearchResult> searchExact(String query, int k, String sourceTable, String modelVersion)
+            throws Exception {
+        return searchExact(embeddingClientService.generateEmbedding(query), k, sourceTable, modelVersion);
     }
 
     public Map<String, Object> getIndexStats() {

@@ -30,8 +30,21 @@ public class VectorRecord {
     private String sourceTable;
     private String sourceRowId;
 
-    /** Iceberg snapshot of the source table this embedding was derived from. */
+    /**
+     * Iceberg snapshot of the source table this embedding was derived from. Identifies the source
+     * version but must NOT be used for ordering: Iceberg snapshot ids are random longs, not a
+     * monotonic sequence.
+     */
     private long sourceSnapshotId;
+
+    /**
+     * Iceberg's snapshot sequence number, which the spec guarantees increases monotonically per
+     * table. This is the ordering key that decides which embedding supersedes which.
+     */
+    private long sourceSequenceNumber;
+
+    /** When the source snapshot was committed, recorded in table metadata. Tiebreak only. */
+    private long sourceCommittedAtMillis;
 
     /** Position within the source row's chunk sequence; 0 when the whole row is one chunk. */
     private int chunkOrdinal;

@@ -222,15 +222,24 @@ row_history="$(curl -fsS --max-time 30 "${SEARCH_URL}/api/provenance/row?sourceT
 assert_eq "$(jget "$row_history" "len(d)")" "2" "p-100 should have one stored embedding per version"
 
 echo
-echo "=== 8. Deletes remain excluded under both versions ==="
+echo "=== 8. Deletes remain excluded under EVERY version ==="
 curl -fsS --max-time 30 -X DELETE "${WORKER_URL}/api/demo/products/p-100" >/dev/null
 sync="$(curl -fsS --max-time 180 -X POST "${WORKER_URL}/api/demo/sync")"
-echo "  live vectors after delete: $(jget "$sync" "d['vectorCount']")"
+# 4 rows x 2 versions = 8, minus both versions of the deleted row = 6. Tombstoning only the
+# currently configured version would leave 7 and keep the row discoverable under the other.
+assert_eq "$(jget "$sync" "d['vectorCount']")" "6" \
+  "a delete must tombstone the row under every materialized version"
 
-after_delete="$(curl -fsS --max-time 60 -X POST "${SEARCH_URL}/api/search/exact" \
-  -H 'Content-Type: application/json' \
-  -d "{\"query\":\"lightweight running shoe\",\"topK\":8,\"sourceTable\":\"${SOURCE_TABLE}\"}")"
-assert_not_contains "$after_delete" '"sourceRowId":"p-100"' "a deleted row must not appear in results"
+for version in v1 v2; do
+  after_delete="$(curl -fsS --max-time 60 -X POST "${SEARCH_URL}/api/search/exact" \
+    -H 'Content-Type: application/json' \
+    -d "{\"query\":\"lightweight running shoe\",\"topK\":8,\"sourceTable\":\"${SOURCE_TABLE}\",\"modelVersion\":\"all-MiniLM-L6-v2:${version}\"}")"
+  assert_not_contains "$after_delete" '"sourceRowId":"p-100"' \
+    "a deleted row must not appear under ${version}"
+  # scoping to one version means each row appears once, not once per version
+  assert_eq "$(jget "$after_delete" "d['totalResults']")" "3" \
+    "exact search scoped to ${version} should return the three surviving rows once each"
+done
 
 echo
 echo "✓ End-to-end lifecycle test passed"

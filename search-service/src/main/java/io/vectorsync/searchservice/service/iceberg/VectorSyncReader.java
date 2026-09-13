@@ -46,9 +46,9 @@ public class VectorSyncReader {
                 .toList();
     }
 
-    /** Live vectors as they stood at a source snapshot, for a reproducible rebuild. */
-    public List<VectorRecord> readForIndexAsOf(String sourceTable, String modelVersion, long sourceSnapshotId) {
-        return VectorResolution.liveVectorsAsOf(readRaw(), sourceSnapshotId).stream()
+    /** Live vectors as they stood at a source sequence number, for a reproducible rebuild. */
+    public List<VectorRecord> readForIndexAsOf(String sourceTable, String modelVersion, long sourceSequenceNumber) {
+        return VectorResolution.liveVectorsAsOf(readRaw(), sourceSequenceNumber).stream()
                 .filter(vector -> sourceTable.equals(vector.getSourceTable()))
                 .filter(vector -> modelVersion.equals(vector.modelVersion()))
                 .filter(vector -> vector.getEmbedding() != null && !vector.getEmbedding().isEmpty())
@@ -59,7 +59,16 @@ public class VectorSyncReader {
     public long latestSourceSnapshot(String sourceTable) {
         return readRaw().stream()
                 .filter(vector -> sourceTable.equals(vector.getSourceTable()))
-                .mapToLong(VectorRecord::getSourceSnapshotId)
+                .max(java.util.Comparator.comparingLong(VectorRecord::getSourceSequenceNumber))
+                .map(VectorRecord::getSourceSnapshotId)
+                .orElse(0L);
+    }
+
+    /** Highest source sequence number observed for a table. Orders history; snapshot ids do not. */
+    public long latestSourceSequenceNumber(String sourceTable) {
+        return readRaw().stream()
+                .filter(vector -> sourceTable.equals(vector.getSourceTable()))
+                .mapToLong(VectorRecord::getSourceSequenceNumber)
                 .max()
                 .orElse(0L);
     }

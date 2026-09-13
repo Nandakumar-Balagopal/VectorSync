@@ -4,9 +4,11 @@ import io.vectorsync.common.dto.ChangeEvent;
 import io.vectorsync.common.dto.TableConfig;
 import io.vectorsync.common.dto.VectorRecord;
 import io.vectorsync.worker.service.embedding.EmbeddingException;
+import io.vectorsync.worker.service.embedding.EmbeddingRequest;
 import io.vectorsync.worker.service.embedding.EmbeddingService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -32,7 +34,7 @@ class CDCServiceTest {
 
     /** Records how it was called, so batching can be asserted rather than assumed. */
     private static class RecordingEmbeddingService implements EmbeddingService {
-        final List<List<String>> batchCalls = new ArrayList<>();
+        final List<List<EmbeddingRequest>> batchCalls = new ArrayList<>();
         int singleCalls;
         boolean fail;
 
@@ -43,19 +45,32 @@ class CDCServiceTest {
         }
 
         @Override
-        public List<List<Double>> generateEmbeddings(List<String> texts) throws EmbeddingException {
-            batchCalls.add(List.copyOf(texts));
+        public Map<String, List<Double>> generateEmbeddings(List<EmbeddingRequest> requests)
+                throws EmbeddingException {
+            batchCalls.add(List.copyOf(requests));
             if (fail) {
                 throw new EmbeddingException("provider unavailable");
             }
-            return texts.stream().map(text -> List.of(1.0, 0.0, 0.0)).toList();
+            Map<String, List<Double>> result = new java.util.LinkedHashMap<>();
+            requests.forEach(request -> result.put(request.vectorId(), List.of(1.0, 0.0, 0.0)));
+            return result;
         }
+    }
+
+    /** A CDCService whose vector store reports the given already-materialized versions. */
+    private static CDCService cdc(EmbeddingService embeddings, String... materializedVersions) {
+        VectorStoreService store = Mockito.mock(VectorStoreService.class);
+        Mockito.when(store.materializedVersions(Mockito.anyString()))
+                .thenReturn(List.of(materializedVersions));
+        return new CDCService(embeddings, store);
     }
 
     private static ChangeEvent event(String operation, String id, String name, long snapshotId) {
         return ChangeEvent.builder()
                 .tableId("t-1")
                 .snapshotId(snapshotId)
+                .sequenceNumber(snapshotId / 100)
+                .committedAtMillis(1_760_000_000_000L + snapshotId)
                 .previousSnapshotId(snapshotId - 1)
                 .operation(operation)
                 .rowData(new java.util.HashMap<>(Map.of(
@@ -70,7 +85,7 @@ class CDCServiceTest {
     @DisplayName("a whole snapshot is embedded in one batch call, not one per row")
     void embedsInOneBatch() {
         RecordingEmbeddingService embeddings = new RecordingEmbeddingService();
-        CDCService service = new CDCService(embeddings);
+        CDCService service = cdc(embeddings);
 
         CDCService.MaterializationResult result = service.processChangeEvents(CONFIG, List.of(
                 event(ChangeEvent.OPERATION_INSERT, "p-1", "Trail Runner", 100L),
@@ -87,7 +102,7 @@ class CDCServiceTest {
     @Test
     @DisplayName("lineage is captured on every record")
     void capturesLineage() {
-        CDCService service = new CDCService(new RecordingEmbeddingService());
+        CDCService service = cdc(new RecordingEmbeddingService());
 
         VectorRecord record = service.processChangeEvents(CONFIG,
                 List.of(event(ChangeEvent.OPERATION_INSERT, "p-1", "Trail Runner", 4242L)))
@@ -96,6 +111,7 @@ class CDCServiceTest {
         assertEquals("default.products", record.getSourceTable());
         assertEquals("p-1", record.getSourceRowId());
         assertEquals(4242L, record.getSourceSnapshotId());
+        assertEquals(42L, record.getSourceSequenceNumber());
         assertEquals(0, record.getChunkOrdinal());
         assertEquals("all-MiniLM-L6-v2", record.getEmbeddingModel());
         assertEquals("v1", record.getEmbeddingVersion());
@@ -109,7 +125,7 @@ class CDCServiceTest {
     @Test
     @DisplayName("identity is deterministic across runs")
     void identityIsDeterministic() {
-        CDCService service = new CDCService(new RecordingEmbeddingService());
+        CDCService service = cdc(new RecordingEmbeddingService());
         ChangeEvent change = event(ChangeEvent.OPERATION_INSERT, "p-1", "Trail Runner", 100L);
 
         String first = service.processChangeEvents(CONFIG, List.of(change)).records().get(0).getVectorId();
@@ -122,7 +138,7 @@ class CDCServiceTest {
     @DisplayName("a delete becomes a tombstone and needs no embedding")
     void deleteProducesTombstone() {
         RecordingEmbeddingService embeddings = new RecordingEmbeddingService();
-        CDCService service = new CDCService(embeddings);
+        CDCService service = cdc(embeddings);
 
         CDCService.MaterializationResult result = service.processChangeEvents(CONFIG,
                 List.of(event(ChangeEvent.OPERATION_DELETE, "p-1", "Trail Runner", 200L)));
@@ -136,11 +152,42 @@ class CDCServiceTest {
     }
 
     @Test
+    @DisplayName("a delete tombstones every materialized version, not just the configured one")
+    void deleteTombstonesAllVersions() {
+        CDCService service = cdc(new RecordingEmbeddingService(),
+                "all-MiniLM-L6-v2:v1", "all-MiniLM-L6-v2:v2");
+
+        CDCService.MaterializationResult result = service.processChangeEvents(CONFIG,
+                List.of(event(ChangeEvent.OPERATION_DELETE, "p-1", "Trail Runner", 300L)));
+
+        assertEquals(2, result.records().size(),
+                "leaving an old version live would keep a deleted row discoverable");
+        assertTrue(result.records().stream().allMatch(VectorRecord::isDeleted));
+        assertEquals(
+                List.of("all-MiniLM-L6-v2:v1", "all-MiniLM-L6-v2:v2"),
+                result.records().stream().map(VectorRecord::modelVersion).sorted().toList());
+        assertEquals(2, result.records().stream().map(VectorRecord::getVectorId).distinct().count(),
+                "each version's tombstone has its own identity");
+    }
+
+    @Test
+    @DisplayName("a delete before anything is materialized still records the configured version")
+    void deleteWithNoMaterializedVersions() {
+        CDCService service = cdc(new RecordingEmbeddingService());
+
+        CDCService.MaterializationResult result = service.processChangeEvents(CONFIG,
+                List.of(event(ChangeEvent.OPERATION_DELETE, "p-1", "Trail Runner", 300L)));
+
+        assertEquals(1, result.records().size());
+        assertEquals("all-MiniLM-L6-v2:v1", result.records().get(0).modelVersion());
+    }
+
+    @Test
     @DisplayName("deletes still materialize when the embedding provider is down")
     void tombstonesSurviveProviderFailure() {
         RecordingEmbeddingService embeddings = new RecordingEmbeddingService();
         embeddings.fail = true;
-        CDCService service = new CDCService(embeddings);
+        CDCService service = cdc(embeddings);
 
         CDCService.MaterializationResult result = service.processChangeEvents(CONFIG, List.of(
                 event(ChangeEvent.OPERATION_DELETE, "p-1", "Trail Runner", 200L),
@@ -156,7 +203,7 @@ class CDCServiceTest {
     void batchFailureBlocksWatermark() {
         RecordingEmbeddingService embeddings = new RecordingEmbeddingService();
         embeddings.fail = true;
-        CDCService service = new CDCService(embeddings);
+        CDCService service = cdc(embeddings);
 
         CDCService.MaterializationResult result = service.processChangeEvents(CONFIG, List.of(
                 event(ChangeEvent.OPERATION_INSERT, "p-1", "a", 100L),
@@ -170,7 +217,7 @@ class CDCServiceTest {
     @Test
     @DisplayName("a row with no embeddable text is skipped, not counted as a failure")
     void blankTextIsSkippedNotFailed() {
-        CDCService service = new CDCService(new RecordingEmbeddingService());
+        CDCService service = cdc(new RecordingEmbeddingService());
 
         ChangeEvent blank = ChangeEvent.builder()
                 .tableId("t-1")
@@ -190,7 +237,7 @@ class CDCServiceTest {
     @Test
     @DisplayName("a row without an id fails rather than getting a random identity")
     void missingIdFails() {
-        CDCService service = new CDCService(new RecordingEmbeddingService());
+        CDCService service = cdc(new RecordingEmbeddingService());
 
         ChangeEvent noId = ChangeEvent.builder()
                 .tableId("t-1")
@@ -207,17 +254,18 @@ class CDCServiceTest {
     }
 
     @Test
-    @DisplayName("a provider returning the wrong count fails the batch instead of mismatching rows")
+    @DisplayName("a provider omitting a row fails the batch instead of mismatching rows")
     void countMismatchFailsBatch() {
-        CDCService service = new CDCService(new EmbeddingService() {
+        CDCService service = cdc(new EmbeddingService() {
             @Override
             public List<Double> generateEmbedding(String text) {
                 return List.of(1.0);
             }
 
             @Override
-            public List<List<Double>> generateEmbeddings(List<String> texts) {
-                return List.of(List.of(1.0));  // one embedding for two texts
+            public Map<String, List<Double>> generateEmbeddings(List<EmbeddingRequest> requests) {
+                // an embedding for only the first request
+                return Map.of(requests.get(0).vectorId(), List.of(1.0));
             }
         });
 

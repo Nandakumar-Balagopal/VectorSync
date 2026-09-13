@@ -76,7 +76,7 @@ public class SearchController {
         try {
             int k = request.getTopK() == null ? 10 : request.getTopK();
             List<SearchResult> results = searchService.searchExact(
-                    request.getQuery(), k, request.getSourceTable());
+                    request.getQuery(), k, request.getSourceTable(), request.getModelVersion());
 
             return ResponseEntity.ok(SearchResponse.builder()
                     .query(request.getQuery())

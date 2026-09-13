@@ -14,11 +14,16 @@ import java.util.Map;
  * <p>This is the most important definition in the format: the vector table is append-only, so
  * every reader must agree on how to collapse its history into a current view.
  *
- * <p>Format v2 resolves by {@code source_snapshot_id} rather than by wall-clock {@code created_at}.
- * Wall clock is metadata about the pipeline run, not about the data version: it is non-deterministic
- * across machines and cannot answer "what was live at source snapshot N?". Snapshot ordering is
- * deterministic, reproducible, and time-travel queryable. {@code created_at} survives only as a
- * tiebreak for two materializations of the same snapshot.
+ * <p>Resolution orders by Iceberg's snapshot <em>sequence number</em>, which the spec guarantees
+ * increases monotonically per table. It deliberately does not order by {@code source_snapshot_id}:
+ * Iceberg snapshot ids are random longs, so comparing them numerically silently reorders history
+ * and a later tombstone can lose to the row it was meant to delete. Nor does it order by
+ * wall-clock {@code created_at}, which is metadata about the pipeline run rather than the data
+ * version, is non-deterministic across machines, and cannot answer "what was live at source
+ * version N?".
+ *
+ * <p>Snapshot commit time and then {@code created_at} break ties, which matter only for two
+ * materializations of the same source version.
  */
 @Slf4j
 public final class VectorResolution {
@@ -31,7 +36,8 @@ public final class VectorResolution {
      * Snapshot id is primary; created_at breaks ties within a snapshot.
      */
     private static final Comparator<VectorRecord> OLDEST_FIRST =
-            Comparator.comparingLong(VectorRecord::getSourceSnapshotId)
+            Comparator.comparingLong(VectorRecord::getSourceSequenceNumber)
+                    .thenComparingLong(VectorRecord::getSourceCommittedAtMillis)
                     .thenComparing(VectorRecord::getCreatedAt,
                             Comparator.nullsFirst(Comparator.naturalOrder()));
 
@@ -41,16 +47,19 @@ public final class VectorResolution {
     }
 
     /**
-     * Collapses history as it stood at a source snapshot, ignoring anything derived from a later
-     * one. This is what makes a stored embedding set reproducible: the same inputs and the same
-     * target snapshot always yield the same answer.
+     * Collapses history as it stood at a source sequence number, ignoring anything derived from a
+     * later one. This is what makes a stored embedding set reproducible: the same inputs and the
+     * same target version always yield the same answer.
+     *
+     * <p>Takes a sequence number, not a snapshot id, because only sequence numbers are ordered.
      */
-    public static List<VectorRecord> liveVectorsAsOf(List<VectorRecord> records, long asOfSourceSnapshotId) {
+    public static List<VectorRecord> liveVectorsAsOf(List<VectorRecord> records,
+                                                     long asOfSourceSequenceNumber) {
         Map<String, VectorRecord> latestByKey = new LinkedHashMap<>();
 
         records.stream()
                 .filter(VectorResolution::hasSourceKey)
-                .filter(record -> record.getSourceSnapshotId() <= asOfSourceSnapshotId)
+                .filter(record -> record.getSourceSequenceNumber() <= asOfSourceSequenceNumber)
                 .sorted(OLDEST_FIRST)
                 .forEach(record -> latestByKey.put(sourceKey(record), record));
 

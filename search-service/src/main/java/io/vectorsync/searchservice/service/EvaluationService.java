@@ -68,7 +68,10 @@ public class EvaluationService {
         int judged = 0;
 
         for (QueryJudgement judgement : judgements) {
-            Set<String> exact = rowIds(searchService.searchExact(judgement.query(), k, entry.getSourceTable()));
+            // Scoped to the index's own version; otherwise recall is measured against a
+            // mixed-version population and is understated.
+            Set<String> exact = rowIds(searchService.searchExact(
+                    judgement.query(), k, entry.getSourceTable(), entry.modelVersion()));
             Set<String> approximate = rowIds(searchService.searchIndexId(indexId, judgement.query(), k));
 
             double recall = exact.isEmpty()

@@ -11,7 +11,7 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -68,33 +68,38 @@ public class ExternalEmbeddingService implements EmbeddingService {
      * that arbitrary managed providers still work.
      */
     @Override
-    public List<List<Double>> generateEmbeddings(List<String> texts) throws EmbeddingException {
-        if (texts.isEmpty()) {
-            return List.of();
+    public Map<String, List<Double>> generateEmbeddings(List<EmbeddingRequest> requests)
+            throws EmbeddingException {
+        if (requests.isEmpty()) {
+            return Map.of();
         }
         if (batchApiUrl == null || batchApiUrl.isBlank()) {
-            return EmbeddingService.super.generateEmbeddings(texts);
+            return EmbeddingService.super.generateEmbeddings(requests);
         }
 
-        List<List<Double>> embeddings = new ArrayList<>(texts.size());
-        for (int start = 0; start < texts.size(); start += batchSize) {
-            embeddings.addAll(callBatchApi(texts.subList(start, Math.min(start + batchSize, texts.size()))));
+        Map<String, List<Double>> embeddings = new LinkedHashMap<>();
+        for (int start = 0; start < requests.size(); start += batchSize) {
+            embeddings.putAll(callBatchApi(
+                    requests.subList(start, Math.min(start + batchSize, requests.size()))));
         }
         return embeddings;
     }
 
     /**
-     * Speaks the Python service's {@code /api/v1/embed} contract. Results are correlated by the
-     * vector_id echoed back, not by position, because the service groups records by provider and
+     * Speaks the embedding service's {@code /api/v1/embed} contract. Results are correlated by the
+     * echoed vector_id rather than by position, because the service groups records by provider and
      * model and so may reorder them.
      */
-    private List<List<Double>> callBatchApi(List<String> texts) throws EmbeddingException {
+    private Map<String, List<Double>> callBatchApi(List<EmbeddingRequest> requests)
+            throws EmbeddingException {
         try {
-            List<Map<String, String>> records = new ArrayList<>(texts.size());
-            for (int i = 0; i < texts.size(); i++) {
+            List<Map<String, String>> records = new ArrayList<>(requests.size());
+            for (EmbeddingRequest request : requests) {
                 records.add(Map.of(
-                        "vector_id", String.valueOf(i),
-                        "text", texts.get(i),
+                        "vector_id", request.vectorId(),
+                        "source_table", request.sourceTable(),
+                        "source_row_id", request.sourceRowId(),
+                        "text", request.text(),
                         "model_name", modelName,
                         "provider", "self_hosted"));
             }
@@ -115,7 +120,7 @@ public class ExternalEmbeddingService implements EmbeddingService {
                 throw new EmbeddingException("Invalid batch embedding response: missing /results");
             }
 
-            Map<String, List<Double>> byId = new HashMap<>();
+            Map<String, List<Double>> byId = new LinkedHashMap<>();
             for (JsonNode result : results) {
                 String error = result.path("error").asText(null);
                 if (error != null && !error.isBlank()) {
@@ -126,15 +131,14 @@ public class ExternalEmbeddingService implements EmbeddingService {
                         objectMapper.getTypeFactory().constructCollectionType(List.class, Double.class)));
             }
 
-            List<List<Double>> ordered = new ArrayList<>(texts.size());
-            for (int i = 0; i < texts.size(); i++) {
-                List<Double> embedding = byId.get(String.valueOf(i));
+            for (EmbeddingRequest request : requests) {
+                List<Double> embedding = byId.get(request.vectorId());
                 if (embedding == null || embedding.isEmpty()) {
-                    throw new EmbeddingException("Batch embedding response missing entry " + i);
+                    throw new EmbeddingException(
+                            "Batch embedding response missing entry for " + request.vectorId());
                 }
-                ordered.add(embedding);
             }
-            return ordered;
+            return byId;
         } catch (EmbeddingException e) {
             throw e;
         } catch (Exception e) {

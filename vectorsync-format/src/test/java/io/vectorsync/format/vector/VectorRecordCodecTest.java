@@ -29,6 +29,8 @@ class VectorRecordCodecTest {
                 .sourceTable("default.products")
                 .sourceRowId("p-100")
                 .sourceSnapshotId(4242L)
+                .sourceSequenceNumber(7L)
+                .sourceCommittedAtMillis(1_760_000_000_000L)
                 .chunkOrdinal(3)
                 .embeddingModel("all-MiniLM-L6-v2")
                 .embeddingVersion("v2")
@@ -52,6 +54,8 @@ class VectorRecordCodecTest {
         assertEquals("default.products", decoded.getSourceTable());
         assertEquals("p-100", decoded.getSourceRowId());
         assertEquals(4242L, decoded.getSourceSnapshotId());
+        assertEquals(7L, decoded.getSourceSequenceNumber());
+        assertEquals(1_760_000_000_000L, decoded.getSourceCommittedAtMillis());
         assertEquals(3, decoded.getChunkOrdinal());
         assertEquals("all-MiniLM-L6-v2", decoded.getEmbeddingModel());
         assertEquals("v2", decoded.getEmbeddingVersion());

@@ -26,6 +26,9 @@ class VectorResolutionTest {
                 .sourceTable("default.products")
                 .sourceRowId(sourceRowId)
                 .sourceSnapshotId(snapshotId)
+                // Snapshot ids are random in Iceberg; the sequence number is what orders history,
+                // so tests derive one from the logical version being expressed.
+                .sourceSequenceNumber(snapshotId / 100)
                 .chunkOrdinal(0)
                 .embeddingModel(model)
                 .embeddingVersion(version)
@@ -39,7 +42,7 @@ class VectorResolutionTest {
     }
 
     @Test
-    @DisplayName("the newest source snapshot wins for the same key")
+    @DisplayName("the newest source version wins for the same key")
     void newestSnapshotWins() {
         List<VectorRecord> resolved = VectorResolution.latestLiveVectors(List.of(
                 record("v1", "p-100", 100L, "m", "v1", false),
@@ -62,7 +65,23 @@ class VectorResolutionTest {
     }
 
     @Test
-    @DisplayName("wall-clock createdAt does not override snapshot ordering")
+    @DisplayName("a random-looking snapshot id does not affect ordering")
+    void snapshotIdDoesNotOrder() {
+        // Mirrors real Iceberg ids: the later commit has the numerically smaller snapshot id.
+        VectorRecord earlier = record("v-earlier", "p-100", 100L, "m", "v1", false);
+        earlier.setSourceSnapshotId(7139976223410259010L);
+        earlier.setSourceSequenceNumber(1L);
+
+        VectorRecord later = record("v-later", "p-100", 200L, "m", "v1", true);
+        later.setSourceSnapshotId(2135807640327332542L);
+        later.setSourceSequenceNumber(2L);
+
+        assertTrue(VectorResolution.latestLiveVectors(List.of(earlier, later)).isEmpty(),
+                "the later tombstone must win even though its snapshot id is smaller");
+    }
+
+    @Test
+    @DisplayName("wall-clock createdAt does not override version ordering")
     void snapshotBeatsWallClock() {
         VectorRecord older = record("v-old", "p-100", 100L, "m", "v1", false);
         older.setCreatedAt(Instant.parse("2026-06-01T00:00:00Z"));
@@ -157,10 +176,9 @@ class VectorResolutionTest {
                 record("v3", "p-100", 300L, "m", "v1", true)
         );
 
-        assertEquals("v1", VectorResolution.liveVectorsAsOf(history, 100L).get(0).getVectorId());
-        assertEquals("v2", VectorResolution.liveVectorsAsOf(history, 200L).get(0).getVectorId());
-        assertEquals("v2", VectorResolution.liveVectorsAsOf(history, 250L).get(0).getVectorId());
-        assertTrue(VectorResolution.liveVectorsAsOf(history, 300L).isEmpty());
+        assertEquals("v1", VectorResolution.liveVectorsAsOf(history, 1L).get(0).getVectorId());
+        assertEquals("v2", VectorResolution.liveVectorsAsOf(history, 2L).get(0).getVectorId());
+        assertTrue(VectorResolution.liveVectorsAsOf(history, 3L).isEmpty());
     }
 
     @Test

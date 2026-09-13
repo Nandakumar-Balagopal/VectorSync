@@ -111,6 +111,7 @@ class LifecycleIntegrationTest {
                 .sourceTable(SOURCE_TABLE)
                 .sourceRowId(rowId)
                 .sourceSnapshotId(snapshotId)
+                .sourceSequenceNumber(snapshotId / 100)
                 .chunkOrdinal(0)
                 .embeddingModel(MODEL)
                 .embeddingVersion(version)

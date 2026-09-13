@@ -4,6 +4,7 @@ import io.vectorsync.common.dto.ChangeEvent;
 import io.vectorsync.common.dto.TableConfig;
 import io.vectorsync.common.dto.VectorRecord;
 import io.vectorsync.format.vector.VectorIds;
+import io.vectorsync.worker.service.embedding.EmbeddingRequest;
 import io.vectorsync.worker.service.embedding.EmbeddingService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -11,17 +12,21 @@ import org.springframework.stereotype.Service;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @Service
 @Slf4j
 public class CDCService {
 
     private final EmbeddingService embeddingService;
+    private final VectorStoreService vectorStoreService;
 
-    public CDCService(EmbeddingService embeddingService) {
+    public CDCService(EmbeddingService embeddingService, VectorStoreService vectorStoreService) {
         this.embeddingService = embeddingService;
+        this.vectorStoreService = vectorStoreService;
     }
 
     /**
@@ -54,18 +59,24 @@ public class CDCService {
         List<PendingRecord> pending = new ArrayList<>();
         int failed = 0;
 
+        List<String> knownVersions = null;
+
         for (ChangeEvent event : changeEvents) {
             try {
+                if (ChangeEvent.OPERATION_DELETE.equals(event.getOperation())) {
+                    if (knownVersions == null) {
+                        // Fetched once per batch, and only when something was actually deleted.
+                        knownVersions = vectorStoreService.materializedVersions(tableConfig.getTableName());
+                    }
+                    vectorRecords.addAll(tombstones(tableConfig, event, knownVersions));
+                    continue;
+                }
+
                 PendingRecord prepared = prepare(tableConfig, event);
                 if (prepared == null) {
                     continue;
                 }
-                if (prepared.text() == null) {
-                    // A tombstone needs no embedding and is final already.
-                    vectorRecords.add(finalise(prepared.record(), List.of()));
-                } else {
-                    pending.add(prepared);
-                }
+                pending.add(prepared);
             } catch (Exception e) {
                 failed++;
                 log.error("Error preparing change event for table {}: {}",
@@ -75,17 +86,28 @@ public class CDCService {
 
         if (!pending.isEmpty()) {
             try {
-                List<String> texts = pending.stream().map(PendingRecord::text).toList();
-                List<List<Double>> embeddings = embeddingService.generateEmbeddings(texts);
+                List<EmbeddingRequest> requests = pending.stream()
+                        .map(entry -> new EmbeddingRequest(
+                                entry.record().getVectorId(),
+                                entry.record().getSourceTable(),
+                                entry.record().getSourceRowId(),
+                                entry.text()))
+                        .toList();
 
-                if (embeddings.size() != pending.size()) {
-                    throw new IllegalStateException("Embedding provider returned " + embeddings.size()
-                            + " embeddings for " + pending.size() + " texts");
-                }
+                Map<String, List<Double>> embeddings = embeddingService.generateEmbeddings(requests);
 
-                for (int i = 0; i < pending.size(); i++) {
-                    vectorRecords.add(finalise(pending.get(i).record(), embeddings.get(i)));
+                // Staged so a row missing from the response leaves no partial records behind;
+                // the batch is all-or-nothing.
+                List<VectorRecord> embedded = new ArrayList<>(pending.size());
+                for (PendingRecord entry : pending) {
+                    List<Double> embedding = embeddings.get(entry.record().getVectorId());
+                    if (embedding == null || embedding.isEmpty()) {
+                        throw new IllegalStateException("Embedding provider returned nothing for "
+                                + entry.record().getVectorId());
+                    }
+                    embedded.add(finalise(entry.record(), embedding));
                 }
+                vectorRecords.addAll(embedded);
             } catch (Exception e) {
                 // The batch is all-or-nothing, so every pending row counts as failed and the
                 // watermark holds rather than skipping past changes that were never embedded.
@@ -99,46 +121,97 @@ public class CDCService {
     }
 
     /**
-     * Resolves an event into a record awaiting its embedding.
+     * Resolves an insert or update into a record awaiting its embedding.
      *
-     * @return null when the event yields nothing to store; a {@link PendingRecord} whose text is
-     *         null when it is a tombstone
+     * @return null when the event yields nothing to store
      */
     private PendingRecord prepare(TableConfig tableConfig, ChangeEvent event) {
-        boolean delete = ChangeEvent.OPERATION_DELETE.equals(event.getOperation());
-        String textContent = null;
-
-        if (!delete) {
-            textContent = extractTextContent(tableConfig, event);
-            if (textContent == null || textContent.isBlank()) {
-                log.warn("No text content found for event in table {}", tableConfig.getTableName());
-                return null;
-            }
+        String textContent = extractTextContent(tableConfig, event);
+        if (textContent == null || textContent.isBlank()) {
+            log.warn("No text content found for event in table {}", tableConfig.getTableName());
+            return null;
         }
 
         VectorRecord record = VectorRecord.builder()
                 .sourceTable(tableConfig.getTableName())
                 .sourceRowId(extractRowId(event))
                 .sourceSnapshotId(event.getSnapshotId())
+                .sourceSequenceNumber(event.getSequenceNumber())
+                .sourceCommittedAtMillis(event.getCommittedAtMillis())
                 .chunkOrdinal(0)
                 .embeddingModel(tableConfig.getModelName())
                 .embeddingVersion(tableConfig.embeddingVersionOrDefault())
                 .preprocessingId(VectorIds.preprocessingId(
                         tableConfig.getEmbeddingColumns(), TableConfig.TEXT_JOIN_SEPARATOR))
                 .text(textContent)
-                .deleted(delete)
+                .deleted(false)
                 .metadata(extractMetadata(event))
                 .createdAt(Instant.now())
                 .build();
 
+        // Identity depends only on source lineage, not on the embedding, so it can be derived now
+        // and used to correlate the batch response.
+        record.setVectorId(VectorIds.vectorId(record));
+
         return new PendingRecord(record, textContent);
     }
 
-    /** Attaches the embedding and derives the record's identity from its completed lineage. */
+    /**
+     * A deleted source row is tombstoned under **every** version materialized for the table, not
+     * just the currently configured one.
+     *
+     * <p>Resolution is keyed by model version, so tombstoning only the current version would leave
+     * the row live -- and therefore discoverable -- under every older version. For a table claiming
+     * to be an auditable system of record, a deleted row must disappear from all of them.
+     */
+    private List<VectorRecord> tombstones(TableConfig tableConfig,
+                                          ChangeEvent event,
+                                          List<String> knownVersions) {
+        String sourceRowId = extractRowId(event);
+
+        Set<String> versions = new LinkedHashSet<>(knownVersions);
+        // Always include the configured version, so a delete arriving before that version has
+        // materialized anything is still recorded.
+        versions.add(tableConfig.getModelName() + ":" + tableConfig.embeddingVersionOrDefault());
+
+        List<VectorRecord> result = new ArrayList<>(versions.size());
+        for (String modelVersion : versions) {
+            int separator = modelVersion.lastIndexOf(':');
+            if (separator <= 0) {
+                log.warn("Skipping malformed model version '{}' while tombstoning {}",
+                        modelVersion, sourceRowId);
+                continue;
+            }
+
+            VectorRecord tombstone = VectorRecord.builder()
+                    .sourceTable(tableConfig.getTableName())
+                    .sourceRowId(sourceRowId)
+                    .sourceSnapshotId(event.getSnapshotId())
+                    .sourceSequenceNumber(event.getSequenceNumber())
+                    .sourceCommittedAtMillis(event.getCommittedAtMillis())
+                    .chunkOrdinal(0)
+                    .embeddingModel(modelVersion.substring(0, separator))
+                    .embeddingVersion(modelVersion.substring(separator + 1))
+                    .preprocessingId(VectorIds.preprocessingId(
+                            tableConfig.getEmbeddingColumns(), TableConfig.TEXT_JOIN_SEPARATOR))
+                    .embedding(List.of())
+                    .embeddingDim(0)
+                    .text(null)
+                    .deleted(true)
+                    .metadata(extractMetadata(event))
+                    .createdAt(Instant.now())
+                    .build();
+            tombstone.setVectorId(VectorIds.vectorId(tombstone));
+            result.add(tombstone);
+        }
+
+        return result;
+    }
+
+    /** Attaches the embedding. Identity was already derived in {@link #prepare}. */
     private VectorRecord finalise(VectorRecord record, List<Double> embedding) {
         record.setEmbedding(embedding);
         record.setEmbeddingDim(embedding.size());
-        record.setVectorId(VectorIds.vectorId(record));
         return record;
     }
 

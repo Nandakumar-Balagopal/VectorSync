@@ -52,7 +52,11 @@ public class LifecycleController {
         this.evaluationService = evaluationService;
     }
 
-    public record BuildRequest(String sourceTable, String modelVersion, Long asOfSnapshotId) {
+    /**
+     * @param asOfSequenceNumber optional Iceberg snapshot sequence number to build as of. A
+     *        sequence number rather than a snapshot id because only sequence numbers are ordered.
+     */
+    public record BuildRequest(String sourceTable, String modelVersion, Long asOfSequenceNumber) {
     }
 
     public record PromoteRequest(String sourceTable, String indexId, String promotedBy, String note) {
@@ -78,13 +82,17 @@ public class LifecycleController {
                     .body(Map.of("error", "modelVersion must be in 'model:version' form"));
         }
 
-        long snapshotId = request.asOfSnapshotId() != null
-                ? request.asOfSnapshotId()
-                : vectorSyncReader.latestSourceSnapshot(request.sourceTable());
-
-        List<VectorRecord> vectors = request.asOfSnapshotId() != null
-                ? vectorSyncReader.readForIndexAsOf(request.sourceTable(), request.modelVersion(), snapshotId)
+        List<VectorRecord> vectors = request.asOfSequenceNumber() != null
+                ? vectorSyncReader.readForIndexAsOf(
+                        request.sourceTable(), request.modelVersion(), request.asOfSequenceNumber())
                 : vectorSyncReader.readForIndex(request.sourceTable(), request.modelVersion());
+
+        // Recorded on the manifest for provenance; the snapshot id addresses the source version
+        // even though the sequence number is what ordered it.
+        long snapshotId = vectors.stream()
+                .mapToLong(VectorRecord::getSourceSnapshotId)
+                .max()
+                .orElseGet(() -> vectorSyncReader.latestSourceSnapshot(request.sourceTable()));
 
         if (vectors.isEmpty()) {
             return ResponseEntity.badRequest().body(Map.of(
@@ -211,7 +219,8 @@ public class LifecycleController {
         return ResponseEntity.ok(Map.of(
                 "sourceTable", sourceTable,
                 "modelVersions", vectorSyncReader.modelVersionsFor(sourceTable),
-                "latestSourceSnapshotId", vectorSyncReader.latestSourceSnapshot(sourceTable)));
+                "latestSourceSnapshotId", vectorSyncReader.latestSourceSnapshot(sourceTable),
+                "latestSourceSequenceNumber", vectorSyncReader.latestSourceSequenceNumber(sourceTable)));
     }
 
     @PostMapping("/index/{indexId}/evict")

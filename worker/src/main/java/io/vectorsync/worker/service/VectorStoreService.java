@@ -55,11 +55,28 @@ public class VectorStoreService {
     }
 
     /**
-     * The live vector set as it stood at a source snapshot, which is what makes a materialization
-     * reproducible rather than merely current.
+     * The live vector set as it stood at a source sequence number, which is what makes a
+     * materialization reproducible rather than merely current.
      */
-    public List<VectorRecord> getVectorsAsOf(long sourceSnapshotId) {
-        return VectorResolution.liveVectorsAsOf(readRaw(), sourceSnapshotId);
+    public List<VectorRecord> getVectorsAsOf(long sourceSequenceNumber) {
+        return VectorResolution.liveVectorsAsOf(readRaw(), sourceSequenceNumber);
+    }
+
+    /**
+     * Every {@code model:version} ever materialized for a table, including versions whose rows are
+     * all tombstoned.
+     *
+     * <p>Read from full history rather than the live set, because a delete has to tombstone every
+     * version of the row and must not skip one merely because that version is already partly
+     * deleted.
+     */
+    public List<String> materializedVersions(String sourceTable) {
+        return readRaw().stream()
+                .filter(record -> sourceTable.equals(record.getSourceTable()))
+                .map(VectorRecord::modelVersion)
+                .distinct()
+                .sorted()
+                .toList();
     }
 
     public List<VectorRecord> getVectorsByTable(String tableName) {

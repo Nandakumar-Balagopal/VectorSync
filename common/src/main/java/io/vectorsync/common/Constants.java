@@ -3,7 +3,7 @@ package io.vectorsync.common;
 public class Constants {
 
     /** Bumped whenever the vector table's physical layout changes incompatibly. */
-    public static final int VECTOR_FORMAT_VERSION = 2;
+    public static final int VECTOR_FORMAT_VERSION = 3;
 
     /** Table property recording the format version a vector table was created with. */
     public static final String FORMAT_VERSION_PROPERTY = "vectorsync.format-version";
@@ -17,6 +17,8 @@ public class Constants {
     public static final String SOURCE_TABLE_COLUMN = "source_table";
     public static final String SOURCE_ROW_ID_COLUMN = "source_row_id";
     public static final String SOURCE_SNAPSHOT_ID_COLUMN = "source_snapshot_id";
+    public static final String SOURCE_SEQUENCE_NUMBER_COLUMN = "source_sequence_number";
+    public static final String SOURCE_COMMITTED_AT_COLUMN = "source_committed_at";
     public static final String CHUNK_ORDINAL_COLUMN = "chunk_ordinal";
     public static final String EMBEDDING_MODEL_COLUMN = "embedding_model";
     public static final String EMBEDDING_VERSION_COLUMN = "embedding_version";

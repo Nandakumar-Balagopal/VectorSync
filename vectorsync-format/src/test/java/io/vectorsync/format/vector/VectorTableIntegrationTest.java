@@ -61,6 +61,7 @@ class VectorTableIntegrationTest {
                 .sourceTable(SOURCE_TABLE)
                 .sourceRowId(rowId)
                 .sourceSnapshotId(snapshotId)
+                .sourceSequenceNumber(snapshotId / 100)
                 .chunkOrdinal(0)
                 .embeddingModel(MODEL)
                 .embeddingVersion(version)
@@ -107,6 +108,7 @@ class VectorTableIntegrationTest {
         assertEquals("v1", stored.getEmbeddingVersion());
         assertEquals(MODEL + ":v1", stored.modelVersion());
         assertEquals(100L, stored.getSourceSnapshotId());
+        assertEquals(1L, stored.getSourceSequenceNumber());
         assertEquals("pp-1", stored.getPreprocessingId());
         assertEquals(List.of(0.1, 0.2, 0.3), roundedEmbedding(stored));
         assertNotNull(stored.getVectorId());
@@ -179,9 +181,9 @@ class VectorTableIntegrationTest {
 
         List<VectorRecord> raw = readRaw();
 
-        assertEquals(1, VectorResolution.liveVectorsAsOf(raw, 100L).size());
-        assertEquals(2, VectorResolution.liveVectorsAsOf(raw, 200L).size());
-        assertEquals(1, VectorResolution.liveVectorsAsOf(raw, 300L).size());
+        assertEquals(1, VectorResolution.liveVectorsAsOf(raw, 1L).size());
+        assertEquals(2, VectorResolution.liveVectorsAsOf(raw, 2L).size());
+        assertEquals(1, VectorResolution.liveVectorsAsOf(raw, 3L).size());
     }
 
     @Test

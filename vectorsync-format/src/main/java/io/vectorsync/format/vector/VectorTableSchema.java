@@ -50,7 +50,9 @@ public final class VectorTableSchema {
                 Types.NestedField.required(14, Constants.DELETED_COLUMN, Types.BooleanType.get()),
                 Types.NestedField.optional(15, Constants.METADATA_COLUMN,
                         Types.MapType.ofOptional(16, 17, Types.StringType.get(), Types.StringType.get())),
-                Types.NestedField.required(18, Constants.CREATED_AT_COLUMN, Types.TimestampType.withZone())
+                Types.NestedField.required(18, Constants.CREATED_AT_COLUMN, Types.TimestampType.withZone()),
+                Types.NestedField.required(19, Constants.SOURCE_SEQUENCE_NUMBER_COLUMN, Types.LongType.get()),
+                Types.NestedField.required(20, Constants.SOURCE_COMMITTED_AT_COLUMN, Types.LongType.get())
         );
     }
 

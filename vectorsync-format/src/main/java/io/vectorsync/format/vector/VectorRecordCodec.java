@@ -32,6 +32,8 @@ public final class VectorRecordCodec {
         icebergRecord.setField(Constants.SOURCE_TABLE_COLUMN, record.getSourceTable());
         icebergRecord.setField(Constants.SOURCE_ROW_ID_COLUMN, record.getSourceRowId());
         icebergRecord.setField(Constants.SOURCE_SNAPSHOT_ID_COLUMN, record.getSourceSnapshotId());
+        icebergRecord.setField(Constants.SOURCE_SEQUENCE_NUMBER_COLUMN, record.getSourceSequenceNumber());
+        icebergRecord.setField(Constants.SOURCE_COMMITTED_AT_COLUMN, record.getSourceCommittedAtMillis());
         icebergRecord.setField(Constants.CHUNK_ORDINAL_COLUMN, record.getChunkOrdinal());
         icebergRecord.setField(Constants.EMBEDDING_MODEL_COLUMN, record.getEmbeddingModel());
         icebergRecord.setField(Constants.EMBEDDING_VERSION_COLUMN, record.getEmbeddingVersion());
@@ -59,6 +61,8 @@ public final class VectorRecordCodec {
                 .sourceTable(asString(record.getField(Constants.SOURCE_TABLE_COLUMN)))
                 .sourceRowId(asString(record.getField(Constants.SOURCE_ROW_ID_COLUMN)))
                 .sourceSnapshotId(asLong(record.getField(Constants.SOURCE_SNAPSHOT_ID_COLUMN)))
+                .sourceSequenceNumber(asLong(record.getField(Constants.SOURCE_SEQUENCE_NUMBER_COLUMN)))
+                .sourceCommittedAtMillis(asLong(record.getField(Constants.SOURCE_COMMITTED_AT_COLUMN)))
                 .chunkOrdinal(asInt(record.getField(Constants.CHUNK_ORDINAL_COLUMN)))
                 .embeddingModel(asString(record.getField(Constants.EMBEDDING_MODEL_COLUMN)))
                 .embeddingVersion(asString(record.getField(Constants.EMBEDDING_VERSION_COLUMN)))
