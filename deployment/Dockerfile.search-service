@@ -2,12 +2,13 @@ FROM maven:3.9.9-eclipse-temurin-17 AS builder
 WORKDIR /app
 COPY pom.xml .
 COPY common/pom.xml common/pom.xml
+COPY vectorsync-format/pom.xml vectorsync-format/pom.xml
 COPY control-plane/pom.xml control-plane/pom.xml
 COPY worker/pom.xml worker/pom.xml
 COPY search-service/pom.xml search-service/pom.xml
-RUN mvn -q -DskipTests -pl search-service -am dependency:go-offline
+RUN mvn -q -B -Dmaven.wagon.http.retryHandler.count=5 -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dmaven.wagon.rto=60000 -DskipTests -pl search-service -am dependency:go-offline
 COPY . .
-RUN mvn -q -DskipTests -pl search-service -am package
+RUN mvn -q -B -Dmaven.wagon.http.retryHandler.count=5 -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dmaven.wagon.rto=60000 -DskipTests -pl search-service -am package
 
 FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app

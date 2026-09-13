@@ -25,6 +25,11 @@
             <artifactId>vectorsync-common</artifactId>
             <version>${project.version}</version>
         </dependency>
+        <dependency>
+            <groupId>io.vectorsync</groupId>
+            <artifactId>vectorsync-format</artifactId>
+            <version>${project.version}</version>
+        </dependency>
 
         <dependency>
             <groupId>org.apache.iceberg</groupId>

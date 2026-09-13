@@ -1,340 +1,198 @@
-import { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useCallback, useEffect, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import {
-  Breadcrumb,
-  BreadcrumbItem,
   Button,
-  Loading,
-  Tabs,
-  TabList,
-  Tab,
-  TabPanels,
-  TabPanel,
-  Tag,
-  ProgressBar,
   InlineNotification,
+  Loading,
+  StructuredListBody,
+  StructuredListCell,
+  StructuredListHead,
+  StructuredListRow,
+  StructuredListWrapper,
+  Tag,
+  TextInput,
+  Tile,
 } from '@carbon/react';
-import { ArrowLeft, Renew, Settings } from '@carbon/icons-react';
 import { vectorSyncApi } from '../services/api';
-import type { TableDetails as TableDetailsType, TableConfig } from '../types';
+import type { IndexManifestEntry, ModelVersions, SyncStatus, TableConfig } from '../types';
+import { describeError } from '../utils/format';
 import './TableDetails.scss';
 
-interface TimelineEvent {
-  timestamp: string;
-  type: 'insert' | 'update' | 'delete';
-  count: number;
-  processed: boolean;
-}
-
+/**
+ * One table's real configuration, sync state, materialized embedding versions, and indexes.
+ *
+ * The previous version rendered a fabricated CDC timeline, embedding throughput, and index
+ * freshness score against endpoints that do not exist.
+ */
 export function TableDetails() {
   const { tableId } = useParams<{ tableId: string }>();
   const navigate = useNavigate();
-  const [loading, setLoading] = useState(true);
-  const [details, setDetails] = useState<TableDetailsType | null>(null);
+
   const [config, setConfig] = useState<TableConfig | null>(null);
+  const [status, setStatus] = useState<SyncStatus | null>(null);
+  const [versions, setVersions] = useState<ModelVersions | null>(null);
+  const [indexes, setIndexes] = useState<IndexManifestEntry[]>([]);
+  const [newVersion, setNewVersion] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
-  const loadData = async () => {
+  const load = useCallback(async () => {
     if (!tableId) return;
+    setError(null);
     try {
-      const [detailsData, configData] = await Promise.all([
-        vectorSyncApi.getTableDetails(tableId),
-        vectorSyncApi.getTable(tableId),
-      ]);
-      setDetails(detailsData);
+      const configData = await vectorSyncApi.getTable(tableId);
       setConfig(configData);
-    } catch (error) {
-      console.error('Error loading table details:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
+      setStatus(await vectorSyncApi.getSyncStatus(tableId).catch(() => null));
 
-  useEffect(() => {
-    void loadData();
-    const interval = setInterval(() => void loadData(), 30000);
-    return () => clearInterval(interval);
+      const [versionData, indexData] = await Promise.all([
+        vectorSyncApi.getModelVersions(configData.tableName).catch(() => null),
+        vectorSyncApi.getIndexes(configData.tableName).catch(() => []),
+      ]);
+      setVersions(versionData);
+      setIndexes(indexData);
+    } catch (err) {
+      setError(describeError(err, 'Could not load table'));
+    }
   }, [tableId]);
 
-  const handleSync = async () => {
-    if (!tableId) return;
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Derived rather than stored: no setState runs synchronously from the effect.
+  const loading = config === null && error === null;
+
+  const migrate = async () => {
+    if (!tableId || !newVersion.trim()) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
     try {
-      await vectorSyncApi.triggerSync(tableId);
-      setTimeout(loadData, 2000);
-    } catch (error) {
-      console.error('Error triggering sync:', error);
+      await vectorSyncApi.setEmbeddingVersion(tableId, newVersion.trim());
+      setNotice(
+        `Embedding version set to "${newVersion.trim()}". The sync watermark was reset, so the `
+        + 'next sync materializes this version alongside the existing ones.');
+      setNewVersion('');
+      await load();
+    } catch (err) {
+      setError(describeError(err, 'Could not change embedding version'));
+    } finally {
+      setBusy(false);
     }
   };
 
   if (loading) {
-    return <Loading description="Loading table details..." withOverlay={false} />;
+    return <Loading description="Loading table" withOverlay={false} />;
   }
 
-  if (!details || !config) {
+  if (!config) {
     return (
       <div className="table-details">
-        <InlineNotification
-          kind="error"
-          title="Table not found"
-          subtitle={`Table ${tableId} could not be loaded`}
-        />
+        <InlineNotification kind="error" title="Not found" subtitle={error ?? 'Unknown table'} />
+        <Button kind="ghost" onClick={() => navigate('/')}>Back to overview</Button>
       </div>
     );
   }
 
-  const coveragePercent = details.embeddingStats.totalRows > 0
-    ? (details.embeddingStats.embeddedRows / details.embeddingStats.totalRows) * 100
-    : 0;
-
   return (
     <div className="table-details">
-      <Breadcrumb>
-        <BreadcrumbItem href="/">Overview</BreadcrumbItem>
-        <BreadcrumbItem isCurrentPage>{config.tableName}</BreadcrumbItem>
-      </Breadcrumb>
-
-      <div className="page-header">
-        <div className="header-content">
-          <Button
-            kind="ghost"
-            size="sm"
-            renderIcon={ArrowLeft}
-            onClick={() => navigate('/')}
-          >
-            Back
-          </Button>
-          <div className="title-section">
-            <h1>{config.catalog}.{config.tableName}</h1>
-            <div className="header-tags">
-              <Tag type={details.health.health === 'healthy' ? 'green' : 'red'} size="sm">
-                {details.health.health}
-              </Tag>
-              <Tag type="blue" size="sm">
-                {config.vectorColumn}
-              </Tag>
-            </div>
-          </div>
+      <div className="table-details__header">
+        <div>
+          <h1>{config.tableName}</h1>
+          <p className="table-details__subtitle">{config.tableId}</p>
         </div>
-        <div className="header-actions">
-          <Button
-            kind="tertiary"
-            size="sm"
-            renderIcon={Settings}
-            onClick={() => navigate(`/config?table=${tableId}`)}
-          >
-            Configure
-          </Button>
-          <Button
-            kind="primary"
-            size="sm"
-            renderIcon={Renew}
-            onClick={handleSync}
-          >
-            Trigger Sync
-          </Button>
-        </div>
+        <Button kind="ghost" onClick={() => navigate('/')}>Back</Button>
       </div>
 
-      <div className="stats-grid">
-        <div className="stat-card">
-          <div className="stat-label">Lag</div>
-          <div className="stat-value">{details.health.lag}s</div>
-          <div className="stat-description">
-            {details.health.lag > 600 ? 'Behind schedule' : 'On track'}
-          </div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">Pending Rows</div>
-          <div className="stat-value">{details.health.pendingRows.toLocaleString()}</div>
-          <div className="stat-description">
-            {details.health.pendingRows > 1000 ? 'High backlog' : 'Normal'}
-          </div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">Index Status</div>
-          <div className="stat-value">{details.indexStats.status}</div>
-          <div className="stat-description">
-            {details.indexStats.vectorCount.toLocaleString()} vectors
-          </div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">Coverage</div>
-          <div className="stat-value">{coveragePercent.toFixed(1)}%</div>
-          <div className="stat-description">
-            {details.embeddingStats.embeddedRows.toLocaleString()} / {details.embeddingStats.totalRows.toLocaleString()} rows
-          </div>
-        </div>
+      {error && (
+        <InlineNotification kind="error" title="Error" subtitle={error}
+          onCloseButtonClick={() => setError(null)} />
+      )}
+      {notice && (
+        <InlineNotification kind="success" title="Migration started" subtitle={notice}
+          onCloseButtonClick={() => setNotice(null)} />
+      )}
+
+      <div className="table-details__tiles">
+        <Tile>
+          <span className="table-details__label">Model</span>
+          <span className="table-details__value">{config.modelName}</span>
+        </Tile>
+        <Tile>
+          <span className="table-details__label">Current version</span>
+          <span className="table-details__value">{config.embeddingVersion ?? 'v1'}</span>
+        </Tile>
+        <Tile>
+          <span className="table-details__label">Embedded columns</span>
+          <span className="table-details__value">{config.embeddingColumns.join(', ')}</span>
+        </Tile>
+        <Tile>
+          <span className="table-details__label">Last synced snapshot</span>
+          <span className="table-details__value">{status?.lastSnapshotId ?? 'never'}</span>
+        </Tile>
       </div>
 
-      <Tabs>
-        <TabList aria-label="Table details tabs">
-          <Tab>CDC Timeline</Tab>
-          <Tab>Embedding Pipeline</Tab>
-          <Tab>Index Statistics</Tab>
-          <Tab>Configuration</Tab>
-        </TabList>
-        <TabPanels>
-          <TabPanel>
-            <div className="timeline-panel">
-              <h3>Change Data Capture Timeline</h3>
-              <p className="panel-description">
-                Recent CDC events from the source table
-              </p>
-              <div className="timeline">
-                {details.cdcTimeline.map((event, idx) => (
-                  <div key={idx} className={`timeline-event ${event.processed ? 'processed' : 'pending'}`}>
-                    <div className="event-marker" />
-                    <div className="event-content">
-                      <div className="event-header">
-                        <span className="event-type">{event.type.toUpperCase()}</span>
-                        <span className="event-count">{event.count} rows</span>
-                      </div>
-                      <div className="event-time">
-                        {new Date(event.timestamp).toLocaleString()}
-                      </div>
-                      {event.processed ? (
-                        <Tag type="green" size="sm">Processed</Tag>
-                      ) : (
-                        <Tag type="warm-gray" size="sm">Pending</Tag>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </TabPanel>
+      <h2>Materialized versions</h2>
+      <p className="table-details__hint">
+        {versions?.modelVersions.length
+          ? versions.modelVersions.join(', ')
+          : 'None yet — run a sync to materialize embeddings.'}
+      </p>
 
-          <TabPanel>
-            <div className="embedding-panel">
-              <h3>Embedding Pipeline Status</h3>
-              <p className="panel-description">
-                Vector embedding generation progress
-              </p>
-              <div className="embedding-stats">
-                <div className="progress-section">
-                  <div className="progress-header">
-                    <span>Embedding Coverage</span>
-                    <span>{coveragePercent.toFixed(1)}%</span>
-                  </div>
-                  <ProgressBar
-                    value={coveragePercent}
-                    max={100}
-                    label="Coverage"
-                    hideLabel
-                  />
-                  <div className="progress-details">
-                    <span>{details.embeddingStats.embeddedRows.toLocaleString()} embedded</span>
-                    <span>{details.embeddingStats.pendingRows.toLocaleString()} pending</span>
-                    <span>{details.embeddingStats.failedRows.toLocaleString()} failed</span>
-                  </div>
-                </div>
+      <h2>Start a migration</h2>
+      <p className="table-details__hint">
+        Setting a new version materializes it alongside the existing ones so it can be indexed and
+        evaluated before it serves traffic. Nothing is overwritten.
+      </p>
+      <div className="table-details__migrate">
+        <TextInput
+          id="new-version"
+          labelText="New embedding version"
+          placeholder="v2"
+          value={newVersion}
+          onChange={event => setNewVersion(event.target.value)}
+        />
+        <Button disabled={busy || !newVersion.trim()} onClick={migrate}>
+          {busy ? 'Applying…' : 'Set version'}
+        </Button>
+      </div>
 
-                <div className="embedding-metrics">
-                  <div className="metric">
-                    <div className="metric-label">Total Rows</div>
-                    <div className="metric-value">{details.embeddingStats.totalRows.toLocaleString()}</div>
-                  </div>
-                  <div className="metric">
-                    <div className="metric-label">Embedded</div>
-                    <div className="metric-value success">{details.embeddingStats.embeddedRows.toLocaleString()}</div>
-                  </div>
-                  <div className="metric">
-                    <div className="metric-label">Pending</div>
-                    <div className="metric-value warning">{details.embeddingStats.pendingRows.toLocaleString()}</div>
-                  </div>
-                  <div className="metric">
-                    <div className="metric-label">Failed</div>
-                    <div className="metric-value error">{details.embeddingStats.failedRows.toLocaleString()}</div>
-                  </div>
-                </div>
-
-                {details.embeddingStats.lastEmbeddingTime && (
-                  <div className="last-embedding">
-                    Last embedding: {new Date(details.embeddingStats.lastEmbeddingTime).toLocaleString()}
-                  </div>
-                )}
-              </div>
-            </div>
-          </TabPanel>
-
-          <TabPanel>
-            <div className="index-panel">
-              <h3>HNSW Index Statistics</h3>
-              <p className="panel-description">
-                Vector index performance and configuration
-              </p>
-              <div className="index-stats">
-                <div className="stat-row">
-                  <span className="stat-label">Status</span>
-                  <Tag type={details.indexStats.status === 'fresh' ? 'green' : 'warm-gray'} size="sm">
-                    {details.indexStats.status}
+      <h2>Indexes</h2>
+      {indexes.length === 0 ? (
+        <p className="table-details__hint">No indexes built for this table.</p>
+      ) : (
+        <StructuredListWrapper>
+          <StructuredListHead>
+            <StructuredListRow head>
+              <StructuredListCell head>Index</StructuredListCell>
+              <StructuredListCell head>Version</StructuredListCell>
+              <StructuredListCell head>Snapshot</StructuredListCell>
+              <StructuredListCell head>Vectors</StructuredListCell>
+              <StructuredListCell head>Status</StructuredListCell>
+            </StructuredListRow>
+          </StructuredListHead>
+          <StructuredListBody>
+            {indexes.map(entry => (
+              <StructuredListRow key={entry.indexId}>
+                <StructuredListCell><code>{entry.indexId.slice(0, 12)}</code></StructuredListCell>
+                <StructuredListCell>{entry.embeddingVersion}</StructuredListCell>
+                <StructuredListCell>{entry.sourceSnapshotId}</StructuredListCell>
+                <StructuredListCell>{entry.vectorCount}</StructuredListCell>
+                <StructuredListCell>
+                  <Tag type={entry.status === 'READY' ? 'green' : 'gray'} size="sm">
+                    {entry.status}
                   </Tag>
-                </div>
-                <div className="stat-row">
-                  <span className="stat-label">Vector Count</span>
-                  <span className="stat-value">{details.indexStats.vectorCount.toLocaleString()}</span>
-                </div>
-                <div className="stat-row">
-                  <span className="stat-label">Dimension</span>
-                  <span className="stat-value">{details.indexStats.dimension}</span>
-                </div>
-                <div className="stat-row">
-                  <span className="stat-label">M Parameter</span>
-                  <span className="stat-value">{details.indexStats.m}</span>
-                </div>
-                <div className="stat-row">
-                  <span className="stat-label">EF Construction</span>
-                  <span className="stat-value">{details.indexStats.efConstruction}</span>
-                </div>
-                {details.indexStats.lastBuildTime && (
-                  <div className="stat-row">
-                    <span className="stat-label">Last Build</span>
-                    <span className="stat-value">
-                      {new Date(details.indexStats.lastBuildTime).toLocaleString()}
-                    </span>
-                  </div>
-                )}
-              </div>
-            </div>
-          </TabPanel>
+                </StructuredListCell>
+              </StructuredListRow>
+            ))}
+          </StructuredListBody>
+        </StructuredListWrapper>
+      )}
 
-          <TabPanel>
-            <div className="config-panel">
-              <h3>Table Configuration</h3>
-              <p className="panel-description">
-                Current vectorization settings
-              </p>
-              <div className="config-details">
-                <div className="config-row">
-                  <span className="config-label">Table ID</span>
-                  <code className="config-value">{config.tableId}</code>
-                </div>
-                <div className="config-row">
-                  <span className="config-label">Catalog</span>
-                  <code className="config-value">{config.catalog}</code>
-                </div>
-                <div className="config-row">
-                  <span className="config-label">Table Name</span>
-                  <code className="config-value">{config.tableName}</code>
-                </div>
-                <div className="config-row">
-                  <span className="config-label">Vector Column</span>
-                  <code className="config-value">{config.vectorColumn}</code>
-                </div>
-                <div className="config-row">
-                  <span className="config-label">Text Column</span>
-                  <code className="config-value">{config.textColumn}</code>
-                </div>
-                <div className="config-row">
-                  <span className="config-label">Sync Enabled</span>
-                  <Tag type={config.syncEnabled ? 'green' : 'gray'} size="sm">
-                    {config.syncEnabled ? 'Enabled' : 'Disabled'}
-                  </Tag>
-                </div>
-              </div>
-            </div>
-          </TabPanel>
-        </TabPanels>
-      </Tabs>
+      <Button kind="tertiary" onClick={() => navigate('/lifecycle')}>
+        Manage lifecycle
+      </Button>
     </div>
   );
 }

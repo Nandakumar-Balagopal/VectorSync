@@ -6,13 +6,9 @@ import {
 } from '@carbon/react';
 import {
   Dashboard,
-  Table,
-  DataBase,
-  TaskTools,
+  Version,
   Search,
-  Debug,
   Settings,
-  Notification,
 } from '@carbon/icons-react';
 import './Navigation.scss';
 
@@ -20,14 +16,13 @@ export function Navigation() {
   const location = useLocation();
   const navigate = useNavigate();
 
+  // Only routes backed by real endpoints. Pages for jobs, alerts, workers and pipeline metrics
+  // were removed along with the fabricated data that populated them.
   const navItems = [
     { path: '/', label: 'Overview', icon: Dashboard },
-    { path: '/pipeline', label: 'Global Pipeline', icon: DataBase },
-    { path: '/jobs', label: 'Job Queue', icon: TaskTools },
+    { path: '/lifecycle', label: 'Lifecycle', icon: Version },
     { path: '/search', label: 'Semantic Search', icon: Search },
-    { path: '/debug', label: 'Debug Panel', icon: Debug },
     { path: '/config', label: 'Configuration', icon: Settings },
-    { path: '/alerts', label: 'Alerts', icon: Notification },
   ];
 
   const isActive = (path: string) => {

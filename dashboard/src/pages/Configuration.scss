@@ -1,211 +1,37 @@
-@use '@carbon/react/scss/spacing' as *;
-@use '@carbon/react/scss/theme' as *;
-@use '@carbon/react/scss/type' as *;
-
 .configuration {
-  padding: $spacing-06;
-  max-width: 1600px;
-  margin: 0 auto;
+  padding: 2rem;
+  max-width: 1400px;
 
-  &__header {
-    margin-bottom: $spacing-07;
-
-    h1 {
-      @include type-style('heading-05');
-      margin-bottom: $spacing-03;
-      color: $text-primary;
-    }
-
-    p {
-      @include type-style('body-01');
-      color: $text-secondary;
-    }
+  h1 {
+    font-size: 1.75rem;
+    font-weight: 400;
+    margin-bottom: 1.5rem;
   }
 
-  &__notification {
-    margin-bottom: $spacing-05;
+  h2 {
+    font-size: 1.25rem;
+    font-weight: 400;
+    margin: 2.5rem 0 0.5rem;
   }
 
-  &__tab-content {
-    padding: $spacing-06 0;
+  &__hint {
+    color: #6f6f6f;
+    max-width: 48rem;
+    line-height: 1.5;
+    margin-bottom: 1rem;
 
-    h2 {
-      @include type-style('heading-04');
-      margin-bottom: $spacing-05;
-      color: $text-primary;
+    code {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 0.8125rem;
     }
-  }
-
-  &__tab-description {
-    @include type-style('body-01');
-    color: $text-secondary;
-    margin-bottom: $spacing-06;
   }
 
   &__form {
-    display: flex;
-    flex-direction: column;
-    gap: $spacing-05;
-    padding: $spacing-05;
-    background: $layer-02;
-    border-radius: 4px;
-
-    .cds--text-input,
-    .cds--number-input,
-    .cds--dropdown,
-    .cds--password-input {
-      margin-bottom: 0;
-    }
-  }
-
-  &__actions {
-    display: flex;
-    gap: $spacing-04;
-    margin-top: $spacing-06;
-    padding-top: $spacing-06;
-    border-top: 1px solid $border-subtle-01;
-  }
-
-  // Carbon component overrides
-  .cds--tabs {
-    margin-top: $spacing-05;
-  }
-
-  .cds--tab-content {
-    padding: 0;
-  }
-
-  .cds--accordion {
-    margin-bottom: $spacing-06;
-  }
-
-  .cds--accordion__item {
-    border-top: 1px solid $border-subtle-01;
-  }
-
-  .cds--accordion__content {
-    padding: $spacing-05;
-  }
-
-  .cds--data-table-container {
-    margin-top: $spacing-05;
-  }
-
-  .cds--toggle {
-    justify-content: flex-start;
-  }
-
-  &__modal-content {
-    display: flex;
-    flex-direction: column;
-    gap: $spacing-05;
-    padding: $spacing-05 0;
-
-    .cds--text-input,
-    .cds--number-input,
-    .cds--dropdown,
-    .cds--password-input {
-      margin-bottom: 0;
-    }
-  }
-
-  &__modal-examples {
-    margin-top: $spacing-05;
-    padding: $spacing-05;
-    background: $layer-02;
-    border-radius: 4px;
-
-    h4 {
-      @include type-style('heading-02');
-      margin-bottom: $spacing-04;
-      color: $text-primary;
-    }
-
-    ul {
-      list-style: none;
-      padding: 0;
-      margin: 0;
-
-      li {
-        @include type-style('body-01');
-        color: $text-secondary;
-        padding-left: $spacing-05;
-        margin-bottom: $spacing-03;
-        position: relative;
-
-        &::before {
-          content: '•';
-          position: absolute;
-          left: 0;
-          color: $icon-secondary;
-        }
-
-        strong {
-          color: $text-primary;
-        }
-
-        &:last-child {
-          margin-bottom: 0;
-        }
-      }
-    }
-  }
-
-  &__sync-tile {
-    margin-top: $spacing-06;
-    padding: $spacing-06;
-    background: $layer-01;
-    border: 1px solid $border-subtle-01;
-  }
-
-  &__sync-header {
-    display: flex;
-    align-items: center;
-    margin-bottom: $spacing-04;
-
-    h4 {
-      @include type-style('heading-03');
-      color: $text-primary;
-      margin: 0;
-    }
-
-    svg {
-      color: $icon-primary;
-    }
-  }
-
-  &__sync-description {
-    @include type-style('body-01');
-    color: $text-secondary;
-    margin-bottom: $spacing-05;
-    line-height: 1.5;
-  }
-
-  &__sync-actions {
-    display: flex;
-    align-items: center;
-    gap: $spacing-05;
-    margin-top: $spacing-05;
-
-    .cds--loading {
-      margin-left: $spacing-03;
-    }
-  }
-}
-
-// Responsive adjustments
-@media (max-width: 768px) {
-  .configuration {
-    &__form {
-      gap: $spacing-04;
-    }
-
-    &__actions {
-      flex-direction: column;
-
-      button {
-        width: 100%;
-      }
-    }
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+    gap: 1rem;
+    align-items: end;
+    margin-bottom: 1.5rem;
+    max-width: 72rem;
   }
 }

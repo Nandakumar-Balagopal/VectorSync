@@ -21,18 +21,6 @@
     background: $background;
     min-height: calc(100vh - 48px);
 
-    .page-placeholder {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 400px;
-      @include type-style('productive-heading-04');
-      color: $text-secondary;
-      background: $layer-01;
-      margin: $spacing-06;
-      border-radius: 4px;
-      border: 1px dashed $border-subtle-01;
-    }
   }
 }
 

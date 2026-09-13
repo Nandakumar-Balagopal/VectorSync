@@ -18,6 +18,13 @@ public class ChangeEvent {
 
     private String tableId;
     private long snapshotId;
+
+    /** Monotonic per-table ordering for {@link #snapshotId}; snapshot ids themselves are random. */
+    private long sequenceNumber;
+
+    /** Commit time of the snapshot, from Iceberg table metadata. */
+    private long committedAtMillis;
+
     private long previousSnapshotId;
     private String operation;
     private Map<String, Object> rowData;

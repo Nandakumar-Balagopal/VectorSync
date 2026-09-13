@@ -51,6 +51,9 @@ public class IcebergCdcService {
         }
 
         Long currentSnapshotId = currentSnapshot.snapshotId();
+        // Snapshot ids are random longs; the sequence number is what orders history.
+        long sequenceNumber = currentSnapshot.sequenceNumber();
+        long committedAtMillis = currentSnapshot.timestampMillis();
         log.info("CDC check for table {}: lastSnapshotId={}, currentSnapshotId={}",
                  tableConfig.getTableName(), lastSnapshotId, currentSnapshotId);
         
@@ -59,10 +62,10 @@ public class IcebergCdcService {
         try {
             if (lastSnapshotId == null) {
                 log.info("Performing full table scan for {} (lastSnapshotId is null)", tableConfig.getTableName());
-                events.addAll(readFullTable(table, tableConfig, currentSnapshotId));
+                events.addAll(readFullTable(table, tableConfig, currentSnapshotId, sequenceNumber, committedAtMillis));
             } else if (!lastSnapshotId.equals(currentSnapshotId)) {
                 log.info("Performing incremental scan for {} (snapshots differ)", tableConfig.getTableName());
-                events.addAll(readIncremental(table, tableConfig, lastSnapshotId, currentSnapshotId));
+                events.addAll(readIncremental(table, tableConfig, lastSnapshotId, currentSnapshotId, sequenceNumber, committedAtMillis));
             } else {
                 log.info("No changes for {} (snapshots match: {})", tableConfig.getTableName(), currentSnapshotId);
             }
@@ -70,7 +73,7 @@ public class IcebergCdcService {
             log.warn("Incremental CDC failed for {} from snapshot {} to {}: {}. Falling back to full scan.",
                     tableConfig.getTableName(), lastSnapshotId, currentSnapshotId, e.getMessage());
             events.clear();
-            events.addAll(readFullTable(table, tableConfig, currentSnapshotId));
+            events.addAll(readFullTable(table, tableConfig, currentSnapshotId, sequenceNumber, committedAtMillis));
         }
 
         log.info("CDC result for {}: {} change events detected", tableConfig.getTableName(), events.size());
@@ -82,7 +85,11 @@ public class IcebergCdcService {
                 .build();
     }
 
-    private List<ChangeEvent> readFullTable(Table table, TableConfig tableConfig, long snapshotId) {
+    private List<ChangeEvent> readFullTable(Table table,
+                                            TableConfig tableConfig,
+                                            long snapshotId,
+                                            long sequenceNumber,
+                                            long committedAtMillis) {
         log.info("Performing initial full scan for table {}", tableConfig.getTableName());
 
         List<ChangeEvent> events = new ArrayList<>();
@@ -95,6 +102,8 @@ public class IcebergCdcService {
                 events.add(toChangeEvent(
                         tableConfig,
                         snapshotId,
+                        sequenceNumber,
+                        committedAtMillis,
                         null,
                         ChangeEvent.OPERATION_INSERT,
                         rowData,
@@ -107,7 +116,12 @@ public class IcebergCdcService {
         return events;
     }
 
-    private List<ChangeEvent> readIncremental(Table table, TableConfig tableConfig, long fromSnapshot, long toSnapshot) {
+    private List<ChangeEvent> readIncremental(Table table,
+                                              TableConfig tableConfig,
+                                              long fromSnapshot,
+                                              long toSnapshot,
+                                              long sequenceNumber,
+                                              long committedAtMillis) {
         log.info("Performing incremental scan for table {} from {} to {}",
                 tableConfig.getTableName(), fromSnapshot, toSnapshot);
 
@@ -125,6 +139,8 @@ public class IcebergCdcService {
                 events.add(toChangeEvent(
                         tableConfig,
                         toSnapshot,
+                        sequenceNumber,
+                        committedAtMillis,
                         fromSnapshot,
                         ChangeEvent.OPERATION_INSERT,
                         currentRow,
@@ -134,6 +150,8 @@ public class IcebergCdcService {
                 events.add(toChangeEvent(
                         tableConfig,
                         toSnapshot,
+                        sequenceNumber,
+                        committedAtMillis,
                         fromSnapshot,
                         ChangeEvent.OPERATION_UPDATE,
                         currentRow,
@@ -147,6 +165,8 @@ public class IcebergCdcService {
                 events.add(toChangeEvent(
                         tableConfig,
                         toSnapshot,
+                        sequenceNumber,
+                        committedAtMillis,
                         fromSnapshot,
                         ChangeEvent.OPERATION_DELETE,
                         previousEntry.getValue(),
@@ -182,6 +202,8 @@ public class IcebergCdcService {
 
     private ChangeEvent toChangeEvent(TableConfig tableConfig,
                                       long snapshotId,
+                                      long sequenceNumber,
+                                      long committedAtMillis,
                                       Long previousSnapshotId,
                                       String operation,
                                       Map<String, Object> rowData,
@@ -189,6 +211,8 @@ public class IcebergCdcService {
         return ChangeEvent.builder()
                 .tableId(tableConfig.getTableId())
                 .snapshotId(snapshotId)
+                .sequenceNumber(sequenceNumber)
+                .committedAtMillis(committedAtMillis)
                 .previousSnapshotId(previousSnapshotId == null ? -1L : previousSnapshotId)
                 .operation(operation)
                 .rowData(rowData)

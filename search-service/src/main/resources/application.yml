@@ -23,16 +23,17 @@ embedding:
 iceberg:
   catalog:
     type: ${ICEBERG_CATALOG_TYPE:hadoop}
-    warehouse: ${ICEBERG_CATALOG_WAREHOUSE}
+    warehouse: ${ICEBERG_CATALOG_WAREHOUSE:}
   vector:
     namespace: ${ICEBERG_VECTOR_NAMESPACE:vector}
 
 aws:
   s3:
-    endpoint: ${AWS_S3_ENDPOINT}
-    access-key: ${AWS_S3_ACCESS_KEY}
-    secret-key: ${AWS_S3_SECRET_KEY}
+    endpoint: ${AWS_S3_ENDPOINT:}
+    access-key: ${AWS_S3_ACCESS_KEY:}
+    secret-key: ${AWS_S3_SECRET_KEY:}
     path-style-access: ${AWS_S3_PATH_STYLE_ACCESS:true}
+    region: ${AWS_REGION:}
 
 search:
   use-hnsw-index: ${SEARCH_USE_HNSW_INDEX:true}

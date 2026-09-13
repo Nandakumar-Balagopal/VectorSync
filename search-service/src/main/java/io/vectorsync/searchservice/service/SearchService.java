@@ -4,155 +4,160 @@ import io.vectorsync.common.Constants;
 import io.vectorsync.common.dto.SearchResult;
 import io.vectorsync.common.dto.VectorRecord;
 import io.vectorsync.common.util.CosineSimilarityUtil;
+import io.vectorsync.format.index.IndexManifestEntry;
 import io.vectorsync.searchservice.service.iceberg.VectorSyncReader;
-import io.vectorsync.searchservice.service.index.HnswIndexService;
-import io.vectorsync.searchservice.service.index.VectorSearchResult;
+import io.vectorsync.searchservice.service.index.HnswIndexArtifact;
+import io.vectorsync.searchservice.service.index.IndexFields;
+import io.vectorsync.searchservice.service.index.HnswIndexCache;
+import io.vectorsync.searchservice.service.index.IndexRegistry;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.search.KnnFloatVectorQuery;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.TopDocs;
 import org.springframework.stereotype.Service;
-import java.util.*;
-import java.util.stream.Collectors;
 
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * Serves queries through whichever index the {@code production} alias resolves to.
+ *
+ * <p>Previously this read the entire vector table on every query and rebuilt an in-memory index
+ * whenever a content signature changed, so the index saved similarity arithmetic but no I/O.
+ * Serving now resolves an alias, opens a durable artifact once, and keeps it.
+ */
 @Service
 @Slf4j
 public class SearchService {
 
     private final QueryEmbeddingService embeddingClientService;
     private final VectorSyncReader vectorSyncReader;
-    private final HnswIndexService hnswIndexService;
-    
-    @Value("${search.use-hnsw-index:true}")
-    private boolean useHnswIndex;
-    
-    @Value("${search.index-rebuild-threshold:100}")
-    private int indexRebuildThreshold;
+    private final IndexRegistry registry;
+    private final HnswIndexCache indexCache;
 
     public SearchService(QueryEmbeddingService embeddingClientService,
                          VectorSyncReader vectorSyncReader,
-                         HnswIndexService hnswIndexService) {
+                         IndexRegistry registry,
+                         HnswIndexCache indexCache) {
         this.embeddingClientService = embeddingClientService;
         this.vectorSyncReader = vectorSyncReader;
-        this.hnswIndexService = hnswIndexService;
+        this.registry = registry;
+        this.indexCache = indexCache;
     }
 
     public List<SearchResult> search(String query, Integer topK, String sourceTable) throws Exception {
         int k = topK != null ? topK : Constants.DEFAULT_TOP_K;
-
-        log.info("Searching for query: {}, topK: {}, sourceTable: {}, useHnsw: {}",
-                 query, k, sourceTable, useHnswIndex);
-
         List<Double> queryEmbedding = embeddingClientService.generateEmbedding(query);
-        
-        // Decide whether to use HNSW index or brute-force search
-        if (useHnswIndex) {
-            return searchWithHnsw(queryEmbedding, k, sourceTable);
-        } else {
-            return searchBruteForce(queryEmbedding, k, sourceTable);
+
+        Optional<IndexManifestEntry> promoted = sourceTable == null || sourceTable.isBlank()
+                ? Optional.empty()
+                : registry.promotedIndex(sourceTable);
+
+        if (promoted.isPresent()) {
+            return searchIndex(promoted.get(), queryEmbedding, k);
         }
+
+        log.info("No promoted index for {}; falling back to exact search", sourceTable);
+        return searchExact(queryEmbedding, k, sourceTable, null);
     }
-    
-    /**
-     * Search using HNSW index for efficient ANN search.
-     * Automatically rebuilds index if not built or if vector count has changed significantly.
-     */
-    private List<SearchResult> searchWithHnsw(List<Double> queryEmbedding, int k, String sourceTable)
+
+    /** Searches a specific index version, which is how a candidate is evaluated before promotion. */
+    public List<SearchResult> searchIndexId(String indexId, String query, int k) throws Exception {
+        IndexManifestEntry entry = registry.manifest().findById(indexId)
+                .orElseThrow(() -> new IllegalArgumentException("Unknown index: " + indexId));
+
+        return searchIndex(entry, embeddingClientService.generateEmbedding(query), k);
+    }
+
+    private List<SearchResult> searchIndex(IndexManifestEntry entry, List<Double> queryEmbedding, int k)
             throws Exception {
         long startTime = System.currentTimeMillis();
-        
-        // Check if index needs to be built or rebuilt
-        List<VectorRecord> allVectors = vectorSyncReader.readAllVectors();
-        int currentVectorCount = allVectors.size();
-        
-        if (!hnswIndexService.isIndexBuilt() ||
-            currentVectorCount != hnswIndexService.getIndexedVectorCount() ||
-            hnswIndexService.isStale(allVectors)) {
-            
-            log.info("Rebuilding HNSW index: current={}, indexed={}",
-                     currentVectorCount, hnswIndexService.getIndexedVectorCount());
-            hnswIndexService.buildIndex(allVectors);
+        HnswIndexArtifact artifact = indexCache.get(entry);
+
+        float[] target = new float[queryEmbedding.size()];
+        for (int i = 0; i < queryEmbedding.size(); i++) {
+            target[i] = queryEmbedding.get(i).floatValue();
         }
-        
-        // Search using HNSW index
-        List<VectorSearchResult> indexResults = hnswIndexService.search(queryEmbedding, k, sourceTable);
-        
-        // Convert to SearchResult
-        List<SearchResult> results = indexResults.stream()
-                .map(r -> SearchResult.builder()
-                        .vectorId(r.getVectorId())
-                        .sourceTable(r.getSourceTable())
-                        .sourceRowId(r.getSourceRowId())
-                        .text(r.getText())
-                        .similarity(r.getSimilarity())
-                        .build())
-                .collect(Collectors.toList());
-        
-        long duration = System.currentTimeMillis() - startTime;
-        log.info("HNSW search returned {} results in {}ms from {} vectors",
-                 results.size(), duration, currentVectorCount);
-        
+
+        // No source-table filter is applied or needed: an index covers exactly one
+        // (source_table, model_version), so the artifact is itself the filter. The previous
+        // implementation post-filtered after top-k and could silently return fewer than k.
+        TopDocs topDocs = artifact.searcher().search(new KnnFloatVectorQuery(
+                IndexFields.VECTOR, target, k), k);
+
+        List<SearchResult> results = new java.util.ArrayList<>();
+        for (ScoreDoc scoreDoc : topDocs.scoreDocs) {
+            Document document = artifact.searcher().storedFields().document(scoreDoc.doc);
+            results.add(SearchResult.builder()
+                    .vectorId(document.get(IndexFields.VECTOR_ID))
+                    .sourceTable(document.get(IndexFields.SOURCE_TABLE))
+                    .sourceRowId(document.get(IndexFields.SOURCE_ROW_ID))
+                    .text(document.get(IndexFields.TEXT))
+                    .similarity(scoreDoc.score)
+                    .build());
+        }
+
+        log.info("Index {} returned {} results in {}ms",
+                entry.getIndexId(), results.size(), System.currentTimeMillis() - startTime);
         return results;
     }
-    
+
     /**
-     * Brute-force search using cosine similarity.
-     * Used as fallback or when HNSW is disabled.
+     * Exhaustive cosine scan. Slower, but exact, so it doubles as the ground truth that index
+     * recall is measured against.
+     *
+     * @param modelVersion when set, restricts the scan to one embedding version. Leaving it null
+     *        scans every version materialized for the table, which mixes embedding spaces: a query
+     *        embedded with one model scored against vectors from another is meaningless, and the
+     *        same row appears once per version. Always scope it when comparing against an index.
      */
-    private List<SearchResult> searchBruteForce(List<Double> queryEmbedding, int k, String sourceTable)
-            throws Exception {
+    public List<SearchResult> searchExact(List<Double> queryEmbedding,
+                                          int k,
+                                          String sourceTable,
+                                          String modelVersion) {
         long startTime = System.currentTimeMillis();
-        
-        List<VectorRecord> allVectors = vectorSyncReader.readAllVectors();
-        log.debug("Retrieved {} vectors from Iceberg", allVectors.size());
 
-        List<VectorRecord> relevantVectors = allVectors.stream()
-            .filter(v -> sourceTable == null
-                || sourceTable.isEmpty()
-                || v.getSourceTable() == null
-                || sourceTable.equals(v.getSourceTable()))
-                .collect(Collectors.toList());
+        List<VectorRecord> candidates = vectorSyncReader.readAllVectors().stream()
+                .filter(vector -> sourceTable == null
+                        || sourceTable.isBlank()
+                        || sourceTable.equals(vector.getSourceTable()))
+                .filter(vector -> modelVersion == null
+                        || modelVersion.isBlank()
+                        || modelVersion.equals(vector.modelVersion()))
+                .filter(vector -> vector.getEmbedding() != null && !vector.getEmbedding().isEmpty())
+                .toList();
 
-        List<SearchResult> results = relevantVectors.stream()
-                .map(vectorRecord -> {
-                    double similarity = CosineSimilarityUtil.cosineSimilarity(
-                            queryEmbedding, vectorRecord.getEmbedding());
-                    return SearchResult.builder()
-                            .vectorId(vectorRecord.getVectorId())
-                            .sourceTable(vectorRecord.getSourceTable())
-                            .sourceRowId(vectorRecord.getSourceRowId())
-                            .text(vectorRecord.getText())
-                            .similarity(similarity)
-                            .build();
-                })
+        List<SearchResult> results = candidates.stream()
+                .map(vector -> SearchResult.builder()
+                        .vectorId(vector.getVectorId())
+                        .sourceTable(vector.getSourceTable())
+                        .sourceRowId(vector.getSourceRowId())
+                        .text(vector.getText())
+                        .similarity(CosineSimilarityUtil.cosineSimilarity(queryEmbedding, vector.getEmbedding()))
+                        .build())
                 .sorted((a, b) -> Double.compare(b.getSimilarity(), a.getSimilarity()))
                 .limit(k)
-                .collect(Collectors.toList());
+                .toList();
 
-        long duration = System.currentTimeMillis() - startTime;
-        log.info("Brute-force search returned {} results in {}ms from {} candidates",
-                 results.size(), duration, relevantVectors.size());
-
+        log.info("Exact search over {} returned {} of {} candidates in {}ms",
+                modelVersion == null ? "all versions" : modelVersion,
+                results.size(), candidates.size(), System.currentTimeMillis() - startTime);
         return results;
     }
-    
-    /**
-     * Manually trigger index rebuild.
-     * Useful for forcing index refresh after bulk vector updates.
-     */
-    public void rebuildIndex() throws Exception {
-        log.info("Manual index rebuild triggered");
-        List<VectorRecord> allVectors = vectorSyncReader.readAllVectors();
-        hnswIndexService.buildIndex(allVectors);
+
+    public List<SearchResult> searchExact(String query, int k, String sourceTable, String modelVersion)
+            throws Exception {
+        return searchExact(embeddingClientService.generateEmbedding(query), k, sourceTable, modelVersion);
     }
-    
-    /**
-     * Get index statistics.
-     */
+
     public Map<String, Object> getIndexStats() {
         Map<String, Object> stats = new HashMap<>();
-        stats.put("indexBuilt", hnswIndexService.isIndexBuilt());
-        stats.put("indexedVectorCount", hnswIndexService.getIndexedVectorCount());
-        stats.put("useHnswIndex", useHnswIndex);
-        stats.put("indexRebuildThreshold", indexRebuildThreshold);
+        stats.put("formatVersion", registry.formatVersion());
+        stats.put("openArtifacts", indexCache.openCount());
+        stats.put("indexBaseUri", registry.baseUri());
         return stats;
     }
 }

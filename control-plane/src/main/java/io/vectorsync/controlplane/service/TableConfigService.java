@@ -44,6 +44,7 @@ public class TableConfigService {
                     .tableName(config.getTableName())
                     .embeddingColumns(config.getEmbeddingColumns() == null ? "" : String.join(",", config.getEmbeddingColumns()))
                     .modelName(config.getModelName())
+                    .embeddingVersion(config.embeddingVersionOrDefault())
                     .enabled(config.isEnabled())
                     .createdAt(Instant.now())
                     .updatedAt(Instant.now())
@@ -74,6 +75,48 @@ public class TableConfigService {
 
     public Optional<TableConfig> getTableConfig(String tableId) {
         return tableConfigRepository.findById(tableId).map(this::toDto);
+    }
+
+    /**
+     * Repoints a table at a new embedding version.
+     *
+     * <p>Resets the sync watermark, because a new embedding version is a fresh materialization of
+     * data the worker has already seen. Without the reset, incremental CDC would find no source
+     * changes and the new version would never be produced. Existing versions are untouched, so
+     * both coexist and the new one can be evaluated before promotion.
+     */
+    public Optional<TableConfig> setEmbeddingVersion(String tableId, String embeddingVersion) {
+        if (embeddingVersion == null || embeddingVersion.isBlank()) {
+            throw new IllegalArgumentException("embeddingVersion is required");
+        }
+
+        return tableConfigRepository.findById(tableId).map(entity -> {
+            String previous = entity.getEmbeddingVersion();
+            entity.setEmbeddingVersion(embeddingVersion);
+            entity.setUpdatedAt(Instant.now());
+            tableConfigRepository.save(entity);
+
+            if (!embeddingVersion.equals(previous)) {
+                syncStateRepository.findById(tableId).ifPresent(state -> {
+                    state.setLastSnapshotId(null);
+                    state.setLastSyncAt(Instant.now());
+                    syncStateRepository.save(state);
+                });
+                log.info("Table {} embedding version {} -> {}; sync watermark reset for re-materialization",
+                        tableId, previous, embeddingVersion);
+            }
+
+            return toDto(entity);
+        });
+    }
+
+    public Optional<TableConfig> setEnabled(String tableId, boolean enabled) {
+        return tableConfigRepository.findById(tableId).map(entity -> {
+            entity.setEnabled(enabled);
+            entity.setUpdatedAt(Instant.now());
+            tableConfigRepository.save(entity);
+            return toDto(entity);
+        });
     }
 
     public List<TableConfig> getAllTableConfigs() {
@@ -125,6 +168,7 @@ public class TableConfigService {
                 .tableName(entity.getTableName())
                 .embeddingColumns(columns)
                 .modelName(entity.getModelName())
+                .embeddingVersion(entity.getEmbeddingVersion())
                 .enabled(entity.isEnabled())
                 .createdAt(entity.getCreatedAt())
                 .build();

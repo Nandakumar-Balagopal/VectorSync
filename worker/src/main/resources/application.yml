@@ -16,6 +16,8 @@ embedding:
   external:
     type: ${EMBEDDING_EXTERNAL_TYPE:gemini}
     api-url: ${EMBEDDING_EXTERNAL_API_URL:}
+    batch-api-url: ${EMBEDDING_EXTERNAL_BATCH_API_URL:}
+    batch-size: ${EMBEDDING_EXTERNAL_BATCH_SIZE:64}
     api-key: ${EMBEDDING_EXTERNAL_API_KEY:}
     model: ${EMBEDDING_EXTERNAL_MODEL:}
     timeout-ms: ${EMBEDDING_EXTERNAL_TIMEOUT_MS:10000}
@@ -26,26 +28,26 @@ embedding:
       response-json-pointer: ${EMBEDDING_EXTERNAL_HTTP_RESPONSE_JSON_POINTER:}
 control:
   api:
-    url: ${CONTROL_API_URL}
+    url: ${CONTROL_API_URL:http://localhost:8080}
 
 iceberg:
   catalog:
     type: ${ICEBERG_CATALOG_TYPE:hadoop}
-    warehouse: ${ICEBERG_CATALOG_WAREHOUSE}
+    warehouse: ${ICEBERG_CATALOG_WAREHOUSE:}
   vector:
     namespace: ${ICEBERG_VECTOR_NAMESPACE:vector}
   s3:
-    endpoint: ${AWS_S3_ENDPOINT}
-    access-key: ${AWS_S3_ACCESS_KEY}
-    secret-key: ${AWS_S3_SECRET_KEY}
+    endpoint: ${AWS_S3_ENDPOINT:}
+    access-key: ${AWS_S3_ACCESS_KEY:}
+    secret-key: ${AWS_S3_SECRET_KEY:}
 
 aws:
   s3:
-    endpoint: ${AWS_S3_ENDPOINT}
-    access-key: ${AWS_S3_ACCESS_KEY}
-    secret-key: ${AWS_S3_SECRET_KEY}
+    endpoint: ${AWS_S3_ENDPOINT:}
+    access-key: ${AWS_S3_ACCESS_KEY:}
+    secret-key: ${AWS_S3_SECRET_KEY:}
     path-style-access: ${AWS_S3_PATH_STYLE_ACCESS:true}
-    region: ${AWS_REGION}
+    region: ${AWS_REGION:}
 
 logging:
   level:

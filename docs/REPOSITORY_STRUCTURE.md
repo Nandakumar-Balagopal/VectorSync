@@ -1,40 +1,53 @@
 # Repository structure
 
-VectorSync is organized around the Phase 1 runtime path and leaves room for
-future distributed phases without keeping unused experimental modules in the
-active build.
-
-## Active services
-
 ```text
-common/             Shared Java DTOs, constants, and utilities
-control-plane/      Table configuration and sync-state API
-worker/             Phase 1 CDC + embedding + vector write service
-search-service/     Semantic query API and vector retrieval
-embedding-service/  Optional Python embedding API for local/self-hosted models
-dashboard/          React UI
-deployment/         Dockerfiles and helper scripts for the active stack
-docs/               Architecture and planning docs
+vectorsync-format/   Canonical, engine-neutral format contract. NO framework dependencies.
+common/              Pure DTOs, constants, cosine utility
+control-plane/       Table + embedding-version registry, sync watermark (PostgreSQL) :8080
+worker/              Embedding materializer: snapshot diff -> batch embed -> versioned write :8081
+search-service/      Index build, alias-based serving, evaluation, provenance :8083
+embedding-service/   Python FastAPI: sentence-transformers or a managed API :8000
+dashboard/           React UI :3000
+deployment/          Dockerfiles, compose overlays, E2E scripts
+scripts/             Host-local dev startup
+docs/                Architecture and lifecycle guides
 ```
 
-## Future phases
+## Why `vectorsync-format` exists
 
-Do not reintroduce separate CDC or embedding worker modules until the coordinator
-task model exists. Phase 2 should add distributed pieces intentionally, for
-example:
+The vector table's schema, record codec, and version-resolution rule were previously duplicated
+across worker, search-service, and control-plane, and had drifted apart. Under a design whose
+claim is "an open, engine-neutral format", that is fatal: the resolution semantics *are* the
+product, so two components carrying their own copy means they can disagree about what the format
+means.
 
-```text
-coordinator/        Planned: sync jobs, file-level task planning, leases
-worker/             Evolves into a stateless task executor
+```
+io.vectorsync.format
+├── catalog/   IcebergCatalogConfig, IcebergCatalogFactory
+├── io/        IcebergAppender          partitioned Parquet append, one commit
+├── vector/    VectorTableSchema, VectorRecordCodec, VectorResolution, VectorIds
+└── index/     IndexManifestStore, IndexAliasStore, IndexArtifactStore, IndexManifestEntry
 ```
 
-The durable contract should be task-based rather than module-name-based:
+**Hard constraint: no Spring, no framework.** Its consumers include the Spring services, Spark
+batch jobs, and eventually a Trino plugin — none of which can share a framework container. The
+Spring services hold only thin `@Value`-binding adapters over it.
 
-- table snapshot detected
-- coordinator plans Iceberg file tasks
-- workers claim tasks with leases
-- workers generate embeddings and write idempotent vector/tombstone records
-- coordinator advances table freshness only after task completion
+## Layering
 
-This keeps the codebase small in Phase 1 while preserving a clean path to
-autoscaled distributed ingestion.
+```
+common  <-  vectorsync-format  <-  control-plane / worker / search-service
+```
+
+Nothing above `vectorsync-format` may define format semantics. If you find yourself writing a
+schema, an id derivation, or a resolution rule inside a service, it belongs in the format module.
+
+## Not planned
+
+Do not reintroduce a multi-format CDC abstraction (Delta, Hive). It conflicts directly with
+treating Iceberg as the system of record, and the previous design document for it has been removed.
+
+Worker autoscaling is also off the roadmap. The materializer's steady-state load is small and its
+heavy load is a known-size scheduled backfill, which wants provisioned parallelism rather than a
+reactive autoscaler — and the embedding tier, not the worker, is the binding constraint. See the
+scaling notes in `docs/architecture.md`.

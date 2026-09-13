@@ -30,6 +30,9 @@ public class TableConfigEntity {
     @Column(name = "model_name", nullable = false)
     private String modelName;
 
+    @Column(name = "embedding_version")
+    private String embeddingVersion;
+
     @Column(name = "enabled", nullable = false)
     private boolean enabled;
 

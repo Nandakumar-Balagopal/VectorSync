@@ -1,6 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-  Search,
   Button,
   TextArea,
   Dropdown,
@@ -19,9 +18,10 @@ import {
   Accordion,
   AccordionItem,
 } from '@carbon/react';
-import { Search as SearchIcon, Debug, Renew } from '@carbon/icons-react';
+import { Search as SearchIcon, Renew } from '@carbon/icons-react';
 import { vectorSyncApi } from '../services/api';
-import type { TableConfig, SearchResponse, SearchResult } from '../types';
+import type { TableConfig, SearchResponse } from '../types';
+import { describeError } from '../utils/format';
 import './SemanticSearch.scss';
 
 export const SemanticSearch: React.FC = () => {
@@ -35,23 +35,23 @@ export const SemanticSearch: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [debugMode, setDebugMode] = useState(false);
 
-  // Load tables on mount
-  useEffect(() => {
-    loadTables();
-  }, []);
-
-  const loadTables = async () => {
+  const loadTables = useCallback(async () => {
     try {
       const data = await vectorSyncApi.getTables();
-      setTables(Array.isArray(data) ? data : []);
-      if (data.length > 0 && !selectedTable) {
-        setSelectedTable(data[0].tableId);
-      }
+      const list = Array.isArray(data) ? data : [];
+      setTables(list);
+      // Functional form so this does not close over selectedTable, which would
+      // otherwise have to be a dependency and refire the effect on every pick.
+      setSelectedTable(current => current || (list[0]?.tableId ?? ''));
     } catch (err) {
       console.error('Failed to load tables:', err);
       setError('Failed to load tables');
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    void loadTables();
+  }, [loadTables]);
 
   const handleSearch = async () => {
     if (!query.trim() || !selectedTable) {
@@ -64,16 +64,13 @@ export const SemanticSearch: React.FC = () => {
 
     try {
       const table = tables.find(t => t.tableId === selectedTable);
-      const response = await vectorSyncApi.search(
-        query,
-        table?.tableName || selectedTable,
-        topK,
-        useIndex
-      );
+      const response = useIndex
+        ? await vectorSyncApi.search(query, table?.tableName || selectedTable, topK)
+        : await vectorSyncApi.searchExact(query, table?.tableName || selectedTable, topK);
       setSearchResponse(response);
-    } catch (err: any) {
+    } catch (err) {
       console.error('Search failed:', err);
-      setError(err.message || 'Search failed');
+      setError(describeError(err, 'Search failed'));
       setSearchResponse(null);
     } finally {
       setLoading(false);
@@ -116,7 +113,7 @@ export const SemanticSearch: React.FC = () => {
     { key: 'similarity', header: 'Similarity' },
     { key: 'text', header: 'Text' },
     { key: 'sourceRowId', header: 'Row ID' },
-    { key: 'metadata', header: 'Metadata' },
+    { key: 'vectorId', header: 'Vector ID' },
   ];
 
   const rows = searchResponse?.results.map((result, index) => ({
@@ -125,7 +122,7 @@ export const SemanticSearch: React.FC = () => {
     similarity: result.similarity,
     text: result.text,
     sourceRowId: result.sourceRowId,
-    metadata: result.metadata,
+    vectorId: result.vectorId,
     result, // Keep full result for debug mode
   })) || [];
 
