@@ -25,9 +25,24 @@ public class CDCService {
         this.embeddingService = embeddingService;
     }
 
-    public List<VectorRecord> processChangeEvents(TableConfig tableConfig,
-                                                    List<ChangeEvent> changeEvents) {
+    /**
+     * Result of materializing a batch of change events.
+     *
+     * <p>The failure count matters: the caller must not advance the sync watermark past a snapshot
+     * whose events did not all materialize, or those changes are lost permanently. An empty record
+     * list with zero failures is a legitimate outcome (for example, every changed row had blank
+     * text) and is safe to advance past.
+     */
+    public record MaterializationResult(List<VectorRecord> records, int failed) {
+        public boolean complete() {
+            return failed == 0;
+        }
+    }
+
+    public MaterializationResult processChangeEvents(TableConfig tableConfig,
+                                                     List<ChangeEvent> changeEvents) {
         List<VectorRecord> vectorRecords = new ArrayList<>();
+        int failed = 0;
 
         for (ChangeEvent event : changeEvents) {
             try {
@@ -36,11 +51,12 @@ public class CDCService {
                     vectorRecords.add(record);
                 }
             } catch (Exception e) {
+                failed++;
                 log.error("Error processing change event for table {}: {}", tableConfig.getTableId(), e.getMessage(), e);
             }
         }
 
-        return vectorRecords;
+        return new MaterializationResult(vectorRecords, failed);
     }
 
     private VectorRecord processChangeEvent(TableConfig tableConfig, ChangeEvent event)
