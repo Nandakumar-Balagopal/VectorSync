@@ -6,9 +6,6 @@ import type {
   ModelVersions,
   IndexManifestEntry,
   IndexAliasEntry,
-  EvaluationReport,
-  ProvenanceChain,
-  RowEmbeddingHistory,
   DiscoveredTable,
 } from '../types';
 
@@ -73,18 +70,8 @@ export const vectorSyncApi = {
     return response.data;
   },
 
-  getDiscoveredTable: async (uuid: string): Promise<DiscoveredTable> => {
-    const response = await api.get(`${CONTROL}/tables/discovered/${uuid}`);
-    return response.data;
-  },
-
   startTableDiscovery: async (request: Record<string, unknown>): Promise<{ jobId: string }> => {
     const response = await api.post(`${CONTROL}/tables/sync`, request);
-    return response.data;
-  },
-
-  getDiscoveryJob: async (jobId: string): Promise<Record<string, unknown>> => {
-    const response = await api.get(`${CONTROL}/tables/sync/status/${jobId}`);
     return response.data;
   },
 
@@ -97,11 +84,6 @@ export const vectorSyncApi = {
 
   getVectorCount: async (): Promise<number> => {
     const response = await api.get(`${WORKER}/vectors/count`);
-    return response.data;
-  },
-
-  rebuildVectorTable: async (): Promise<Record<string, unknown>> => {
-    const response = await api.post(`${WORKER}/admin/vector-table/rebuild`);
     return response.data;
   },
 
@@ -153,24 +135,10 @@ export const vectorSyncApi = {
     return response.data;
   },
 
-  evaluateIndex: async (
-    indexId: string,
-    topK: number,
-    queries: { query: string; relevantSourceRowIds: string[] }[],
-  ): Promise<EvaluationReport> => {
-    const response = await api.post(`${SEARCH}/lifecycle/evaluate`, { indexId, topK, queries });
-    return response.data;
-  },
-
   // ---------- search ----------
 
   search: async (query: string, sourceTable: string, topK = 5): Promise<SearchResponse> => {
     const response = await api.post(`${SEARCH}/search`, { query, sourceTable, topK });
-    return response.data;
-  },
-
-  searchIndex: async (indexId: string, query: string, topK = 5): Promise<SearchResponse> => {
-    const response = await api.post(`${SEARCH}/search/index/${indexId}`, { query, topK });
     return response.data;
   },
 
@@ -179,22 +147,6 @@ export const vectorSyncApi = {
     return response.data;
   },
 
-  getIndexStats: async (): Promise<Record<string, unknown>> => {
-    const response = await api.get(`${SEARCH}/search/index/stats`);
-    return response.data;
-  },
-
   // ---------- provenance ----------
 
-  explainVector: async (vectorId: string): Promise<ProvenanceChain> => {
-    const response = await api.get(`${SEARCH}/provenance/vector/${encodeURIComponent(vectorId)}`);
-    return response.data;
-  },
-
-  getRowHistory: async (sourceTable: string, sourceRowId: string): Promise<RowEmbeddingHistory[]> => {
-    const response = await api.get(
-      `${SEARCH}/provenance/row?sourceTable=${encodeURIComponent(sourceTable)}`
-      + `&sourceRowId=${encodeURIComponent(sourceRowId)}`);
-    return response.data;
-  },
 };

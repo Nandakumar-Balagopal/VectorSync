@@ -25,8 +25,6 @@ export interface ModelVersions {
   latestSourceSnapshotId: number;
 }
 
-export type IndexStatus = 'BUILDING' | 'READY' | 'FAILED' | 'ARCHIVED';
-
 export interface IndexManifestEntry {
   indexId: string;
   sourceTable: string;
@@ -41,7 +39,7 @@ export interface IndexManifestEntry {
   indexUri: string;
   indexFiles: string[];
   vectorCount: number;
-  status: IndexStatus;
+  status: 'BUILDING' | 'READY' | 'FAILED' | 'ARCHIVED';
   evalMetrics: Record<string, string>;
   builtAt: string;
   updatedAt?: string;
@@ -57,17 +55,6 @@ export interface IndexAliasEntry {
   note?: string;
 }
 
-export interface EvaluationReport {
-  indexId: string;
-  queryCount: number;
-  k: number;
-  /** Overlap with an exhaustive scan. Measures the index, not the model. */
-  indexRecallAtK: number;
-  /** Against judged relevance. Measures the model. Null when no labels were supplied. */
-  precisionAtK: number | null;
-  perQueryIndexRecall: Record<string, number>;
-}
-
 export interface SearchResult {
   vectorId: string;
   sourceTable: string;
@@ -81,25 +68,6 @@ export interface SearchResponse {
   executionTimeMs?: number;
   totalResults: number;
   results: SearchResult[];
-}
-
-export interface ProvenanceChain {
-  vector: Record<string, unknown>;
-  servedByAlias: Record<string, unknown> | null;
-  index: Record<string, unknown> | null;
-  embedding: Record<string, unknown>;
-  source: Record<string, unknown>;
-  sourceRowAtSnapshot: Record<string, unknown> | null;
-}
-
-export interface RowEmbeddingHistory {
-  vectorId: string;
-  modelVersion: string;
-  sourceSnapshotId: number;
-  deleted: boolean;
-  text: string | null;
-  createdAt: string;
-  metadata: Record<string, string>;
 }
 
 export interface DiscoveredTable {

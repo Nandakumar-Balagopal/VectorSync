@@ -21,13 +21,4 @@ body {
   background-color: #161616;
 }
 
-// Ensure no overlays are blocking
-.cds--loading-overlay {
-  display: none !important;
-}
 
-// Fix any potential white overlays
-.cds--modal,
-.cds--modal-container {
-  background-color: transparent !important;
-}

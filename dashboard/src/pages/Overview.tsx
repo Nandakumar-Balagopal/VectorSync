@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Button,
@@ -14,6 +14,7 @@ import {
 } from '@carbon/react';
 import { vectorSyncApi } from '../services/api';
 import type { SyncStatus, TableConfig } from '../types';
+import { describeError, formatTime } from '../utils/format';
 import './Overview.scss';
 
 interface TableRow {
@@ -29,19 +30,13 @@ interface TableRow {
  */
 export function Overview() {
   const navigate = useNavigate();
-  const [rows, setRows] = useState<TableRow[]>([]);
+  const [rows, setRows] = useState<TableRow[] | null>(null);
   const [vectorCount, setVectorCount] = useState<number | null>(null);
   const [vectorCountError, setVectorCountError] = useState(false);
-  const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const load = async () => {
-    setLoading(true);
+  const load = useCallback(async () => {
     setError(null);
     try {
       const configs = await vectorSyncApi.getTables();
@@ -61,11 +56,17 @@ export function Overview() {
         setVectorCountError(true);
       }
     } catch (err) {
-      setError(describe(err, 'Could not load tables'));
-    } finally {
-      setLoading(false);
+      setError(describeError(err, 'Could not load tables'));
+      setRows([]);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Derived rather than stored: no setState runs synchronously from the effect.
+  const loading = rows === null;
 
   const sync = async () => {
     setSyncing(true);
@@ -74,7 +75,7 @@ export function Overview() {
       await vectorSyncApi.triggerSync();
       await load();
     } catch (err) {
-      setError(describe(err, 'Sync failed'));
+      setError(describeError(err, 'Sync failed'));
     } finally {
       setSyncing(false);
     }
@@ -86,7 +87,7 @@ export function Overview() {
       await vectorSyncApi.deleteTable(tableId);
       await load();
     } catch (err) {
-      setError(describe(err, 'Delete failed'));
+      setError(describeError(err, 'Delete failed'));
     }
   };
 
@@ -98,7 +99,7 @@ export function Overview() {
     <div className="overview">
       <div className="overview__header">
         <h1>Overview</h1>
-        <Button onClick={sync} disabled={syncing || rows.length === 0}>
+        <Button onClick={sync} disabled={syncing || (rows ?? []).length === 0}>
           {syncing ? 'Syncing…' : 'Sync now'}
         </Button>
       </div>
@@ -115,7 +116,7 @@ export function Overview() {
       <div className="overview__tiles">
         <Tile>
           <span className="overview__label">Registered tables</span>
-          <span className="overview__metric">{rows.length}</span>
+          <span className="overview__metric">{(rows ?? []).length}</span>
         </Tile>
         <Tile>
           <span className="overview__label">Live vectors</span>
@@ -125,11 +126,11 @@ export function Overview() {
         </Tile>
         <Tile>
           <span className="overview__label">Enabled for sync</span>
-          <span className="overview__metric">{rows.filter(row => row.config.enabled).length}</span>
+          <span className="overview__metric">{(rows ?? []).filter(row => row.config.enabled).length}</span>
         </Tile>
       </div>
 
-      {rows.length === 0 ? (
+      {(rows ?? []).length === 0 ? (
         <p className="overview__empty">
           No tables registered. Register one from Configuration, then sync to materialize
           embeddings.
@@ -148,7 +149,7 @@ export function Overview() {
             </StructuredListRow>
           </StructuredListHead>
           <StructuredListBody>
-            {rows.map(({ config, status }) => (
+            {(rows ?? []).map(({ config, status }) => (
               <StructuredListRow key={config.tableId}>
                 <StructuredListCell>{config.tableName}</StructuredListCell>
                 <StructuredListCell>{config.modelName}</StructuredListCell>
@@ -177,15 +178,4 @@ export function Overview() {
       )}
     </div>
   );
-}
-
-function formatTime(value: string | null | undefined): string {
-  if (!value) return '—';
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
-}
-
-function describe(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { error?: string; message?: string } } })?.response?.data;
-  return detail?.message ?? detail?.error ?? (err as Error)?.message ?? fallback;
 }

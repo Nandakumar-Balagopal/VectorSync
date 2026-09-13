@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   Button,
   Checkbox,
@@ -14,6 +14,7 @@ import {
 } from '@carbon/react';
 import { vectorSyncApi } from '../services/api';
 import type { DiscoveredTable, TableConfig } from '../types';
+import { describeError } from '../utils/format';
 import './Configuration.scss';
 
 /**
@@ -23,9 +24,8 @@ import './Configuration.scss';
  * index tuning, none of which had endpoints; edits went nowhere.
  */
 export function Configuration() {
-  const [tables, setTables] = useState<TableConfig[]>([]);
+  const [tables, setTables] = useState<TableConfig[] | null>(null);
   const [discovered, setDiscovered] = useState<DiscoveredTable[]>([]);
-  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -42,21 +42,22 @@ export function Configuration() {
   const [s3Path, setS3Path] = useState('');
   const [catalogName, setCatalogName] = useState('');
 
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const load = async () => {
-    setLoading(true);
+  const load = useCallback(async () => {
     try {
       setTables(await vectorSyncApi.getTables());
       setDiscovered(await vectorSyncApi.getDiscoveredTables().catch(() => []));
     } catch (err) {
-      setError(describe(err, 'Could not load configuration'));
-    } finally {
-      setLoading(false);
+      setError(describeError(err, 'Could not load configuration'));
+      setTables([]);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Derived rather than stored: no setState runs synchronously from the effect.
+  const loading = tables === null;
 
   const register = async () => {
     if (!tableName.trim()) return;
@@ -76,7 +77,7 @@ export function Configuration() {
       setTableName('');
       await load();
     } catch (err) {
-      setError(describe(err, 'Registration failed'));
+      setError(describeError(err, 'Registration failed'));
     } finally {
       setBusy(null);
     }
@@ -97,7 +98,7 @@ export function Configuration() {
       });
       setNotice(`Discovery job ${jobId} started. Reload to see results.`);
     } catch (err) {
-      setError(describe(err, 'Discovery failed'));
+      setError(describeError(err, 'Discovery failed'));
     } finally {
       setBusy(null);
     }
@@ -144,7 +145,7 @@ export function Configuration() {
       </div>
 
       <h2>Registered tables</h2>
-      {tables.length === 0 ? (
+      {(tables ?? []).length === 0 ? (
         <p className="configuration__hint">None yet.</p>
       ) : (
         <StructuredListWrapper>
@@ -158,7 +159,7 @@ export function Configuration() {
             </StructuredListRow>
           </StructuredListHead>
           <StructuredListBody>
-            {tables.map(table => (
+            {(tables ?? []).map(table => (
               <StructuredListRow key={table.tableId}>
                 <StructuredListCell>{table.tableName}</StructuredListCell>
                 <StructuredListCell>{table.embeddingColumns.join(', ')}</StructuredListCell>
@@ -220,9 +221,4 @@ export function Configuration() {
       )}
     </div>
   );
-}
-
-function describe(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { error?: string; message?: string } } })?.response?.data;
-  return detail?.message ?? detail?.error ?? (err as Error)?.message ?? fallback;
 }

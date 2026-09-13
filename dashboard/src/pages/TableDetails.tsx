@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
   Button,
@@ -15,6 +15,7 @@ import {
 } from '@carbon/react';
 import { vectorSyncApi } from '../services/api';
 import type { IndexManifestEntry, ModelVersions, SyncStatus, TableConfig } from '../types';
+import { describeError } from '../utils/format';
 import './TableDetails.scss';
 
 /**
@@ -32,18 +33,12 @@ export function TableDetails() {
   const [versions, setVersions] = useState<ModelVersions | null>(null);
   const [indexes, setIndexes] = useState<IndexManifestEntry[]>([]);
   const [newVersion, setNewVersion] = useState('');
-  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  useEffect(() => {
-    void load();
-  }, [tableId]);
-
-  const load = async () => {
+  const load = useCallback(async () => {
     if (!tableId) return;
-    setLoading(true);
     setError(null);
     try {
       const configData = await vectorSyncApi.getTable(tableId);
@@ -57,11 +52,16 @@ export function TableDetails() {
       setVersions(versionData);
       setIndexes(indexData);
     } catch (err) {
-      setError(describe(err, 'Could not load table'));
-    } finally {
-      setLoading(false);
+      setError(describeError(err, 'Could not load table'));
     }
-  };
+  }, [tableId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Derived rather than stored: no setState runs synchronously from the effect.
+  const loading = config === null && error === null;
 
   const migrate = async () => {
     if (!tableId || !newVersion.trim()) return;
@@ -76,7 +76,7 @@ export function TableDetails() {
       setNewVersion('');
       await load();
     } catch (err) {
-      setError(describe(err, 'Could not change embedding version'));
+      setError(describeError(err, 'Could not change embedding version'));
     } finally {
       setBusy(false);
     }
@@ -195,9 +195,4 @@ export function TableDetails() {
       </Button>
     </div>
   );
-}
-
-function describe(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { error?: string; message?: string } } })?.response?.data;
-  return detail?.message ?? detail?.error ?? (err as Error)?.message ?? fallback;
 }

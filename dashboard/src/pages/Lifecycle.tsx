@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   Button,
   Dropdown,
@@ -19,6 +19,7 @@ import type {
   ModelVersions,
   TableConfig,
 } from '../types';
+import { describeError, formatTime } from '../utils/format';
 import './Lifecycle.scss';
 
 const STATUS_TAG: Record<string, 'green' | 'blue' | 'red' | 'gray'> = {
@@ -36,11 +37,10 @@ export function Lifecycle() {
   const [tables, setTables] = useState<TableConfig[]>([]);
   const [sourceTable, setSourceTable] = useState<string>('');
   const [versions, setVersions] = useState<ModelVersions | null>(null);
-  const [indexes, setIndexes] = useState<IndexManifestEntry[]>([]);
+  const [indexes, setIndexes] = useState<IndexManifestEntry[] | null>(null);
   const [promotedId, setPromotedId] = useState<string | null>(null);
   const [history, setHistory] = useState<IndexAliasEntry[]>([]);
   const [selectedVersion, setSelectedVersion] = useState<string>('');
-  const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -52,17 +52,10 @@ export function Lifecycle() {
           setSourceTable(data[0].tableName);
         }
       })
-      .catch(err => setError(describe(err, 'Could not load tables')));
+      .catch(err => setError(describeError(err, 'Could not load tables')));
   }, []);
 
-  useEffect(() => {
-    if (sourceTable) {
-      void load(sourceTable);
-    }
-  }, [sourceTable]);
-
-  const load = async (table: string) => {
-    setLoading(true);
+  const load = useCallback(async (table: string) => {
     setError(null);
     try {
       const [versionData, indexData, promoted, historyData] = await Promise.all([
@@ -78,11 +71,20 @@ export function Lifecycle() {
       setPromotedId('indexId' in promoted ? (promoted as IndexManifestEntry).indexId : null);
       setSelectedVersion(versionData.modelVersions[0] ?? '');
     } catch (err) {
-      setError(describe(err, 'Could not load lifecycle state'));
-    } finally {
-      setLoading(false);
+      setError(describeError(err, 'Could not load lifecycle state'));
+      setIndexes([]);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    if (!sourceTable) {
+      return;
+    }
+    void load(sourceTable);
+  }, [sourceTable, load]);
+
+  // Derived rather than stored: no setState runs synchronously from the effect.
+  const loading = indexes === null;
 
   const act = async (label: string, action: () => Promise<unknown>) => {
     setBusy(label);
@@ -91,7 +93,7 @@ export function Lifecycle() {
       await action();
       await load(sourceTable);
     } catch (err) {
-      setError(describe(err, `${label} failed`));
+      setError(describeError(err, `${label} failed`));
     } finally {
       setBusy(null);
     }
@@ -171,7 +173,7 @@ export function Lifecycle() {
       <h2>Index artifacts</h2>
       {loading ? (
         <Loading description="Loading indexes" withOverlay={false} />
-      ) : indexes.length === 0 ? (
+      ) : (indexes ?? []).length === 0 ? (
         <p className="lifecycle__empty">
           No indexes built for this table yet. Build one to serve searches from an ANN index
           instead of an exhaustive scan.
@@ -190,7 +192,7 @@ export function Lifecycle() {
             </StructuredListRow>
           </StructuredListHead>
           <StructuredListBody>
-            {indexes.map(entry => (
+            {(indexes ?? []).map(entry => (
               <StructuredListRow key={entry.indexId}>
                 <StructuredListCell>
                   <code>{entry.indexId.slice(0, 12)}</code>
@@ -255,15 +257,4 @@ export function Lifecycle() {
       )}
     </div>
   );
-}
-
-function formatTime(value: string | null | undefined): string {
-  if (!value) return '—';
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
-}
-
-function describe(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { error?: string; message?: string } } })?.response?.data;
-  return detail?.message ?? detail?.error ?? (err as Error)?.message ?? fallback;
 }
