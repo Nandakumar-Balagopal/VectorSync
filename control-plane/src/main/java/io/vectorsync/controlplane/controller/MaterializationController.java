@@ -92,6 +92,45 @@ public class MaterializationController {
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
+    /**
+     * Moves a validated materialization into BACKFILLING.
+     *
+     * <p>Called by the worker when it starts planning, so the state reflects what is actually
+     * happening rather than what was requested. A materialization that never leaves VALIDATED has a
+     * planner problem, and that is worth being able to see.
+     */
+    @PostMapping("/{id}/backfill")
+    public ResponseEntity<?> beginBackfill(@PathVariable("id") String id) {
+        return admissionService.beginBackfill(id)
+                .<ResponseEntity<?>>map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /**
+     * Marks a materialization LIVE at a watermark.
+     *
+     * <p>The watermark is supplied by the worker rather than recomputed here, because only the
+     * worker knows whether every file in the pass actually landed. Accepting a watermark the caller
+     * did not earn is the one way this endpoint can cause silent data loss, so the worker must only
+     * call it on a complete pass.
+     */
+    @PostMapping("/{id}/live")
+    public ResponseEntity<?> markLive(@PathVariable("id") String id,
+                                      @RequestParam("watermark") long watermark) {
+        return admissionService.markLive(id, watermark)
+                .<ResponseEntity<?>>map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /** Records that a materialization cannot proceed, with the reason an operator needs. */
+    @PostMapping("/{id}/degraded")
+    public ResponseEntity<?> markDegraded(@PathVariable("id") String id,
+                                          @RequestParam("reason") String reason) {
+        return admissionService.markDegraded(id, reason)
+                .<ResponseEntity<?>>map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
     @PostMapping("/{id}/pause")
     public ResponseEntity<?> pause(@PathVariable("id") String id) {
         return transition(id, () -> admissionService.pause(id));

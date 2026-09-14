@@ -41,6 +41,13 @@ control:
 iceberg:
   catalog:
     type: ${ICEBERG_CATALOG_TYPE:hadoop}
+    uri: ${ICEBERG_CATALOG_URI:}
+    credential: ${ICEBERG_CATALOG_CREDENTIAL:}
+    name: ${ICEBERG_CATALOG_NAME:}
+    # HadoopCatalog cannot commit atomically on object storage, so a shared
+    # deployment must use rest, hive, glue or nessie. This compose stack is a
+    # single writer against local MinIO, which is the one case where it is safe.
+    allow-unsafe-hadoop: ${ICEBERG_CATALOG_ALLOW_UNSAFE_HADOOP:true}
     warehouse: ${ICEBERG_CATALOG_WAREHOUSE:}
   vector:
     namespace: ${ICEBERG_VECTOR_NAMESPACE:vector}

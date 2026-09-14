@@ -49,6 +49,42 @@ public class WorkQueueController {
     }
 
     /**
+     * Enqueues planned work for a materialization.
+     *
+     * <p>Planning happens in the worker, because only the data plane talks to the source catalog;
+     * the queue is the control plane's, because only it has durable state. So the file list crosses
+     * the boundary here. Idempotent on (materializationId, dataFilePath, snapshotId), which is what
+     * makes a replan after a crashed planner safe to repeat.
+     */
+    @PostMapping("/enqueue")
+    public ResponseEntity<?> enqueue(@RequestBody EnqueueRequest request) {
+        if (request == null || request.getMaterializationId() == null
+                || request.getMaterializationId().isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "materializationId is required"));
+        }
+
+        try {
+            int inserted = workQueueService.enqueue(
+                    request.getMaterializationId(),
+                    request.getDescriptors() == null ? List.of() : request.getDescriptors());
+            int submitted = request.getDescriptors() == null ? 0 : request.getDescriptors().size();
+            return ResponseEntity.ok(Map.of(
+                    "materializationId", request.getMaterializationId(),
+                    "submitted", submitted,
+                    "inserted", inserted,
+                    "alreadyQueued", submitted - inserted));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
+        }
+    }
+
+    @lombok.Data
+    public static class EnqueueRequest {
+        private String materializationId;
+        private List<WorkQueueService.WorkDescriptor> descriptors;
+    }
+
+    /**
      * Leases up to {@code limit} items to a worker.
      *
      * <p>POST, not GET, because it mutates: each call transfers ownership of rows. A cached or

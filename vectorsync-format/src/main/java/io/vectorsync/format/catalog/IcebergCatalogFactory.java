@@ -57,27 +57,22 @@ public final class IcebergCatalogFactory {
     }
 
     private static Catalog build(IcebergCatalogConfig config) {
-        log.info("Creating Iceberg catalog with warehouse: {}", config.getWarehousePath());
+        log.info("Creating {} Iceberg catalog (warehouse {}, uri {})",
+                config.type(), config.getWarehousePath(),
+                config.getCatalogUri() == null ? "-" : config.getCatalogUri());
 
         ensureWarehouseBucket(config);
 
-        String catalogImpl = config.catalogImpl();
+        Map<String, String> properties = config.catalogProperties();
 
-        Map<String, String> properties = new HashMap<>();
-        properties.put(CatalogProperties.CATALOG_IMPL, catalogImpl);
-        properties.put(CatalogProperties.WAREHOUSE_LOCATION, config.getWarehousePath());
-
-        if (config.usesNativeS3FileIO()) {
-            properties.put(CatalogProperties.FILE_IO_IMPL, S3_FILE_IO_IMPL);
-            properties.put("s3.endpoint", config.getS3Endpoint());
-            properties.put("s3.access-key-id", config.getS3AccessKey());
-            properties.put("s3.secret-access-key", config.getS3SecretKey());
-            properties.put("s3.path-style-access", String.valueOf(config.isPathStyleAccess()));
-            properties.put("s3.region", config.getS3Region());
-            properties.put("aws.region", config.getS3Region());
-        }
-
-        return CatalogUtil.loadCatalog(catalogImpl, CATALOG_NAME, properties, hadoopConfiguration(config));
+        // buildIcebergCatalog resolves rest, hive, glue, nessie, jdbc and hadoop from the "type"
+        // property, each with its own configuration handling. The previous implementation called
+        // loadCatalog with a class name, which meant only HadoopCatalog could ever be constructed:
+        // a REST catalog needs uri and credential, Glue needs a region, Nessie needs a ref, and
+        // none of those were ever placed in the property map. Every engine deployment worth
+        // integrating with -- Spark on Glue, Trino on REST or Hive, Databricks on Unity -- was
+        // therefore unreachable.
+        return CatalogUtil.buildIcebergCatalog(CATALOG_NAME, properties, hadoopConfiguration(config));
     }
 
     /**

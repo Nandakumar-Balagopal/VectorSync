@@ -5,12 +5,24 @@ import io.vectorsync.worker.client.ControlApiClient;
 import io.vectorsync.worker.service.SyncOrchestrationService;
 import io.vectorsync.worker.service.VectorStoreService;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import java.util.List;
 
+/**
+ * The legacy row-keyed sync path, off by default.
+ *
+ * <p>Superseded by {@link DerivationScheduler}. Its change detection diffs two fully-materialized
+ * snapshots in memory, and it writes the old row-keyed vector table that the content-addressed
+ * design does not read. Running both schedulers means two derivation implementations over the same
+ * sources, writing to different destinations, neither aware of the other's watermark -- so this is
+ * opt-in via {@code vectorsync.legacy-sync.enabled} and exists only for comparison and for
+ * deployments still serving from the old table.
+ */
 @Component
 @Slf4j
+@ConditionalOnProperty(name = "vectorsync.legacy-sync.enabled", havingValue = "true")
 public class SyncScheduler {
 
     private final SyncOrchestrationService syncOrchestrationService;

@@ -34,6 +34,23 @@ public class IcebergCatalogService {
     @Value("${aws.s3.path-style-access:true}")
     private boolean pathStyleAccess;
 
+    @Value("${iceberg.catalog.uri:}")
+    private String catalogUri;
+
+    @Value("${iceberg.catalog.credential:}")
+    private String catalogCredential;
+
+    /** Server-side catalog name for a REST catalog, where it differs from the warehouse path. */
+    @Value("${iceberg.catalog.name:}")
+    private String catalogWarehouse;
+
+    /**
+     * Accepts HadoopCatalog on object storage, which cannot commit atomically. Local single-writer
+     * development only; a shared deployment must use rest, hive, glue or nessie.
+     */
+    @Value("${iceberg.catalog.allow-unsafe-hadoop:false}")
+    private boolean allowUnsafeHadoopCatalog;
+
     public Catalog getCatalog() {
         return IcebergCatalogFactory.load(config());
     }
@@ -47,6 +64,10 @@ public class IcebergCatalogService {
                 .s3SecretKey(s3SecretKey)
                 .s3Region(s3Region)
                 .pathStyleAccess(pathStyleAccess)
+                .catalogUri(catalogUri)
+                .catalogCredential(catalogCredential)
+                .catalogWarehouse(catalogWarehouse)
+                .allowUnsafeHadoopCatalog(allowUnsafeHadoopCatalog)
                 .build();
     }
 }
