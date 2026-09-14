@@ -100,6 +100,28 @@ public interface WorkItemRepository extends JpaRepository<WorkItemEntity, String
     List<String> selectLeasableIds(@Param("limit") int limit);
 
     /**
+     * As {@link #selectLeasableIds} but restricted to one materialization.
+     *
+     * <p>Needed because a runner iterating materializations one at a time can only derive work for
+     * the spec it currently holds. Leasing from the global head handed it items belonging to other
+     * materializations, and reporting those back as failures spent their retry budget: with three
+     * or more materializations registered, the queue head's items reached terminal FAILED before any
+     * worker ever opened the file.
+     */
+    @Query(value = """
+            SELECT id
+            FROM work_items
+            WHERE state = 'PENDING'
+              AND attempts < max_attempts
+              AND materialization_id = :materializationId
+            ORDER BY priority ASC, created_at ASC
+            LIMIT :limit
+            FOR UPDATE SKIP LOCKED
+            """, nativeQuery = true)
+    List<String> selectLeasableIdsFor(@Param("materializationId") String materializationId,
+                                      @Param("limit") int limit);
+
+    /**
      * Sends expired leases whose next attempt would exceed the budget straight to FAILED.
      *
      * <p>Must run before {@link #requeueExpiredLeases}, which would otherwise reset these rows to

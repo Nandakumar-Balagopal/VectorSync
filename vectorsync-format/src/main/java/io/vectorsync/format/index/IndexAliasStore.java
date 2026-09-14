@@ -1,5 +1,6 @@
 package io.vectorsync.format.index;
 
+import io.vectorsync.format.catalog.Namespaces;
 import io.vectorsync.common.Constants;
 import io.vectorsync.format.io.IcebergAppender;
 import lombok.extern.slf4j.Slf4j;
@@ -93,6 +94,8 @@ public final class IndexAliasStore {
         log.info("Creating index alias table {}", identifier);
         Schema schema = schema();
         try {
+            // Non-Hadoop catalogs reject createTable into a namespace that does not exist.
+            Namespaces.ensureExists(catalog, identifier);
             catalog.createTable(identifier, schema, partitionSpec(schema),
                     java.util.Map.of(Constants.FORMAT_VERSION_PROPERTY,
                             String.valueOf(Constants.VECTOR_FORMAT_VERSION)));

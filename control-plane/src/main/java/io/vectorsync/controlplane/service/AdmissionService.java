@@ -394,8 +394,14 @@ public class AdmissionService {
     @Transactional
     public Optional<MaterializationEntity> beginBackfill(String id) {
         return materializationRepository.findById(id).map(entity -> {
+            // Idempotent. The planner calls this on every cycle until the backfill drains, and
+            // BACKFILLING -> BACKFILLING is not a legal transition, so an unguarded call threw a 500
+            // and logged a stack trace every interval for the whole duration of the backfill.
+            if (entity.getState() == State.BACKFILLING) {
+                return entity;
+            }
             entity.transitionTo(State.BACKFILLING);
-            entity.setLastError(null);
+            entity.setUpdatedAt(Instant.now());
             return materializationRepository.save(entity);
         });
     }

@@ -1,5 +1,6 @@
 package io.vectorsync.format.derive;
 
+import io.vectorsync.format.catalog.Namespaces;
 import io.vectorsync.common.Constants;
 import io.vectorsync.format.io.IcebergAppender;
 import lombok.extern.slf4j.Slf4j;
@@ -129,6 +130,8 @@ public final class ContentMap {
                 namespace, Constants.CONTENT_MAP_TABLE_NAME, Constants.VECTOR_FORMAT_VERSION);
         Schema schema = schema();
         try {
+            // Non-Hadoop catalogs reject createTable into a namespace that does not exist.
+            Namespaces.ensureExists(catalog, identifier);
             catalog.createTable(
                     identifier,
                     schema,

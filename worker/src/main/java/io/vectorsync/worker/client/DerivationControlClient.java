@@ -204,9 +204,10 @@ public class DerivationControlClient {
         return response == null ? 0 : response.path("inserted").asInt(0);
     }
 
-    public List<LeasedItem> lease(String owner, int limit, long leaseSeconds) {
+    public List<LeasedItem> lease(String owner, int limit, long leaseSeconds, String materializationId) {
         JsonNode response = post("/api/queue/lease", Map.of(
-                "owner", owner, "limit", limit, "leaseSeconds", leaseSeconds));
+                "owner", owner, "limit", limit, "leaseSeconds", leaseSeconds,
+                "materializationId", materializationId));
 
         List<LeasedItem> items = new ArrayList<>();
         if (response == null) {
@@ -261,8 +262,15 @@ public class DerivationControlClient {
         post("/api/materializations/" + id + "/backfill", Map.of());
     }
 
-    public void markLive(String id, long watermark) {
-        post("/api/materializations/" + id + "/live?watermark=" + watermark, Map.of());
+    /**
+     * @return true only when the control plane confirmed the transition
+     *
+     * <p>{@link #post} swallows transport and 4xx/5xx failures into a warning, which is right for a
+     * fire-and-forget call and wrong here: the caller reports "watermark advanced" from this, and a
+     * swallowed failure made that metric claim progress the control plane never recorded.
+     */
+    public boolean markLive(String id, long watermark) {
+        return post("/api/materializations/" + id + "/live?watermark=" + watermark, Map.of()) != null;
     }
 
     public void markDegraded(String id, String reason) {

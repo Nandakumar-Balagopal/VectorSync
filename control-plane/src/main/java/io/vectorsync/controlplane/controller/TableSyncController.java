@@ -30,6 +30,10 @@ public class TableSyncController {
     /**
      * Trigger table sync from S3
      */
+    private static boolean isPresent(String value) {
+        return value != null && !value.isBlank();
+    }
+
     @PostMapping("/sync")
     public ResponseEntity<SyncResponse> syncTables(@RequestBody SyncRequest request) {
         log.info("Received sync request for catalog: {} at path: {}", 
@@ -52,17 +56,54 @@ public class TableSyncController {
                             .build());
         }
         
-        // Credentials come from the request when supplied, otherwise from the control plane's
-        // own configuration. Callers such as the dashboard deliberately do not send secrets, and
-        // Hadoop's Configuration.set rejects null values outright -- previously any request
-        // without credentials failed with a 500 rather than a usable message.
+        // Credentials and the endpoint they are sent to are ONE group, taken entirely from the
+        // request or entirely from configuration. Never mixed.
+        //
+        // Mixing them was a credential-exfiltration hole. An earlier version filled in missing
+        // credentials from the control plane's own configuration -- convenient, so the dashboard
+        // need not handle secrets -- while still honoring a request-supplied endpoint. A caller who
+        // sent {"awsEndpoint":"http://attacker/"} and no credentials therefore made the control
+        // plane authenticate to an arbitrary host using the warehouse's own long-lived keys, in
+        // plaintext. The endpoint decides where the secret travels, so whoever supplies the
+        // endpoint must supply the secret.
         IcebergCatalogConfig configured = catalogService.config();
-        String accessKey = firstNonBlank(request.getAwsAccessKey(), configured.getS3AccessKey());
-        String secretKey = firstNonBlank(request.getAwsSecretKey(), configured.getS3SecretKey());
-        String endpoint = firstNonBlank(request.getAwsEndpoint(), configured.getS3Endpoint());
-        String region = firstNonBlank(request.getAwsRegion(), configured.getS3Region());
+        boolean requestHasCredentials =
+                isPresent(request.getAwsAccessKey()) || isPresent(request.getAwsSecretKey());
+        boolean requestHasEndpoint =
+                isPresent(request.getAwsEndpoint()) || isPresent(request.getAwsRegion());
 
-        if (accessKey == null || secretKey == null) {
+        String accessKey;
+        String secretKey;
+        String endpoint;
+        String region;
+
+        if (requestHasCredentials) {
+            if (!isPresent(request.getAwsAccessKey()) || !isPresent(request.getAwsSecretKey())) {
+                return ResponseEntity.badRequest().body(SyncResponse.builder()
+                        .success(false)
+                        .message("Supply both awsAccessKey and awsSecretKey, or neither")
+                        .build());
+            }
+            accessKey = request.getAwsAccessKey();
+            secretKey = request.getAwsSecretKey();
+            endpoint = firstNonBlank(request.getAwsEndpoint(), configured.getS3Endpoint());
+            region = firstNonBlank(request.getAwsRegion(), configured.getS3Region());
+        } else {
+            if (requestHasEndpoint) {
+                return ResponseEntity.badRequest().body(SyncResponse.builder()
+                        .success(false)
+                        .message("awsEndpoint and awsRegion may only be set together with "
+                                + "awsAccessKey and awsSecretKey. Directing the control plane's own "
+                                + "credentials at a caller-chosen endpoint would disclose them.")
+                        .build());
+            }
+            accessKey = configured.getS3AccessKey();
+            secretKey = configured.getS3SecretKey();
+            endpoint = configured.getS3Endpoint();
+            region = configured.getS3Region();
+        }
+
+        if (!isPresent(accessKey) || !isPresent(secretKey)) {
             return ResponseEntity.badRequest().body(
                     SyncResponse.builder()
                             .success(false)
@@ -80,7 +121,10 @@ public class TableSyncController {
         hadoopConf.set("fs.s3a.endpoint", endpoint == null ? "s3.amazonaws.com" : endpoint);
         hadoopConf.set("fs.s3a.path.style.access", "true");
         hadoopConf.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem");
-        hadoopConf.set("fs.s3a.connection.ssl.enabled", "false");
+        // Follows the endpoint rather than being pinned off. Hardcoding it disabled TLS even for a
+        // real https endpoint, so credentials crossed the network in the clear.
+        boolean plaintext = endpoint != null && endpoint.startsWith("http://");
+        hadoopConf.set("fs.s3a.connection.ssl.enabled", String.valueOf(!plaintext));
 
         if (region != null) {
             hadoopConf.set("fs.s3a.region", region);

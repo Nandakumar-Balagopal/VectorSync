@@ -72,6 +72,11 @@ services:
       SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME}
       SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD}
       ICEBERG_CATALOG_WAREHOUSE: ${ICEBERG_CATALOG_WAREHOUSE}
+      # This stack is a single writer against local MinIO, the one case where
+      # HadoopCatalog's non-atomic commit cannot lose a snapshot. A shared
+      # deployment must use a rest, hive, glue or nessie catalog instead, and
+      # the application default refuses this combination without the opt-in.
+      ICEBERG_CATALOG_ALLOW_UNSAFE_HADOOP: "true"
       ICEBERG_VECTOR_NAMESPACE: ${ICEBERG_VECTOR_NAMESPACE}
       AWS_S3_ENDPOINT: ${AWS_S3_ENDPOINT}
       AWS_S3_ACCESS_KEY: ${AWS_S3_ACCESS_KEY}
@@ -101,6 +106,11 @@ services:
     environment:
       CONTROL_API_URL: ${CONTROL_API_URL:-http://control-plane:8080}
       ICEBERG_CATALOG_WAREHOUSE: ${ICEBERG_CATALOG_WAREHOUSE}
+      # This stack is a single writer against local MinIO, the one case where
+      # HadoopCatalog's non-atomic commit cannot lose a snapshot. A shared
+      # deployment must use a rest, hive, glue or nessie catalog instead, and
+      # the application default refuses this combination without the opt-in.
+      ICEBERG_CATALOG_ALLOW_UNSAFE_HADOOP: "true"
       ICEBERG_VECTOR_NAMESPACE: ${ICEBERG_VECTOR_NAMESPACE}
       AWS_S3_ENDPOINT: ${AWS_S3_ENDPOINT}
       AWS_S3_ACCESS_KEY: ${AWS_S3_ACCESS_KEY}
@@ -144,6 +154,11 @@ services:
       - "${SEARCH_SERVICE_HOST_PORT:-8083}:8083"
     environment:
       ICEBERG_CATALOG_WAREHOUSE: ${ICEBERG_CATALOG_WAREHOUSE}
+      # This stack is a single writer against local MinIO, the one case where
+      # HadoopCatalog's non-atomic commit cannot lose a snapshot. A shared
+      # deployment must use a rest, hive, glue or nessie catalog instead, and
+      # the application default refuses this combination without the opt-in.
+      ICEBERG_CATALOG_ALLOW_UNSAFE_HADOOP: "true"
       ICEBERG_VECTOR_NAMESPACE: ${ICEBERG_VECTOR_NAMESPACE}
       AWS_S3_ENDPOINT: ${AWS_S3_ENDPOINT}
       AWS_S3_ACCESS_KEY: ${AWS_S3_ACCESS_KEY}

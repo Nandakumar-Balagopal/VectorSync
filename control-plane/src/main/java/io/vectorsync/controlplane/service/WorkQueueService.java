@@ -170,6 +170,21 @@ public class WorkQueueService {
      */
     @Transactional
     public List<WorkItemEntity> lease(String owner, int limit, Duration leaseDuration) {
+        return lease(owner, limit, leaseDuration, null);
+    }
+
+    /**
+     * Claims items, optionally restricted to one materialization.
+     *
+     * <p>A caller that can only process one materialization must pass it. Filtering after an
+     * unscoped lease is not equivalent: the items it cannot use are already leased to it, and
+     * handing them back as failures consumes their retry budget.
+     */
+    @Transactional
+    public List<WorkItemEntity> lease(String owner,
+                                      int limit,
+                                      Duration leaseDuration,
+                                      String materializationId) {
         if (owner == null || owner.isBlank()) {
             throw new IllegalArgumentException("owner is required");
         }
@@ -182,7 +197,9 @@ public class WorkQueueService {
                 ? DEFAULT_LEASE_DURATION
                 : leaseDuration;
 
-        List<String> ids = workItemRepository.selectLeasableIds(effectiveLimit);
+        List<String> ids = materializationId == null || materializationId.isBlank()
+                ? workItemRepository.selectLeasableIds(effectiveLimit)
+                : workItemRepository.selectLeasableIdsFor(materializationId, effectiveLimit);
         if (ids.isEmpty()) {
             return List.of();
         }

@@ -102,7 +102,8 @@ public class WorkQueueController {
                     : Duration.ofSeconds(request.getLeaseSeconds());
             int limit = request.getLimit() == null ? 1 : request.getLimit();
 
-            List<WorkItemEntity> leased = workQueueService.lease(request.getOwner(), limit, leaseDuration);
+            List<WorkItemEntity> leased = workQueueService.lease(
+                    request.getOwner(), limit, leaseDuration, request.getMaterializationId());
             return ResponseEntity.ok(leased);
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
@@ -212,6 +213,8 @@ public class WorkQueueController {
         private Integer limit;
         /** Should exceed the worker's expected time to process {@code limit} files. */
         private Integer leaseSeconds;
+        /** Restricts the lease to one materialization. Null leases from the global head. */
+        private String materializationId;
     }
 
     /**

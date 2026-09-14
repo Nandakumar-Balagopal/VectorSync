@@ -48,8 +48,31 @@ public class MaterializationRunner {
     private final DeriveService deriveService;
     private final IcebergCatalogService catalogService;
 
-    @Value("${vectorsync.runner.owner:worker-1}")
+    /**
+     * Lease owner. Defaults to host and pid rather than a constant, because the fence in the queue
+     * compares owner strings: every replica calling itself "worker-1" makes the fence inert, so a
+     * stale worker could report on an item that had been reassigned to a peer.
+     */
+    @Value("${vectorsync.runner.owner:}")
+    private String configuredOwner;
+
     private String owner;
+
+    @jakarta.annotation.PostConstruct
+    void resolveOwner() {
+        if (configuredOwner != null && !configuredOwner.isBlank()) {
+            owner = configuredOwner;
+            return;
+        }
+        String host;
+        try {
+            host = java.net.InetAddress.getLocalHost().getHostName();
+        } catch (Exception e) {
+            host = "unknown-host";
+        }
+        owner = host + ":" + ProcessHandle.current().pid();
+        log.info("Derivation runner lease owner: {}", owner);
+    }
 
     /** Files leased per cycle. Bounds heap and keeps a crash cheap; it is not a throughput knob. */
     @Value("${vectorsync.runner.lease-batch:8}")
@@ -57,6 +80,10 @@ public class MaterializationRunner {
 
     @Value("${vectorsync.runner.lease-seconds:900}")
     private long leaseSeconds;
+
+    /** Ceiling on lease batches per materialization per cycle, so one backfill cannot hold a cycle. */
+    @Value("${vectorsync.runner.max-batches-per-cycle:32}")
+    private int maxBatchesPerCycle;
 
     @Value("${iceberg.vector.namespace:vector}")
     private String vectorNamespace;
@@ -134,6 +161,22 @@ public class MaterializationRunner {
 
         boolean backfilled = materialization.getIncrementalWatermark() > 0;
         if (!backfilled) {
+            QueueDepth depth = control.depth(materialization.getId());
+
+            // Replan only when the queue holds nothing for this materialization. Keying on the
+            // watermark instead meant replanning on every cycle for the entire backfill, because
+            // markLive only sets it once the queue drains: a 10,000-file table replanned 1,250
+            // times and re-sent 10,000 descriptors each time -- roughly 12.5M no-op upserts to do
+            // 10,000 files of work, with the enqueue round trips, not derivation, setting the
+            // wall-clock floor.
+            if (depth != null && (depth.getPending() > 0 || depth.getLeased() > 0)) {
+                return 0;
+            }
+            if (depth != null && depth.getDone() > 0 && depth.getFailed() == 0) {
+                // Everything planned has been derived; publish() advances from here.
+                return 0;
+            }
+
             control.beginBackfill(materialization.getId());
             List<SourceFileWork> work = detector.backfillWork(config, materialization.getAnchorSnapshotId());
             int inserted = control.enqueue(materialization.getId(), work, "BACKFILL");
@@ -177,15 +220,17 @@ public class MaterializationRunner {
         int processed = 0;
         int failed = 0;
 
-        List<LeasedItem> batch = control.lease(owner, leaseBatch, leaseSeconds);
+        int batches = 0;
+        List<LeasedItem> batch = control.lease(owner, leaseBatch, leaseSeconds, materialization.getId());
         while (!batch.isEmpty()) {
             for (LeasedItem item : batch) {
-                // The queue is global, so a lease can hand back work for a different
-                // materialization. Deriving it with this spec would embed rows under the wrong
-                // configuration, so it is released rather than guessed at.
+                // The lease is scoped to this materialization, so a mismatch means the control
+                // plane and the worker disagree about what was claimed. Skipping without reporting
+                // is deliberate: reporting a failure would spend a retry from this item's budget for
+                // a problem that is not the item's fault, and the lease expiring returns it intact.
                 if (!materialization.getId().equals(item.getMaterializationId())) {
-                    control.fail(item.getId(), owner,
-                            "leased to a runner iterating a different materialization; requeued");
+                    log.error("Lease for {} returned an item belonging to {}; leaving it to expire",
+                            materialization.getId(), item.getMaterializationId());
                     continue;
                 }
 
@@ -216,9 +261,16 @@ public class MaterializationRunner {
                 }
             }
 
-            // One batch per cycle per materialization: the loop yields so that a long backfill does
-            // not starve the other materializations this cycle still has to visit.
-            break;
+            // Keep draining, but with a ceiling so one large backfill cannot hold the cycle for an
+            // unbounded time while other materializations wait. Leasing one batch per cycle instead
+            // made the scheduler interval the throughput limit: a 10,000-file table needed 1,250
+            // cycles, a floor of over five hours at a 15-second interval regardless of derivation
+            // speed.
+            batches++;
+            if (batches >= maxBatchesPerCycle) {
+                break;
+            }
+            batch = control.lease(owner, leaseBatch, leaseSeconds, materialization.getId());
         }
 
         return new int[]{processed, failed};
@@ -277,8 +329,15 @@ public class MaterializationRunner {
                     projection.rowsWritten(), projection.distinctVectors(), projection.embeddingDim());
         }
 
-        control.markLive(materialization.getId(), watermark);
-        return true;
+        boolean advanced = control.markLive(materialization.getId(), watermark);
+        if (!advanced) {
+            // The projection is published but the control plane did not record the watermark. Safe
+            // in that direction -- the next cycle republishes and retries -- but it must not be
+            // counted as progress, which is what the report is for.
+            log.warn("Projection for {} published but the watermark was not recorded; will retry",
+                    materialization.getId());
+        }
+        return advanced;
     }
 
     private static TableConfig toTableConfig(MaterializationSpec spec) {
