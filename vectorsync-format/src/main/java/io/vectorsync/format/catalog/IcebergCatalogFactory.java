@@ -18,6 +18,7 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 import java.net.URI;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Single definition of how VectorSync builds an Iceberg catalog.
@@ -33,11 +34,29 @@ public final class IcebergCatalogFactory {
     private static final String CATALOG_NAME = "iceberg-catalog";
     private static final String S3_FILE_IO_IMPL = "org.apache.iceberg.aws.s3.S3FileIO";
 
+    /**
+     * Catalogs are cached per configuration. Callers reach for a catalog on every read and write,
+     * and building one is not cheap: it reloads the catalog implementation, rebuilds a Hadoop
+     * Configuration, and performs an S3 HeadBucket round trip. Iceberg catalogs are designed to be
+     * long-lived and are safe to share, so the per-call construction was pure overhead charged to
+     * every query.
+     */
+    private static final Map<IcebergCatalogConfig, Catalog> CACHE = new ConcurrentHashMap<>();
+
     private IcebergCatalogFactory() {
     }
 
     public static Catalog load(IcebergCatalogConfig config) {
         config.validate();
+        return CACHE.computeIfAbsent(config, IcebergCatalogFactory::build);
+    }
+
+    /** Drops cached catalogs. For tests that repoint the warehouse within one JVM. */
+    public static void clearCache() {
+        CACHE.clear();
+    }
+
+    private static Catalog build(IcebergCatalogConfig config) {
         log.info("Creating Iceberg catalog with warehouse: {}", config.getWarehousePath());
 
         ensureWarehouseBucket(config);

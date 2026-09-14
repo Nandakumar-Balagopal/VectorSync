@@ -1,5 +1,6 @@
 package io.vectorsync.worker.service;
 
+import io.vectorsync.common.Constants;
 import io.vectorsync.common.dto.VectorRecord;
 import io.vectorsync.format.io.IcebergAppender;
 import io.vectorsync.format.vector.VectorRecordCodec;
@@ -10,11 +11,14 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Function;
 
 @Service
 @Slf4j
@@ -71,18 +75,26 @@ public class VectorStoreService {
      * deleted.
      */
     public List<String> materializedVersions(String sourceTable) {
-        return readRaw().stream()
-                .filter(record -> sourceTable.equals(record.getSourceTable()))
-                .map(VectorRecord::modelVersion)
+        // Runs once per table per sync cycle to fan a delete across every version. Reading the
+        // whole table to collect one string per row made the scheduler's cost scale with total
+        // warehouse size; the predicate prunes to this table's partitions and the projection drops
+        // the embedding, which is all but the entire row.
+        Table table = icebergTableService.loadOrCreateVectorTable();
+        return scan(table,
+                Expressions.equal(Constants.SOURCE_TABLE_COLUMN, sourceTable),
+                record -> String.valueOf(record.getField(Constants.MODEL_VERSION_COLUMN)),
+                Constants.MODEL_VERSION_COLUMN)
+                .stream()
                 .distinct()
                 .sorted()
                 .toList();
     }
 
     public List<VectorRecord> getVectorsByTable(String tableName) {
-        return getAllVectors().stream()
-                .filter(v -> tableName.equals(v.getSourceTable()))
-                .toList();
+        Table table = icebergTableService.loadOrCreateVectorTable();
+        return VectorResolution.latestLiveVectors(scan(table,
+                Expressions.equal(Constants.SOURCE_TABLE_COLUMN, tableName),
+                VectorRecordCodec::fromIcebergRecord));
     }
 
     public long getVectorCount() {
@@ -91,13 +103,27 @@ public class VectorStoreService {
 
     /** Full append-only history, before resolution. */
     private List<VectorRecord> readRaw() {
-        Table table = icebergTableService.loadOrCreateVectorTable();
-        List<VectorRecord> records = new ArrayList<>();
+        return scan(icebergTableService.loadOrCreateVectorTable(), null,
+                VectorRecordCodec::fromIcebergRecord);
+    }
 
-        try (CloseableIterable<Record> rows = IcebergGenerics.read(table).build()) {
+    private <T> List<T> scan(Table table,
+                             Expression filter,
+                             Function<Record, T> mapper,
+                             String... columns) {
+        IcebergGenerics.ScanBuilder builder = IcebergGenerics.read(table);
+        if (filter != null) {
+            builder = builder.where(filter);
+        }
+        if (columns.length > 0) {
+            builder = builder.select(columns);
+        }
+
+        List<T> records = new ArrayList<>();
+        try (CloseableIterable<Record> rows = builder.build()) {
             for (Record row : rows) {
                 try {
-                    records.add(VectorRecordCodec.fromIcebergRecord(row));
+                    records.add(mapper.apply(row));
                 } catch (Exception e) {
                     log.warn("Skipping unreadable vector row: {}", e.getMessage(), e);
                 }

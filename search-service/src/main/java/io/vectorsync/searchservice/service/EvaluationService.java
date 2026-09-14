@@ -97,11 +97,12 @@ public class EvaluationService {
      */
     public EvaluationReport evaluateIndexRecall(String indexId, int k, Integer probeCount) throws Exception {
         IndexManifestEntry entry = requireEntry(indexId);
-        List<VectorRecord> population =
-                vectorSyncReader.readForIndex(entry.getSourceTable(), entry.modelVersion());
-
-        List<VectorRecord> probes = sampleProbes(
-                population, probeCount == null || probeCount <= 0 ? DEFAULT_PROBE_COUNT : probeCount);
+        // Sampling happens inside the reader so only the sampled rows have their embeddings read;
+        // pulling the whole partition to choose twenty probes defeats the point of a cheap check.
+        List<VectorRecord> probes = vectorSyncReader.sampleLiveVectors(
+                entry.getSourceTable(),
+                entry.modelVersion(),
+                probeCount == null || probeCount <= 0 ? DEFAULT_PROBE_COUNT : probeCount);
         if (probes.isEmpty()) {
             throw new IllegalStateException("No vectors materialized for "
                     + entry.getSourceTable() + " at " + entry.modelVersion()
@@ -204,29 +205,6 @@ public class EvaluationService {
                 indexId, k, report.indexRecallAtK(), k, precision, queryCount);
 
         return report;
-    }
-
-    /**
-     * Evenly spaced sample over a stable ordering. Deterministic on purpose: a gate that returns a
-     * different number each run cannot be compared against a threshold.
-     */
-    private static List<VectorRecord> sampleProbes(List<VectorRecord> population, int wanted) {
-        List<VectorRecord> usable = population.stream()
-                .filter(vector -> vector.getEmbedding() != null && !vector.getEmbedding().isEmpty())
-                .sorted(Comparator.comparing(VectorRecord::getVectorId,
-                        Comparator.nullsLast(Comparator.naturalOrder())))
-                .toList();
-
-        if (usable.size() <= wanted) {
-            return usable;
-        }
-
-        List<VectorRecord> probes = new ArrayList<>(wanted);
-        double stride = (double) usable.size() / wanted;
-        for (int i = 0; i < wanted; i++) {
-            probes.add(usable.get((int) (i * stride)));
-        }
-        return probes;
     }
 
     private IndexManifestEntry requireEntry(String indexId) {

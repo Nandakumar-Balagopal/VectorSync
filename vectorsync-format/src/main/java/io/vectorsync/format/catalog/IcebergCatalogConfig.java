@@ -1,6 +1,7 @@
 package io.vectorsync.format.catalog;
 
 import lombok.Builder;
+import lombok.EqualsAndHashCode;
 import lombok.Getter;
 
 /**
@@ -8,9 +9,13 @@ import lombok.Getter;
  *
  * <p>Spring services build this from {@code @Value}-injected properties; a Spark job or CLI can
  * build it from its own configuration source. That separation is why this type exists.
+ *
+ * <p>Value equality is required, not cosmetic: {@link IcebergCatalogFactory} caches catalogs keyed
+ * by this type, and identity equality would make every call a cache miss.
  */
 @Getter
 @Builder
+@EqualsAndHashCode
 public class IcebergCatalogConfig {
 
     private static final String HADOOP_CATALOG_IMPL = "org.apache.iceberg.hadoop.HadoopCatalog";

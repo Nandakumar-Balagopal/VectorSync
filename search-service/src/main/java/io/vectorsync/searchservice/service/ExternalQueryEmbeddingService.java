@@ -44,9 +44,9 @@ public class ExternalQueryEmbeddingService implements QueryEmbeddingService {
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
 
-    public ExternalQueryEmbeddingService(ObjectMapper objectMapper) {
+    public ExternalQueryEmbeddingService(ObjectMapper objectMapper, RestTemplate restTemplate) {
         this.objectMapper = objectMapper;
-        this.restTemplate = new RestTemplate();
+        this.restTemplate = restTemplate;
     }
 
     private String resolveModel(String requested) {

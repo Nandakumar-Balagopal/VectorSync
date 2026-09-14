@@ -14,7 +14,11 @@ embedding:
     api-url: ${EMBEDDING_EXTERNAL_API_URL:}
     api-key: ${EMBEDDING_EXTERNAL_API_KEY:}
     model: ${EMBEDDING_EXTERNAL_MODEL:}
-    timeout-ms: ${EMBEDDING_EXTERNAL_TIMEOUT_MS:10000}
+    # Read timeout, now actually applied to the HTTP client. Raised from 10s because a cold
+    # start loads the model on the first request and a batch can be large; the goal is to bound
+    # the wait so a hung service cannot wedge a thread forever, not to enforce a latency budget.
+    timeout-ms: ${EMBEDDING_EXTERNAL_TIMEOUT_MS:120000}
+    connect-timeout-ms: ${EMBEDDING_EXTERNAL_CONNECT_TIMEOUT_MS:5000}
     http:
       api-key-header: ${EMBEDDING_EXTERNAL_HTTP_API_KEY_HEADER:}
       api-key-prefix: ${EMBEDDING_EXTERNAL_HTTP_API_KEY_PREFIX:}

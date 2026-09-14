@@ -150,7 +150,10 @@ public class DemoSeedService {
         Table table = loadProductsTable();
         Record record = buildRecord(table.schema(), id, name, description, category, price);
         appendRecords(table, List.of(record));
-        return new DemoMutationResult("INSERT", id, 1);
+        // The real total, like the update and delete paths report. This returned a hardcoded 1,
+        // which read as "one record left in the table" and looked exactly like an overwrite had
+        // just destroyed the corpus.
+        return new DemoMutationResult("INSERT", id, readProducts(table).size());
     }
 
     public DemoMutationResult updateProduct(String id,
@@ -303,6 +306,9 @@ public class DemoSeedService {
     public record DemoSeedResult(String tableName, int recordsWritten, boolean created, boolean vectorsReset) {
     }
 
+    /**
+     * @param remainingRecords rows in the table after the operation, for all three operations
+     */
     public record DemoMutationResult(String operation, String id, int remainingRecords) {
     }
 }

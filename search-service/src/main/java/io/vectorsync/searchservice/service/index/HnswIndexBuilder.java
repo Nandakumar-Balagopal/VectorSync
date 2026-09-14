@@ -2,6 +2,7 @@ package io.vectorsync.searchservice.service.index;
 
 import io.vectorsync.common.dto.VectorRecord;
 import io.vectorsync.format.index.IndexManifestEntry;
+import io.vectorsync.format.index.IndexVector;
 import io.vectorsync.format.index.IndexStatus;
 import io.vectorsync.format.vector.VectorIds;
 import lombok.extern.slf4j.Slf4j;
@@ -73,14 +74,14 @@ public class HnswIndexBuilder {
                                     long sourceSequenceNumber,
                                     String embeddingModel,
                                     String embeddingVersion,
-                                    List<VectorRecord> vectors) {
+                                    List<IndexVector> vectors) {
         String paramSignature = "maxConn=" + maxConn + ",beamWidth=" + beamWidth;
         String indexId = VectorIds.indexId(
                 sourceTable, sourceSnapshotId, embeddingModel, embeddingVersion, ALGORITHM, paramSignature);
 
         int dimension = vectors.stream()
-                .filter(vector -> vector.getEmbedding() != null && !vector.getEmbedding().isEmpty())
-                .mapToInt(vector -> vector.getEmbedding().size())
+                .filter(IndexVector::hasEmbedding)
+                .mapToInt(IndexVector::dimension)
                 .findFirst()
                 .orElse(0);
 
@@ -139,7 +140,7 @@ public class HnswIndexBuilder {
         }
     }
 
-    private void writeIndex(Path workDir, List<VectorRecord> vectors) throws IOException {
+    private void writeIndex(Path workDir, List<IndexVector> vectors) throws IOException {
         KnnVectorsFormat hnswFormat = new Lucene99HnswVectorsFormat(maxConn, beamWidth);
         Lucene99Codec codec = new Lucene99Codec() {
             @Override
@@ -154,7 +155,7 @@ public class HnswIndexBuilder {
 
         try (FSDirectory directory = FSDirectory.open(workDir);
              IndexWriter writer = new IndexWriter(directory, config)) {
-            for (VectorRecord record : vectors) {
+            for (IndexVector record : vectors) {
                 Document document = toDocument(record);
                 if (document != null) {
                     writer.addDocument(document);
@@ -166,27 +167,22 @@ public class HnswIndexBuilder {
         }
     }
 
-    private Document toDocument(VectorRecord record) {
-        List<Double> embedding = record.getEmbedding();
-        if (embedding == null || embedding.isEmpty()) {
+    private Document toDocument(IndexVector record) {
+        if (!record.hasEmbedding()) {
             // Tombstones carry no vector and are excluded before this point; skip defensively
             // rather than writing a zero vector that would pollute nearest-neighbour results.
             return null;
         }
 
-        float[] vector = new float[embedding.size()];
-        for (int i = 0; i < embedding.size(); i++) {
-            vector[i] = embedding.get(i).floatValue();
-        }
-
         Document document = new Document();
-        document.add(new KnnFloatVectorField(IndexFields.VECTOR, vector, VectorSimilarityFunction.COSINE));
-        document.add(new StringField(IndexFields.VECTOR_ID, nullSafe(record.getVectorId()), Field.Store.YES));
-        document.add(new StoredField(IndexFields.SOURCE_TABLE, nullSafe(record.getSourceTable())));
-        document.add(new StoredField(IndexFields.SOURCE_ROW_ID, nullSafe(record.getSourceRowId())));
-        document.add(new StoredField(IndexFields.TEXT, nullSafe(record.getText())));
+        document.add(new KnnFloatVectorField(
+                IndexFields.VECTOR, record.embedding(), VectorSimilarityFunction.COSINE));
+        document.add(new StringField(IndexFields.VECTOR_ID, nullSafe(record.vectorId()), Field.Store.YES));
+        document.add(new StoredField(IndexFields.SOURCE_TABLE, nullSafe(record.sourceTable())));
+        document.add(new StoredField(IndexFields.SOURCE_ROW_ID, nullSafe(record.sourceRowId())));
+        document.add(new StoredField(IndexFields.TEXT, nullSafe(record.text())));
         document.add(new StoredField(IndexFields.MODEL_VERSION, nullSafe(record.modelVersion())));
-        document.add(new StoredField(IndexFields.SOURCE_SNAPSHOT_ID, record.getSourceSnapshotId()));
+        document.add(new StoredField(IndexFields.SOURCE_SNAPSHOT_ID, record.sourceSnapshotId()));
         return document;
     }
 

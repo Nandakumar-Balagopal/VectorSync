@@ -4,12 +4,14 @@ import io.vectorsync.common.dto.VectorRecord;
 import io.vectorsync.format.index.IndexAliasEntry;
 import io.vectorsync.format.index.IndexAliasStore;
 import io.vectorsync.format.index.IndexManifestEntry;
+import io.vectorsync.format.index.IndexVector;
 import io.vectorsync.searchservice.service.EvaluationService;
 import io.vectorsync.searchservice.service.iceberg.VectorSyncReader;
 import io.vectorsync.searchservice.service.index.HnswIndexBuilder;
 import io.vectorsync.searchservice.service.index.HnswIndexCache;
 import io.vectorsync.searchservice.service.index.IndexRegistry;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -20,6 +22,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -40,6 +43,13 @@ public class LifecycleController {
     private final VectorSyncReader vectorSyncReader;
     private final EvaluationService evaluationService;
 
+    /**
+     * Minimum label-free index recall for an index to be promotable without an override. Not 1.0:
+     * HNSW is approximate by design and a healthy graph routinely lands slightly under.
+     */
+    @Value("${lifecycle.promotion.min-index-recall:0.95}")
+    private double minIndexRecall;
+
     public LifecycleController(IndexRegistry registry,
                                HnswIndexBuilder builder,
                                HnswIndexCache indexCache,
@@ -59,7 +69,15 @@ public class LifecycleController {
     public record BuildRequest(String sourceTable, String modelVersion, Long asOfSequenceNumber) {
     }
 
-    public record PromoteRequest(String sourceTable, String indexId, String promotedBy, String note) {
+    /**
+     * @param force skips the promotion checks. Requires a note; the override and the blockers it
+     *              bypassed are written into the alias log.
+     */
+    public record PromoteRequest(String sourceTable,
+                                 String indexId,
+                                 String promotedBy,
+                                 String note,
+                                 Boolean force) {
     }
 
     /**
@@ -93,24 +111,24 @@ public class LifecycleController {
                     .body(Map.of("error", "modelVersion must be in 'model:version' form"));
         }
 
-        List<VectorRecord> vectors = request.asOfSequenceNumber() != null
-                ? vectorSyncReader.readForIndexAsOf(
+        List<IndexVector> vectors = request.asOfSequenceNumber() != null
+                ? vectorSyncReader.readForIndexBuildAsOf(
                         request.sourceTable(), request.modelVersion(), request.asOfSequenceNumber())
-                : vectorSyncReader.readForIndex(request.sourceTable(), request.modelVersion());
+                : vectorSyncReader.readForIndexBuild(request.sourceTable(), request.modelVersion());
 
         // Recorded on the manifest for provenance; the snapshot id addresses the source version
         // even though the sequence number is what ordered it.
         // Ordering comes from the sequence number; the snapshot id is carried alongside it for
         // identity. Picking the snapshot id by max() would be wrong -- Iceberg snapshot ids are
         // random longs -- so select the row with the highest sequence number and take its id.
-        VectorRecord newest = vectors.stream()
-                .max(java.util.Comparator.comparingLong(VectorRecord::getSourceSequenceNumber))
+        IndexVector newest = vectors.stream()
+                .max(java.util.Comparator.comparingLong(IndexVector::sourceSequenceNumber))
                 .orElse(null);
         long snapshotId = newest != null
-                ? newest.getSourceSnapshotId()
+                ? newest.sourceSnapshotId()
                 : vectorSyncReader.latestSourceSnapshot(request.sourceTable());
         long sequenceNumber = newest != null
-                ? newest.getSourceSequenceNumber()
+                ? newest.sourceSequenceNumber()
                 : vectorSyncReader.latestSourceSequenceNumber(request.sourceTable());
 
         if (vectors.isEmpty()) {
@@ -130,7 +148,17 @@ public class LifecycleController {
         }
     }
 
-    /** Points the production alias at an index. One Iceberg commit. */
+    /**
+     * Points the production alias at an index. One Iceberg commit.
+     *
+     * <p>Gated, because promotion is the moment an artifact starts answering every query for the
+     * table and there is no feedback channel behind it: the consumers are query engines, so a bad
+     * promotion produces no complaints, only quietly worse output. Checks refuse an index that was
+     * never evaluated, one whose measured recall is below the floor, and one that does not cover
+     * the newest data. All three are overridable with {@code force}, which requires a note and is
+     * recorded in the alias log -- an unoverridable gate just gets bypassed by editing the alias
+     * table directly, which would lose the audit trail entirely.
+     */
     @PostMapping("/promote")
     public ResponseEntity<?> promote(@RequestBody PromoteRequest request) {
         if (isBlank(request.sourceTable()) || isBlank(request.indexId())) {
@@ -147,14 +175,74 @@ public class LifecycleController {
                     "error", "Index is not servable", "status", String.valueOf(entry.getStatus())));
         }
 
+        boolean force = Boolean.TRUE.equals(request.force());
+        if (force && isBlank(request.note())) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "error", "force requires a note explaining why the checks are being overridden"));
+        }
+
+        List<String> blockers = promotionBlockers(entry);
+        if (!blockers.isEmpty() && !force) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "error", "Index did not pass promotion checks",
+                    "blockers", blockers,
+                    "hint", "evaluate the index first, or re-send with force=true and a note"));
+        }
+
+        String note = request.note();
+        if (!blockers.isEmpty()) {
+            log.warn("Forced promotion of {} for {} over blockers {}",
+                    entry.getIndexId(), request.sourceTable(), blockers);
+            note = "FORCED (" + String.join("; ", blockers) + "): " + note;
+        }
+
         IndexAliasEntry promoted = registry.aliases().promote(
                 IndexAliasStore.PRODUCTION,
                 request.sourceTable(),
                 request.indexId(),
                 request.promotedBy() == null ? "api" : request.promotedBy(),
-                request.note());
+                note);
 
         return ResponseEntity.ok(promoted);
+    }
+
+    /**
+     * Reasons this index should not serve production. Empty means it passes.
+     *
+     * <p>Only label-free recall can gate: precision needs a judged fixture the table owner may
+     * never have written, so requiring it would block every honest promotion.
+     */
+    private List<String> promotionBlockers(IndexManifestEntry entry) {
+        List<String> blockers = new ArrayList<>();
+
+        Map<String, String> metrics = entry.getEvalMetrics();
+        String recallKey = metrics == null ? null : metrics.keySet().stream()
+                .filter(key -> key.startsWith("index_recall@"))
+                .findFirst()
+                .orElse(null);
+
+        if (recallKey == null) {
+            blockers.add("never evaluated: no index_recall@k recorded on the manifest entry");
+        } else {
+            try {
+                double recall = Double.parseDouble(metrics.get(recallKey));
+                if (recall < minIndexRecall) {
+                    blockers.add(String.format(
+                            "%s=%.4f is below the floor of %.4f", recallKey, recall, minIndexRecall));
+                }
+            } catch (NumberFormatException e) {
+                blockers.add(recallKey + " is not a number: " + metrics.get(recallKey));
+            }
+        }
+
+        long newest = vectorSyncReader.latestSourceSequenceNumber(entry.getSourceTable());
+        if (entry.getSourceSequenceNumber() < newest) {
+            blockers.add(String.format(
+                    "covers source sequence %d but the table is at %d",
+                    entry.getSourceSequenceNumber(), newest));
+        }
+
+        return blockers;
     }
 
     /** Re-points production at whatever it served previously. */

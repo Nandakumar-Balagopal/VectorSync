@@ -1,7 +1,9 @@
 package io.vectorsync.worker.client;
 
 import io.vectorsync.common.dto.TableConfig;
+import io.vectorsync.worker.config.HttpClientConfig;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpEntity;
@@ -21,8 +23,8 @@ public class ControlApiClient {
 
     private final RestTemplate restTemplate;
 
-    public ControlApiClient() {
-        this.restTemplate = new RestTemplate();
+    public ControlApiClient(@Qualifier(HttpClientConfig.CONTROL_API_CLIENT) RestTemplate restTemplate) {
+        this.restTemplate = restTemplate;
     }
 
     public List<TableConfig> getTableConfigs() {

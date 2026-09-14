@@ -2,7 +2,9 @@ package io.vectorsync.worker.service.embedding;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.vectorsync.worker.config.HttpClientConfig;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpEntity;
@@ -58,9 +60,10 @@ public class ExternalEmbeddingService implements EmbeddingService {
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
 
-    public ExternalEmbeddingService(ObjectMapper objectMapper) {
+    public ExternalEmbeddingService(ObjectMapper objectMapper,
+                                    @Qualifier(HttpClientConfig.EMBEDDING_CLIENT) RestTemplate restTemplate) {
         this.objectMapper = objectMapper;
-        this.restTemplate = new RestTemplate();
+        this.restTemplate = restTemplate;
     }
 
     /**

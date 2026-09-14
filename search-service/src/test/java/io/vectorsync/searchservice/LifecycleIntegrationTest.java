@@ -2,6 +2,7 @@ package io.vectorsync.searchservice;
 
 import io.vectorsync.common.dto.SearchResult;
 import io.vectorsync.common.dto.VectorRecord;
+import io.vectorsync.format.index.IndexAliasEntry;
 import io.vectorsync.format.index.IndexAliasStore;
 import io.vectorsync.format.index.IndexManifestEntry;
 import io.vectorsync.format.index.IndexStatus;
@@ -9,6 +10,7 @@ import io.vectorsync.format.io.IcebergAppender;
 import io.vectorsync.format.vector.VectorIds;
 import io.vectorsync.format.vector.VectorRecordCodec;
 import io.vectorsync.format.vector.VectorTableSchema;
+import io.vectorsync.searchservice.controller.LifecycleController;
 import io.vectorsync.searchservice.service.EvaluationService;
 import io.vectorsync.searchservice.service.ProvenanceService;
 import io.vectorsync.searchservice.service.SearchService;
@@ -35,6 +37,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -82,6 +85,8 @@ class LifecycleIntegrationTest {
     VectorSyncReader vectorSyncReader;
     @Autowired
     IcebergCatalogService catalogService;
+    @Autowired
+    LifecycleController lifecycleController;
 
     @BeforeEach
     void seedVectors() {
@@ -140,7 +145,7 @@ class LifecycleIntegrationTest {
     private IndexManifestEntry buildIndex(String modelVersion) {
         String[] parts = modelVersion.split(":", 2);
         return builder.build(SOURCE_TABLE, 100L, 1L, parts[0], parts[1],
-                vectorSyncReader.readForIndex(SOURCE_TABLE, modelVersion));
+                vectorSyncReader.readForIndexBuild(SOURCE_TABLE, modelVersion));
     }
 
     @Test
@@ -283,6 +288,55 @@ class LifecycleIntegrationTest {
     }
 
     @Test
+    @DisplayName("promotion refuses an index that was never evaluated")
+    void promotionRefusesUnevaluatedIndex() {
+        IndexManifestEntry entry = buildIndex(V2);
+
+        Object body = lifecycleController.promote(new LifecycleController.PromoteRequest(
+                SOURCE_TABLE, entry.getIndexId(), "test", null, null)).getBody();
+
+        assertInstanceOf(Map.class, body);
+        Map<?, ?> error = (Map<?, ?>) body;
+        assertEquals("Index did not pass promotion checks", error.get("error"));
+        assertTrue(String.valueOf(error.get("blockers")).contains("never evaluated"),
+                "an unevaluated index has no evidence behind it: " + error.get("blockers"));
+    }
+
+    @Test
+    @DisplayName("a forced promotion needs a note and records what it overrode")
+    void forcedPromotionIsRecorded() throws Exception {
+        IndexManifestEntry entry = buildIndex(V2);
+
+        // force without a note is refused: an override with no reason is worse than a gate.
+        Object refused = lifecycleController.promote(new LifecycleController.PromoteRequest(
+                SOURCE_TABLE, entry.getIndexId(), "test", "  ", true)).getBody();
+        assertTrue(String.valueOf(((Map<?, ?>) refused).get("error")).contains("force requires a note"));
+
+        Object body = lifecycleController.promote(new LifecycleController.PromoteRequest(
+                SOURCE_TABLE, entry.getIndexId(), "test", "incident recovery", true)).getBody();
+
+        assertInstanceOf(IndexAliasEntry.class, body);
+        IndexAliasEntry promoted = (IndexAliasEntry) body;
+        assertEquals(entry.getIndexId(), promoted.getIndexId());
+        assertTrue(promoted.getNote().startsWith("FORCED ("),
+                "the alias log is the audit trail, so the override belongs in it: " + promoted.getNote());
+        assertTrue(promoted.getNote().contains("incident recovery"));
+    }
+
+    @Test
+    @DisplayName("an evaluated index above the recall floor promotes normally")
+    void evaluatedIndexPromotes() throws Exception {
+        IndexManifestEntry entry = buildIndex(V2);
+        evaluationService.evaluateIndexRecall(entry.getIndexId(), 3, 2);
+
+        Object body = lifecycleController.promote(new LifecycleController.PromoteRequest(
+                SOURCE_TABLE, entry.getIndexId(), "test", "passed checks", null)).getBody();
+
+        assertInstanceOf(IndexAliasEntry.class, body);
+        assertEquals(entry.getIndexId(), ((IndexAliasEntry) body).getIndexId());
+    }
+
+    @Test
     @DisplayName("staleness is measured against the vector table, not against other indexes")
     void stalenessComesFromTheDataNotTheManifest() {
         // Its own source table: appending newer data to the shared one would change the version
@@ -292,7 +346,7 @@ class LifecycleIntegrationTest {
 
         appendOne(vectorTable, vectorFor(table, "s-1", 100L, "v1", 20));
         IndexManifestEntry entry = builder.build(table, 100L, 1L, MODEL, "v1",
-                vectorSyncReader.readForIndex(table, V1));
+                vectorSyncReader.readForIndexBuild(table, V1));
         assertEquals(1L, entry.getSourceSequenceNumber());
 
         // The data moves on. The index is now stale by construction.

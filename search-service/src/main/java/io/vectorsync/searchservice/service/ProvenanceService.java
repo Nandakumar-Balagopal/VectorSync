@@ -15,6 +15,7 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.CloseableIterable;
 import org.springframework.stereotype.Service;
 
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -50,8 +51,7 @@ public class ProvenanceService {
      * @return the full lineage chain, including the source row at the snapshot it was derived from
      */
     public Map<String, Object> explain(String vectorId) {
-        VectorRecord vector = vectorSyncReader.readRaw().stream()
-                .filter(record -> vectorId.equals(record.getVectorId()))
+        VectorRecord vector = vectorSyncReader.readRawForVectorId(vectorId).stream()
                 .findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("Unknown vector: " + vectorId));
 
@@ -91,10 +91,12 @@ public class ProvenanceService {
 
     /** Every stored version of one source row, which is what makes a change history auditable. */
     public List<Map<String, Object>> history(String sourceTable, String sourceRowId) {
-        return vectorSyncReader.readRaw().stream()
-                .filter(record -> sourceTable.equals(record.getSourceTable()))
+        return vectorSyncReader.readRawForTable(sourceTable).stream()
                 .filter(record -> sourceRowId.equals(record.getSourceRowId()))
-                .sorted((a, b) -> Long.compare(a.getSourceSnapshotId(), b.getSourceSnapshotId()))
+                // By sequence number, not snapshot id. Iceberg snapshot ids are random longs, so
+                // ordering a change history by them shuffles it.
+                .sorted(Comparator.comparingLong(VectorRecord::getSourceSequenceNumber)
+                        .thenComparingLong(VectorRecord::getSourceCommittedAtMillis))
                 .map(this::vectorSummary)
                 .toList();
     }

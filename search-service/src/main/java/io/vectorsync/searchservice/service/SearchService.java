@@ -157,15 +157,20 @@ public class SearchService {
                                           String modelVersion) {
         long startTime = System.currentTimeMillis();
 
-        List<VectorRecord> candidates = vectorSyncReader.readAllVectors().stream()
-                .filter(vector -> sourceTable == null
-                        || sourceTable.isBlank()
-                        || sourceTable.equals(vector.getSourceTable()))
-                .filter(vector -> modelVersion == null
-                        || modelVersion.isBlank()
-                        || modelVersion.equals(vector.modelVersion()))
-                .filter(vector -> vector.getEmbedding() != null && !vector.getEmbedding().isEmpty())
-                .toList();
+        // Scoped reads push both predicates into Iceberg and prune partitions. The unscoped branch
+        // remains only for the degenerate case of a caller with no table at all; it is a full scan
+        // and mixes embedding spaces, which is why every caller now resolves a scope first.
+        boolean scoped = sourceTable != null && !sourceTable.isBlank()
+                && modelVersion != null && !modelVersion.isBlank();
+
+        List<VectorRecord> candidates = scoped
+                ? vectorSyncReader.readForIndex(sourceTable, modelVersion)
+                : vectorSyncReader.readAllVectors().stream()
+                        .filter(vector -> sourceTable == null
+                                || sourceTable.isBlank()
+                                || sourceTable.equals(vector.getSourceTable()))
+                        .filter(vector -> vector.getEmbedding() != null && !vector.getEmbedding().isEmpty())
+                        .toList();
 
         List<SearchResult> results = candidates.stream()
                 .map(vector -> SearchResult.builder()

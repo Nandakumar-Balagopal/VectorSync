@@ -25,26 +25,53 @@ public class SyncScheduler {
         this.controlApiClient = controlApiClient;
     }
 
+    /**
+     * Syncs every enabled table, isolating failures to the table that caused them.
+     *
+     * <p>The loop used to sit inside a single try/catch while {@code syncTable} rethrows, so the
+     * first table that failed aborted the cycle and every table after it was skipped. Table order
+     * is stable, so one permanently broken table starved all of its successors indefinitely --
+     * silently, because the log line looked like a single table's error.
+     */
     @Scheduled(fixedDelayString = "${worker.sync.interval:30000}")
     public void syncAllTables() {
+        log.debug("Starting scheduled sync cycle");
+
+        List<TableConfig> tableConfigs;
         try {
-            log.debug("Starting scheduled sync cycle");
-
-            List<TableConfig> tableConfigs = fetchTableConfigs();
-            if (tableConfigs.isEmpty()) {
-                log.debug("No table configs found");
-                return;
-            }
-
-            for (TableConfig config : tableConfigs) {
-                if (config.isEnabled()) {
-                    syncOrchestrationService.syncTable(config);
-                }
-            }
-
-            log.info("Sync cycle completed. Total vectors in store: {}", vectorStoreService.getVectorCount());
+            tableConfigs = fetchTableConfigs();
         } catch (Exception e) {
-            log.error("Error in sync scheduler: {}", e.getMessage());
+            log.error("Could not fetch table configs; skipping this cycle: {}", e.getMessage());
+            return;
+        }
+
+        if (tableConfigs.isEmpty()) {
+            log.debug("No table configs found");
+            return;
+        }
+
+        int synced = 0;
+        int failed = 0;
+        for (TableConfig config : tableConfigs) {
+            if (!config.isEnabled()) {
+                continue;
+            }
+            try {
+                syncOrchestrationService.syncTable(config);
+                synced++;
+            } catch (Exception e) {
+                failed++;
+                log.error("Sync failed for table {}; continuing with the rest of the cycle: {}",
+                        config.getTableName(), e.getMessage(), e);
+            }
+        }
+
+        // Deliberately not reporting a total vector count here: that is a full scan of the vector
+        // table, and it ran on every cycle purely to produce a log line.
+        if (failed > 0) {
+            log.warn("Sync cycle completed: {} tables synced, {} failed", synced, failed);
+        } else {
+            log.info("Sync cycle completed: {} tables synced", synced);
         }
     }
 
