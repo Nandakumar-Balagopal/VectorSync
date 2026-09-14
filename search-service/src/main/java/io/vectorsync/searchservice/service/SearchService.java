@@ -88,10 +88,25 @@ public class SearchService {
 
     /** Searches a specific index version, which is how a candidate is evaluated before promotion. */
     public List<SearchResult> searchIndexId(String indexId, String query, int k) throws Exception {
-        IndexManifestEntry entry = registry.manifest().findById(indexId)
-                .orElseThrow(() -> new IllegalArgumentException("Unknown index: " + indexId));
-
+        IndexManifestEntry entry = requireIndex(indexId);
         return searchIndex(entry, embedQuery(query, entry.getEmbeddingModel()), k);
+    }
+
+    /**
+     * Searches a specific index with a vector that is already in that index's embedding space.
+     *
+     * <p>Used by label-free index-recall measurement, which probes with vectors sampled from the
+     * index's own partition. Taking the vector directly avoids an embedding round trip and, more
+     * importantly, removes any chance of probing with the wrong model.
+     */
+    public List<SearchResult> searchIndexWithEmbedding(String indexId, List<Double> queryEmbedding, int k)
+            throws Exception {
+        return searchIndex(requireIndex(indexId), queryEmbedding, k);
+    }
+
+    private IndexManifestEntry requireIndex(String indexId) {
+        return registry.manifest().findById(indexId)
+                .orElseThrow(() -> new IllegalArgumentException("Unknown index: " + indexId));
     }
 
     private List<SearchResult> searchIndex(IndexManifestEntry entry, List<Double> queryEmbedding, int k)

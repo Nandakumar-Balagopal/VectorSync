@@ -127,12 +127,16 @@ export const vectorSyncApi = {
     return response.data;
   },
 
-  evaluateIndex: async (
+  /**
+   * Label-free index recall. Sending no queries makes the service sample its own probes from the
+   * index's partition, which is why this takes no ground truth.
+   */
+  evaluateIndexRecall: async (
     indexId: string,
     topK: number,
-    queries: { query: string; relevantSourceRowIds: string[] }[],
+    probeCount?: number,
   ): Promise<EvaluationReport> => {
-    const response = await api.post(`${SEARCH}/lifecycle/evaluate`, { indexId, topK, queries });
+    const response = await api.post(`${SEARCH}/lifecycle/evaluate`, { indexId, topK, probeCount });
     return response.data;
   },
 

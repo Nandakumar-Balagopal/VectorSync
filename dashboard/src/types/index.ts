@@ -106,11 +106,18 @@ export interface IndexStatusRow {
 
 export interface EvaluationReport {
   indexId: string;
-  queryCount: number;
   k: number;
+  /** Probes sampled from the index's own partition. Zero when recall came from supplied queries. */
+  probeCount: number;
+  /** Caller-supplied queries. Zero for a label-free run. */
+  queryCount: number;
   /** Overlap with an exhaustive scan. Measures the index, not the model. No labels needed. */
   indexRecallAtK: number;
   /** Against judged relevance. Measures the model. Null when no labels were supplied. */
   precisionAtK: number | null;
-  perQueryIndexRecall: Record<string, number>;
+  /** Identifier of the judged query set behind precisionAtK. */
+  fixtureRef: string | null;
+  /** False when precision was computed but not recorded, because no fixtureRef identified it. */
+  precisionPersisted: boolean;
+  perProbeRecall: Record<string, number>;
 }

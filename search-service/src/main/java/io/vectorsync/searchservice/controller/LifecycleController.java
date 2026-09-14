@@ -62,7 +62,18 @@ public class LifecycleController {
     public record PromoteRequest(String sourceTable, String indexId, String promotedBy, String note) {
     }
 
-    public record EvaluateRequest(String indexId, int topK, List<QueryJudgementRequest> queries) {
+    /**
+     * @param queries    optional. Omitted or empty means label-free index recall, with probes
+     *                   sampled from the index's own partition.
+     * @param probeCount optional probe count for the label-free path.
+     * @param fixtureRef identifier for the judged query set behind any relevance labels. Required
+     *                   for precision to be recorded on the manifest; see {@link EvaluationService}.
+     */
+    public record EvaluateRequest(String indexId,
+                                  int topK,
+                                  Integer probeCount,
+                                  String fixtureRef,
+                                  List<QueryJudgementRequest> queries) {
     }
 
     public record QueryJudgementRequest(String query, List<String> relevantSourceRowIds) {
@@ -170,26 +181,37 @@ public class LifecycleController {
     }
 
     /**
-     * Measures index recall against an exhaustive scan, plus precision when labels are supplied,
-     * and records the numbers on the manifest entry.
+     * Measures index recall against an exhaustive scan, plus precision when labels are supplied.
+     *
+     * <p>With no {@code queries} this runs label-free against self-sampled probes, which is the form
+     * an operator or a pre-promotion check can always run. With {@code queries} it also scores
+     * precision, which a pipeline owning a judged set would use to compare two models.
      */
     @PostMapping("/evaluate")
     public ResponseEntity<?> evaluate(@RequestBody EvaluateRequest request) {
-        if (isBlank(request.indexId()) || request.queries() == null || request.queries().isEmpty()) {
-            return ResponseEntity.badRequest()
-                    .body(Map.of("error", "indexId and at least one query are required"));
+        if (isBlank(request.indexId())) {
+            return ResponseEntity.badRequest().body(Map.of("error", "indexId is required"));
         }
 
         int topK = request.topK() > 0 ? request.topK() : 10;
-        List<EvaluationService.QueryJudgement> judgements = request.queries().stream()
-                .map(entry -> new EvaluationService.QueryJudgement(
-                        entry.query(),
-                        entry.relevantSourceRowIds() == null ? List.of() : entry.relevantSourceRowIds()))
-                .toList();
 
         try {
-            return ResponseEntity.ok(evaluationService.evaluate(request.indexId(), judgements, topK));
-        } catch (IllegalArgumentException e) {
+            // No queries means the label-free path, which is the one that needs no external input
+            // and so is the one an operator can always run.
+            if (request.queries() == null || request.queries().isEmpty()) {
+                return ResponseEntity.ok(evaluationService.evaluateIndexRecall(
+                        request.indexId(), topK, request.probeCount()));
+            }
+
+            List<EvaluationService.QueryJudgement> judgements = request.queries().stream()
+                    .map(entry -> new EvaluationService.QueryJudgement(
+                            entry.query(),
+                            entry.relevantSourceRowIds() == null ? List.of() : entry.relevantSourceRowIds()))
+                    .toList();
+
+            return ResponseEntity.ok(evaluationService.evaluate(
+                    request.indexId(), judgements, topK, request.fixtureRef()));
+        } catch (IllegalArgumentException | IllegalStateException e) {
             return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
         } catch (Exception e) {
             log.error("Evaluation failed: {}", e.getMessage(), e);

@@ -35,6 +35,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -233,17 +234,70 @@ class LifecycleIntegrationTest {
                 entry.getIndexId(),
                 List.of(new EvaluationService.QueryJudgement("product p-100", List.of("p-100")),
                         new EvaluationService.QueryJudgement("product p-200", List.of("p-200"))),
-                3);
+                3,
+                "test-fixture@v1");
 
         assertEquals(2, report.queryCount());
         assertEquals(3, report.k());
         assertTrue(report.indexRecallAtK() >= 0.0 && report.indexRecallAtK() <= 1.0);
         assertNotNull(report.precisionAtK(), "labels were supplied, so precision is computed");
+        assertTrue(report.precisionPersisted(), "a fixtureRef was supplied, so precision is evidence");
 
         Map<String, String> metrics = indexRegistry.manifest()
                 .findById(entry.getIndexId()).orElseThrow().getEvalMetrics();
         assertTrue(metrics.containsKey("index_recall@3"));
         assertEquals("2", metrics.get("eval_query_count"));
+        assertEquals("test-fixture@v1", metrics.get("eval_fixture"));
+        assertEquals("supplied_queries", metrics.get("recall_source"));
+    }
+
+    @Test
+    @DisplayName("precision without a fixture reference is returned but not recorded as evidence")
+    void precisionWithoutFixtureIsNotPersisted() throws Exception {
+        IndexManifestEntry entry = buildIndex(V1);
+
+        EvaluationService.EvaluationReport report = evaluationService.evaluate(
+                entry.getIndexId(),
+                List.of(new EvaluationService.QueryJudgement("product p-100", List.of("p-100"))),
+                3,
+                null);
+
+        assertNotNull(report.precisionAtK(), "the caller still gets the number back");
+        assertFalse(report.precisionPersisted());
+
+        Map<String, String> metrics = indexRegistry.manifest()
+                .findById(entry.getIndexId()).orElseThrow().getEvalMetrics();
+        assertTrue(metrics.containsKey("index_recall@3"), "recall needs no attribution");
+        assertFalse(metrics.containsKey("precision@3"),
+                "an unattributable score on the artifact would look like audit evidence");
+        assertFalse(metrics.containsKey("eval_fixture"));
+    }
+
+    @Test
+    @DisplayName("index recall runs with no caller input by sampling its own probes, and is deterministic")
+    void indexRecallIsLabelFreeAndDeterministic() throws Exception {
+        IndexManifestEntry entry = buildIndex(V1);
+
+        EvaluationService.EvaluationReport first =
+                evaluationService.evaluateIndexRecall(entry.getIndexId(), 3, 2);
+        EvaluationService.EvaluationReport second =
+                evaluationService.evaluateIndexRecall(entry.getIndexId(), 3, 2);
+
+        assertEquals(2, first.probeCount());
+        assertEquals(0, first.queryCount());
+        assertNull(first.precisionAtK(), "no labels were involved");
+        // Probing an index with vectors drawn from the index's own contents: each probe is its own
+        // nearest neighbour, so a correctly built graph cannot miss the top hit.
+        assertEquals(1.0, first.indexRecallAtK(), 1e-9);
+
+        assertEquals(first.indexRecallAtK(), second.indexRecallAtK(), 1e-9);
+        assertEquals(first.perProbeRecall().keySet(), second.perProbeRecall().keySet(),
+                "sampling must be stable or the score cannot be compared against a threshold");
+
+        Map<String, String> metrics = indexRegistry.manifest()
+                .findById(entry.getIndexId()).orElseThrow().getEvalMetrics();
+        assertEquals("2", metrics.get("recall_probe_count"));
+        assertEquals("sampled_probes", metrics.get("recall_source"));
     }
 
     @Test

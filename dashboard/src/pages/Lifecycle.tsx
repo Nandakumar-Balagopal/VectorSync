@@ -10,7 +10,6 @@ import {
   StructuredListRow,
   StructuredListWrapper,
   Tag,
-  TextArea,
   Tile,
 } from '@carbon/react';
 import { vectorSyncApi } from '../services/api';
@@ -40,9 +39,6 @@ export function Lifecycle() {
   const [sourceTable, setSourceTable] = useState<string>('');
   const [versions, setVersions] = useState<ModelVersions | null>(null);
   const [indexes, setIndexes] = useState<IndexStatusRow[] | null>(null);
-  const [evalQueries, setEvalQueries] = useState(
-    'wireless earbuds with noise cancelling | p-001,p-002,p-003\n'
-    + 'waterproof boots for hiking | p-011,p-014');
   const [evalReports, setEvalReports] = useState<Record<string, EvaluationReport>>({});
   const [promotedId, setPromotedId] = useState<string | null>(null);
   const [history, setHistory] = useState<IndexAliasEntry[]>([]);
@@ -105,32 +101,16 @@ export function Lifecycle() {
   };
 
   /**
-   * Each line is "query | relevantRowId,relevantRowId". Leave the ids off to measure index
-   * recall only, which needs no labels.
+   * Label-free index recall. The backend samples its own probes from the index's partition, so
+   * there is nothing to type: precision needs a judged query set, and a set typed into a browser
+   * would not be reproducible enough to attach to an artifact as evidence. Pipelines that own a
+   * fixture score precision through POST /api/lifecycle/evaluate instead.
    */
-  const parseQueries = () => evalQueries
-    .split('\n')
-    .map(line => line.trim())
-    .filter(Boolean)
-    .map(line => {
-      const [query, ids] = line.split('|');
-      return {
-        query: (query ?? '').trim(),
-        relevantSourceRowIds: (ids ?? '').split(',').map(id => id.trim()).filter(Boolean),
-      };
-    })
-    .filter(entry => entry.query.length > 0);
-
   const evaluate = async (indexId: string) => {
-    const queries = parseQueries();
-    if (queries.length === 0) {
-      setError('Add at least one query, one per line.');
-      return;
-    }
     setBusy(`Evaluate ${indexId}`);
     setError(null);
     try {
-      const report = await vectorSyncApi.evaluateIndex(indexId, 10, queries);
+      const report = await vectorSyncApi.evaluateIndexRecall(indexId, 10);
       setEvalReports(current => ({ ...current, [indexId]: report }));
       await load(sourceTable);
     } catch (err) {
@@ -290,22 +270,20 @@ export function Lifecycle() {
 
       <h2>Evaluation</h2>
       <p className="lifecycle__empty">
-        One query per line, as <code>query | relevantRowId,relevantRowId</code>. Omit the ids to
-        measure index recall only. Results are written onto the index&apos;s manifest entry, so the
-        numbers a promotion was based on stay attached to the artifact.
+        <strong>Evaluate</strong> measures <strong>index recall</strong>: it probes the index with
+        vectors sampled from its own partition and checks how much of the exhaustive scan&apos;s
+        answer the HNSW graph returns. Ground truth is the exact scan, so this needs no labels and
+        no input, and it is the check to run before promoting — a low score means the graph or its
+        build parameters lost neighbours the index claims to serve. Scores are written onto the
+        manifest entry and stay with the artifact.
       </p>
-      <TextArea
-        id="eval-queries"
-        labelText="Queries and relevance labels"
-        rows={4}
-        value={evalQueries}
-        onChange={event => setEvalQueries(event.target.value)}
-      />
-      <p className="lifecycle__empty lifecycle__eval-note">
-        <strong>Index recall</strong> compares the index against an exhaustive scan — it measures
-        the <em>index</em> and needs no labels. <strong>Precision</strong> compares against your
-        labels — it measures the <em>model</em>. A tiny index can score perfect recall and useless
-        precision, so promote on precision and treat low recall as a build-parameter problem.
+      <p className="lifecycle__empty">
+        Recall cannot tell you a <em>model</em> is worse. Two indexes from two different models both
+        score near-perfect recall, because each approximates its own embedding space faithfully.
+        Comparing models needs judged relevance, which the table owner supplies as a fixture through{' '}
+        <code>POST /api/lifecycle/evaluate</code> with a <code>fixtureRef</code> naming the query set.
+        Precision is only recorded on the manifest when that reference is present: a score whose
+        ground truth cannot be identified is not evidence.
       </p>
 
       {Object.keys(evalReports).length > 0 && (
@@ -313,22 +291,16 @@ export function Lifecycle() {
           <StructuredListHead>
             <StructuredListRow head>
               <StructuredListCell head>Index</StructuredListCell>
-              <StructuredListCell head>Queries</StructuredListCell>
+              <StructuredListCell head>Probes</StructuredListCell>
               <StructuredListCell head>Index recall@k</StructuredListCell>
-              <StructuredListCell head>Precision@k</StructuredListCell>
             </StructuredListRow>
           </StructuredListHead>
           <StructuredListBody>
             {Object.values(evalReports).map(report => (
               <StructuredListRow key={report.indexId}>
                 <StructuredListCell><code>{report.indexId.slice(0, 12)}</code></StructuredListCell>
-                <StructuredListCell>{report.queryCount}</StructuredListCell>
+                <StructuredListCell>{report.probeCount}</StructuredListCell>
                 <StructuredListCell>{report.indexRecallAtK.toFixed(3)}</StructuredListCell>
-                <StructuredListCell>
-                  {report.precisionAtK === null
-                    ? <span className="lifecycle__muted">no labels</span>
-                    : report.precisionAtK.toFixed(3)}
-                </StructuredListCell>
               </StructuredListRow>
             ))}
           </StructuredListBody>
