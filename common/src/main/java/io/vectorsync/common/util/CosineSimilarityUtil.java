@@ -7,9 +7,25 @@ public class CosineSimilarityUtil {
     private CosineSimilarityUtil() {
     }
 
+    /**
+     * Cosine similarity of two equal-length vectors.
+     *
+     * <p>A length mismatch throws rather than returning 0.0. Returning zero made a dimension
+     * mismatch invisible: every candidate of the wrong width scored 0, so an exhaustive scan across
+     * two embedding spaces still produced a confident-looking ranking made entirely of the vectors
+     * that happened to match the query's width. That is how a 768-dimension row stayed absent from
+     * results a 384-dimension query ranked. Comparing different dimensions is a programming error,
+     * and the scan that does it is the ground truth other measurements are taken against.
+     *
+     * @throws IllegalArgumentException if the vectors have different lengths
+     */
     public static double cosineSimilarity(List<Double> vec1, List<Double> vec2) {
-        if (vec1 == null || vec2 == null || vec1.size() != vec2.size()) {
+        if (vec1 == null || vec2 == null) {
             return 0.0;
+        }
+        if (vec1.size() != vec2.size()) {
+            throw new IllegalArgumentException(
+                    "Cannot compare embeddings of different dimensions: " + vec1.size() + " vs " + vec2.size());
         }
 
         double dotProduct = 0.0;
