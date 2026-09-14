@@ -33,6 +33,7 @@ export function TableDetails() {
   const [versions, setVersions] = useState<ModelVersions | null>(null);
   const [indexes, setIndexes] = useState<IndexManifestEntry[]>([]);
   const [newVersion, setNewVersion] = useState('');
+  const [newModel, setNewModel] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -64,19 +65,22 @@ export function TableDetails() {
   const loading = config === null && error === null;
 
   const migrate = async () => {
-    if (!tableId || !newVersion.trim()) return;
+    if (!tableId || (!newVersion.trim() && !newModel.trim())) return;
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      await vectorSyncApi.setEmbeddingVersion(tableId, newVersion.trim());
+      const updated = await vectorSyncApi.setEmbedding(
+        tableId, newModel.trim() || undefined, newVersion.trim() || undefined);
       setNotice(
-        `Embedding version set to "${newVersion.trim()}". The sync watermark was reset, so the `
-        + 'next sync materializes this version alongside the existing ones.');
+        `Now targeting ${updated.modelName}:${updated.embeddingVersion}. The sync watermark was `
+        + 'reset, so the next sync materializes this combination alongside the existing ones — '
+        + 'nothing is overwritten.');
       setNewVersion('');
+      setNewModel('');
       await load();
     } catch (err) {
-      setError(describeError(err, 'Could not change embedding version'));
+      setError(describeError(err, 'Could not change the embedding model or version'));
     } finally {
       setBusy(false);
     }
@@ -142,19 +146,30 @@ export function TableDetails() {
 
       <h2>Start a migration</h2>
       <p className="table-details__hint">
-        Setting a new version materializes it alongside the existing ones so it can be indexed and
-        evaluated before it serves traffic. Nothing is overwritten.
+        Change the model, the version, or both. The new combination is materialized alongside the
+        existing ones so it can be indexed and evaluated before it serves traffic — nothing is
+        overwritten. Any sentence-transformers model name works; it is downloaded on first use.
       </p>
       <div className="table-details__migrate">
         <TextInput
+          id="new-model"
+          labelText="New embedding model (optional)"
+          placeholder="all-mpnet-base-v2"
+          value={newModel}
+          onChange={event => setNewModel(event.target.value)}
+        />
+        <TextInput
           id="new-version"
-          labelText="New embedding version"
+          labelText="New embedding version (optional)"
           placeholder="v2"
           value={newVersion}
           onChange={event => setNewVersion(event.target.value)}
         />
-        <Button disabled={busy || !newVersion.trim()} onClick={migrate}>
-          {busy ? 'Applying…' : 'Set version'}
+        <Button
+          disabled={busy || (!newVersion.trim() && !newModel.trim())}
+          onClick={migrate}
+        >
+          {busy ? 'Applying…' : 'Start migration'}
         </Button>
       </div>
 

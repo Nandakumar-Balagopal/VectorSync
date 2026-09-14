@@ -129,7 +129,7 @@ class LifecycleIntegrationTest {
 
     private IndexManifestEntry buildIndex(String modelVersion) {
         String[] parts = modelVersion.split(":", 2);
-        return builder.build(SOURCE_TABLE, 100L, parts[0], parts[1],
+        return builder.build(SOURCE_TABLE, 100L, 1L, parts[0], parts[1],
                 vectorSyncReader.readForIndex(SOURCE_TABLE, modelVersion));
     }
 

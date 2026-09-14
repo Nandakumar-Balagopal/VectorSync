@@ -60,6 +60,7 @@ public final class IndexManifestStore {
     private static final String BUILT_AT = "built_at";
     private static final String ERROR_MESSAGE = "error_message";
     private static final String UPDATED_AT = "updated_at";
+    private static final String SOURCE_SEQUENCE_NUMBER = "source_sequence_number";
 
     /**
      * Oldest-first, so a later row supersedes an earlier one for the same index id. Ordered by
@@ -105,7 +106,8 @@ public final class IndexManifestStore {
                         Types.MapType.ofOptional(20, 21, Types.StringType.get(), Types.StringType.get())),
                 Types.NestedField.required(22, BUILT_AT, Types.TimestampType.withZone()),
                 Types.NestedField.optional(23, ERROR_MESSAGE, Types.StringType.get()),
-                Types.NestedField.required(24, UPDATED_AT, Types.TimestampType.withZone())
+                Types.NestedField.required(24, UPDATED_AT, Types.TimestampType.withZone()),
+                Types.NestedField.required(25, SOURCE_SEQUENCE_NUMBER, Types.LongType.get())
         );
     }
 
@@ -124,8 +126,12 @@ public final class IndexManifestStore {
         TableIdentifier identifier = identifier();
         try {
             if (catalog.tableExists(identifier)) {
-                return catalog.loadTable(identifier);
+                Table existing = catalog.loadTable(identifier);
+                requireCurrentFormat(existing, identifier);
+                return existing;
             }
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Exception e) {
             log.warn("Index manifest existence check failed: {}", e.getMessage());
         }
@@ -133,7 +139,9 @@ public final class IndexManifestStore {
         log.info("Creating index manifest table {}", identifier);
         Schema schema = schema();
         try {
-            catalog.createTable(identifier, schema, partitionSpec(schema));
+            catalog.createTable(identifier, schema, partitionSpec(schema),
+                    java.util.Map.of(Constants.FORMAT_VERSION_PROPERTY,
+                            String.valueOf(Constants.VECTOR_FORMAT_VERSION)));
         } catch (Exception e) {
             // Another writer may have created it between the check and the create.
             log.warn("Index manifest creation raced or failed, reloading: {}", e.getMessage());
@@ -188,6 +196,17 @@ public final class IndexManifestStore {
         return List.copyOf(newestById.values());
     }
 
+    /**
+     * Highest source sequence number any index covers for a table, i.e. how current the newest
+     * index is. Entries below this were built over superseded data.
+     */
+    public long latestCoveredSequenceNumber(String sourceTable) {
+        return findForTable(sourceTable).stream()
+                .mapToLong(IndexManifestEntry::getSourceSequenceNumber)
+                .max()
+                .orElse(0L);
+    }
+
     public Optional<IndexManifestEntry> findById(String indexId) {
         return list().stream()
                 .filter(entry -> entry.getIndexId().equals(indexId))
@@ -206,9 +225,50 @@ public final class IndexManifestStore {
                 .filter(entry -> entry.getSourceTable().equals(sourceTable))
                 .filter(entry -> entry.modelVersion().equals(modelVersion))
                 .filter(entry -> entry.getStatus() == IndexStatus.READY)
-                .max(Comparator.comparingLong(IndexManifestEntry::getSourceSnapshotId)
+                .max(Comparator.comparingLong(IndexManifestEntry::getSourceSequenceNumber)
                         .thenComparing(IndexManifestEntry::getBuiltAt,
                                 Comparator.nullsFirst(Comparator.naturalOrder())));
+    }
+
+
+    /**
+     * Fails loudly on a schema mismatch instead of letting the write fail with "Cannot set
+     * unknown field". These tables are derived metadata and can be rebuilt, but a silent
+     * mismatch is worse than an explicit refusal.
+     */
+    private static void requireCurrentFormat(Table table, TableIdentifier identifier) {
+        String raw = table.properties().get(Constants.FORMAT_VERSION_PROPERTY);
+        int version;
+        try {
+            version = raw == null ? 1 : Integer.parseInt(raw);
+        } catch (NumberFormatException e) {
+            version = 1;
+        }
+
+        if (version == Constants.VECTOR_FORMAT_VERSION) {
+            return;
+        }
+
+        throw new IllegalStateException(String.format(
+                "%s is at format version %d but this build requires version %d. Index metadata is "
+                        + "derived and must be rebuilt: POST /api/admin/index-tables/rebuild on the "
+                        + "search service, then rebuild your indexes.",
+                identifier, version, Constants.VECTOR_FORMAT_VERSION));
+    }
+
+    /** Drops the table if present. Returns true when one was actually dropped. */
+    public boolean drop() {
+        TableIdentifier identifier = identifier();
+        try {
+            if (catalog.tableExists(identifier)) {
+                catalog.dropTable(identifier, true);
+                log.info("Dropped {}", identifier);
+                return true;
+            }
+        } catch (Exception e) {
+            log.warn("Failed to drop {}: {}", identifier, e.getMessage());
+        }
+        return false;
     }
 
     static Record toRecord(Schema schema, IndexManifestEntry entry) {
@@ -216,6 +276,7 @@ public final class IndexManifestStore {
         record.setField(INDEX_ID, entry.getIndexId());
         record.setField(SOURCE_TABLE, entry.getSourceTable());
         record.setField(SOURCE_SNAPSHOT_ID, entry.getSourceSnapshotId());
+        record.setField(SOURCE_SEQUENCE_NUMBER, entry.getSourceSequenceNumber());
         record.setField(EMBEDDING_MODEL, entry.getEmbeddingModel());
         record.setField(EMBEDDING_VERSION, entry.getEmbeddingVersion());
         record.setField(MODEL_VERSION, entry.modelVersion());
@@ -243,6 +304,7 @@ public final class IndexManifestStore {
                 .indexId(asString(record.getField(INDEX_ID)))
                 .sourceTable(asString(record.getField(SOURCE_TABLE)))
                 .sourceSnapshotId(asLong(record.getField(SOURCE_SNAPSHOT_ID)))
+                .sourceSequenceNumber(asLong(record.getField(SOURCE_SEQUENCE_NUMBER)))
                 .embeddingModel(asString(record.getField(EMBEDDING_MODEL)))
                 .embeddingVersion(asString(record.getField(EMBEDDING_VERSION)))
                 .partitionValue(asString(record.getField(PARTITION_VALUE)))

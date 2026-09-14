@@ -28,7 +28,10 @@ export interface ModelVersions {
 export interface IndexManifestEntry {
   indexId: string;
   sourceTable: string;
+  /** Identity only — Iceberg snapshot ids are random longs and cannot be ordered. */
   sourceSnapshotId: number;
+  /** Iceberg's monotonic sequence number; this is what orders indexes by data version. */
+  sourceSequenceNumber: number;
   embeddingModel: string;
   embeddingVersion: string;
   partitionValue?: string | null;
@@ -82,4 +85,32 @@ export interface DiscoveredTable {
   discoveredAt: string;
   registered: boolean;
   catalogName: string;
+}
+
+/** One index annotated with whether it still covers the newest source version. */
+export interface IndexStatusRow {
+  indexId: string;
+  embeddingModel: string;
+  embeddingVersion: string;
+  dimension: number;
+  vectorCount: number;
+  status: 'BUILDING' | 'READY' | 'FAILED' | 'ARCHIVED';
+  sourceSnapshotId: number;
+  sourceSequenceNumber: number;
+  /** False when the index was built over a snapshot that has since been superseded. */
+  current: boolean;
+  serving: boolean;
+  evalMetrics: Record<string, string>;
+  builtAt: string;
+}
+
+export interface EvaluationReport {
+  indexId: string;
+  queryCount: number;
+  k: number;
+  /** Overlap with an exhaustive scan. Measures the index, not the model. No labels needed. */
+  indexRecallAtK: number;
+  /** Against judged relevance. Measures the model. Null when no labels were supplied. */
+  precisionAtK: number | null;
+  perQueryIndexRecall: Record<string, number>;
 }

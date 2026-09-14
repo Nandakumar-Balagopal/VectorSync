@@ -59,6 +59,7 @@ class IndexLifecycleTest {
                 .indexId(indexId)
                 .sourceTable(SOURCE_TABLE)
                 .sourceSnapshotId(snapshotId)
+                .sourceSequenceNumber(snapshotId / 100)
                 .embeddingModel("all-MiniLM-L6-v2")
                 .embeddingVersion(version)
                 .indexAlgorithm("hnsw")
@@ -107,6 +108,26 @@ class IndexLifecycleTest {
                 manifest.findLatestReady(SOURCE_TABLE, "all-MiniLM-L6-v2:v1").orElseThrow().getIndexId());
         assertEquals("idx-v2",
                 manifest.findLatestReady(SOURCE_TABLE, "all-MiniLM-L6-v2:v2").orElseThrow().getIndexId());
+    }
+
+    @Test
+    @DisplayName("the newest index wins by sequence number, not by snapshot id")
+    void latestReadyOrdersBySequenceNumber() {
+        // Mirrors real Iceberg: the later snapshot has the numerically smaller id.
+        IndexManifestEntry older = entry("idx-older", 100L, "v1", IndexStatus.READY, Map.of());
+        older.setSourceSnapshotId(7139976223410259010L);
+        older.setSourceSequenceNumber(1L);
+        manifest.put(older);
+
+        IndexManifestEntry newer = entry("idx-newer", 200L, "v1", IndexStatus.READY, Map.of());
+        newer.setSourceSnapshotId(2135807640327332542L);
+        newer.setSourceSequenceNumber(2L);
+        manifest.put(newer);
+
+        assertEquals("idx-newer",
+                manifest.findLatestReady(SOURCE_TABLE, "all-MiniLM-L6-v2:v1").orElseThrow().getIndexId(),
+                "ordering by snapshot id would have picked the older index");
+        assertEquals(2L, manifest.latestCoveredSequenceNumber(SOURCE_TABLE));
     }
 
     @Test

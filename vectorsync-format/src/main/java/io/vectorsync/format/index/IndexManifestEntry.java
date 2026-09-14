@@ -27,7 +27,19 @@ public class IndexManifestEntry {
 
     // --- what data this index covers ---
     private String sourceTable;
+
+    /**
+     * Source snapshot this index covers. Identity only -- Iceberg snapshot ids are random longs,
+     * so two entries cannot be ordered by comparing them.
+     */
     private long sourceSnapshotId;
+
+    /**
+     * Iceberg's monotonic snapshot sequence number for {@link #sourceSnapshotId}. This is what
+     * orders indexes by the data version they cover; without it an index built over a superseded
+     * snapshot is indistinguishable from a current one.
+     */
+    private long sourceSequenceNumber;
     private String embeddingModel;
     private String embeddingVersion;
 

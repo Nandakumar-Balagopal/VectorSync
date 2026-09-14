@@ -70,6 +70,7 @@ public class HnswIndexBuilder {
      */
     public IndexManifestEntry build(String sourceTable,
                                     long sourceSnapshotId,
+                                    long sourceSequenceNumber,
                                     String embeddingModel,
                                     String embeddingVersion,
                                     List<VectorRecord> vectors) {
@@ -87,6 +88,7 @@ public class HnswIndexBuilder {
                 .indexId(indexId)
                 .sourceTable(sourceTable)
                 .sourceSnapshotId(sourceSnapshotId)
+                .sourceSequenceNumber(sourceSequenceNumber)
                 .embeddingModel(embeddingModel)
                 .embeddingVersion(embeddingVersion)
                 .indexAlgorithm(ALGORITHM)

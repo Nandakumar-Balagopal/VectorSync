@@ -57,6 +57,16 @@
     color: #6f6f6f;
   }
 
+  &__eval-note {
+    margin-top: 0.75rem;
+    max-width: 60rem;
+  }
+
+  textarea {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.8125rem;
+  }
+
   &__empty {
     color: #6f6f6f;
     max-width: 44rem;

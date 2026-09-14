@@ -80,8 +80,12 @@ public final class IndexAliasStore {
         TableIdentifier identifier = identifier();
         try {
             if (catalog.tableExists(identifier)) {
-                return catalog.loadTable(identifier);
+                Table existing = catalog.loadTable(identifier);
+                requireCurrentFormat(existing, identifier);
+                return existing;
             }
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Exception e) {
             log.warn("Index alias existence check failed: {}", e.getMessage());
         }
@@ -89,7 +93,9 @@ public final class IndexAliasStore {
         log.info("Creating index alias table {}", identifier);
         Schema schema = schema();
         try {
-            catalog.createTable(identifier, schema, partitionSpec(schema));
+            catalog.createTable(identifier, schema, partitionSpec(schema),
+                    java.util.Map.of(Constants.FORMAT_VERSION_PROPERTY,
+                            String.valueOf(Constants.VECTOR_FORMAT_VERSION)));
         } catch (Exception e) {
             log.warn("Index alias creation raced or failed, reloading: {}", e.getMessage());
         }
@@ -180,6 +186,47 @@ public final class IndexAliasStore {
                 .sorted(Comparator.comparing(IndexAliasEntry::getUpdatedAt,
                         Comparator.nullsFirst(Comparator.naturalOrder())))
                 .toList();
+    }
+
+
+    /**
+     * Fails loudly on a schema mismatch instead of letting the write fail with "Cannot set
+     * unknown field". These tables are derived metadata and can be rebuilt, but a silent
+     * mismatch is worse than an explicit refusal.
+     */
+    private static void requireCurrentFormat(Table table, TableIdentifier identifier) {
+        String raw = table.properties().get(Constants.FORMAT_VERSION_PROPERTY);
+        int version;
+        try {
+            version = raw == null ? 1 : Integer.parseInt(raw);
+        } catch (NumberFormatException e) {
+            version = 1;
+        }
+
+        if (version == Constants.VECTOR_FORMAT_VERSION) {
+            return;
+        }
+
+        throw new IllegalStateException(String.format(
+                "%s is at format version %d but this build requires version %d. Index metadata is "
+                        + "derived and must be rebuilt: POST /api/admin/index-tables/rebuild on the "
+                        + "search service, then rebuild your indexes.",
+                identifier, version, Constants.VECTOR_FORMAT_VERSION));
+    }
+
+    /** Drops the table if present. Returns true when one was actually dropped. */
+    public boolean drop() {
+        TableIdentifier identifier = identifier();
+        try {
+            if (catalog.tableExists(identifier)) {
+                catalog.dropTable(identifier, true);
+                log.info("Dropped {}", identifier);
+                return true;
+            }
+        } catch (Exception e) {
+            log.warn("Failed to drop {}: {}", identifier, e.getMessage());
+        }
+        return false;
     }
 
     static Record toRecord(Schema schema, IndexAliasEntry entry) {

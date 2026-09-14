@@ -6,6 +6,8 @@ import type {
   ModelVersions,
   IndexManifestEntry,
   IndexAliasEntry,
+  IndexStatusRow,
+  EvaluationReport,
   DiscoveredTable,
 } from '../types';
 
@@ -54,9 +56,14 @@ export const vectorSyncApi = {
     return response.data;
   },
 
-  /** Bumping embeddingVersion starts a migration; the existing version is retained. */
-  setEmbeddingVersion: async (tableId: string, embeddingVersion: string): Promise<TableConfig> => {
-    const response = await api.put(`${CONTROL}/tables/${tableId}`, { embeddingVersion });
+  /**
+   * Starts a migration. Changing the model or the version materializes the new combination
+   * alongside the existing ones rather than replacing them.
+   */
+  setEmbedding: async (
+    tableId: string, modelName?: string, embeddingVersion?: string,
+  ): Promise<TableConfig> => {
+    const response = await api.put(`${CONTROL}/tables/${tableId}`, { modelName, embeddingVersion });
     return response.data;
   },
 
@@ -110,6 +117,22 @@ export const vectorSyncApi = {
   getPromotedIndex: async (sourceTable: string): Promise<IndexManifestEntry | { promoted: false }> => {
     const response = await api.get(
       `${SEARCH}/lifecycle/promoted?sourceTable=${encodeURIComponent(sourceTable)}`);
+    return response.data;
+  },
+
+  /** Indexes annotated with whether each still covers the newest source version. */
+  getIndexStatus: async (sourceTable: string): Promise<IndexStatusRow[]> => {
+    const response = await api.get(
+      `${SEARCH}/lifecycle/indexes/status?sourceTable=${encodeURIComponent(sourceTable)}`);
+    return response.data;
+  },
+
+  evaluateIndex: async (
+    indexId: string,
+    topK: number,
+    queries: { query: string; relevantSourceRowIds: string[] }[],
+  ): Promise<EvaluationReport> => {
+    const response = await api.post(`${SEARCH}/lifecycle/evaluate`, { indexId, topK, queries });
     return response.data;
   },
 

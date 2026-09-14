@@ -10,12 +10,14 @@ import {
   StructuredListRow,
   StructuredListWrapper,
   Tag,
+  TextArea,
   Tile,
 } from '@carbon/react';
 import { vectorSyncApi } from '../services/api';
 import type {
+  EvaluationReport,
   IndexAliasEntry,
-  IndexManifestEntry,
+  IndexStatusRow,
   ModelVersions,
   TableConfig,
 } from '../types';
@@ -37,7 +39,11 @@ export function Lifecycle() {
   const [tables, setTables] = useState<TableConfig[]>([]);
   const [sourceTable, setSourceTable] = useState<string>('');
   const [versions, setVersions] = useState<ModelVersions | null>(null);
-  const [indexes, setIndexes] = useState<IndexManifestEntry[] | null>(null);
+  const [indexes, setIndexes] = useState<IndexStatusRow[] | null>(null);
+  const [evalQueries, setEvalQueries] = useState(
+    'wireless earbuds with noise cancelling | p-001,p-002,p-003\n'
+    + 'waterproof boots for hiking | p-011,p-014');
+  const [evalReports, setEvalReports] = useState<Record<string, EvaluationReport>>({});
   const [promotedId, setPromotedId] = useState<string | null>(null);
   const [history, setHistory] = useState<IndexAliasEntry[]>([]);
   const [selectedVersion, setSelectedVersion] = useState<string>('');
@@ -58,17 +64,16 @@ export function Lifecycle() {
   const load = useCallback(async (table: string) => {
     setError(null);
     try {
-      const [versionData, indexData, promoted, historyData] = await Promise.all([
+      const [versionData, indexData, historyData] = await Promise.all([
         vectorSyncApi.getModelVersions(table),
-        vectorSyncApi.getIndexes(table),
-        vectorSyncApi.getPromotedIndex(table),
+        vectorSyncApi.getIndexStatus(table),
         vectorSyncApi.getPromotionHistory(table),
       ]);
 
       setVersions(versionData);
       setIndexes(indexData);
       setHistory(historyData);
-      setPromotedId('indexId' in promoted ? (promoted as IndexManifestEntry).indexId : null);
+      setPromotedId(indexData.find(entry => entry.serving)?.indexId ?? null);
       setSelectedVersion(versionData.modelVersions[0] ?? '');
     } catch (err) {
       setError(describeError(err, 'Could not load lifecycle state'));
@@ -94,6 +99,42 @@ export function Lifecycle() {
       await load(sourceTable);
     } catch (err) {
       setError(describeError(err, `${label} failed`));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /**
+   * Each line is "query | relevantRowId,relevantRowId". Leave the ids off to measure index
+   * recall only, which needs no labels.
+   */
+  const parseQueries = () => evalQueries
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => {
+      const [query, ids] = line.split('|');
+      return {
+        query: (query ?? '').trim(),
+        relevantSourceRowIds: (ids ?? '').split(',').map(id => id.trim()).filter(Boolean),
+      };
+    })
+    .filter(entry => entry.query.length > 0);
+
+  const evaluate = async (indexId: string) => {
+    const queries = parseQueries();
+    if (queries.length === 0) {
+      setError('Add at least one query, one per line.');
+      return;
+    }
+    setBusy(`Evaluate ${indexId}`);
+    setError(null);
+    try {
+      const report = await vectorSyncApi.evaluateIndex(indexId, 10, queries);
+      setEvalReports(current => ({ ...current, [indexId]: report }));
+      await load(sourceTable);
+    } catch (err) {
+      setError(describeError(err, 'Evaluation failed'));
     } finally {
       setBusy(null);
     }
@@ -183,9 +224,10 @@ export function Lifecycle() {
           <StructuredListHead>
             <StructuredListRow head>
               <StructuredListCell head>Index</StructuredListCell>
-              <StructuredListCell head>Version</StructuredListCell>
-              <StructuredListCell head>Snapshot</StructuredListCell>
+              <StructuredListCell head>Model</StructuredListCell>
+              <StructuredListCell head>Dim</StructuredListCell>
               <StructuredListCell head>Vectors</StructuredListCell>
+              <StructuredListCell head>Coverage</StructuredListCell>
               <StructuredListCell head>Status</StructuredListCell>
               <StructuredListCell head>Metrics</StructuredListCell>
               <StructuredListCell head />
@@ -200,9 +242,17 @@ export function Lifecycle() {
                     <Tag type="green" size="sm" className="lifecycle__serving">serving</Tag>
                   )}
                 </StructuredListCell>
-                <StructuredListCell>{entry.embeddingVersion}</StructuredListCell>
-                <StructuredListCell>{entry.sourceSnapshotId}</StructuredListCell>
+                <StructuredListCell>
+                  {entry.embeddingModel}
+                  <span className="lifecycle__muted"> :{entry.embeddingVersion}</span>
+                </StructuredListCell>
+                <StructuredListCell>{entry.dimension}</StructuredListCell>
                 <StructuredListCell>{entry.vectorCount}</StructuredListCell>
+                <StructuredListCell>
+                  {entry.current
+                    ? <Tag type="blue" size="sm">current</Tag>
+                    : <Tag type="red" size="sm" title="Built over a snapshot that has since been superseded">stale</Tag>}
+                </StructuredListCell>
                 <StructuredListCell>
                   <Tag type={STATUS_TAG[entry.status] ?? 'gray'} size="sm">{entry.status}</Tag>
                 </StructuredListCell>
@@ -217,12 +267,67 @@ export function Lifecycle() {
                   <Button
                     size="sm"
                     kind="ghost"
+                    disabled={entry.status !== 'READY' || busy !== null}
+                    onClick={() => evaluate(entry.indexId)}
+                  >
+                    {busy === `Evaluate ${entry.indexId}` ? 'Scoring…' : 'Evaluate'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    kind="ghost"
                     disabled={entry.status !== 'READY' || entry.indexId === promotedId || busy !== null}
                     onClick={() => act('Promote', () =>
                       vectorSyncApi.promoteIndex(sourceTable, entry.indexId, 'promoted from dashboard'))}
                   >
                     Promote
                   </Button>
+                </StructuredListCell>
+              </StructuredListRow>
+            ))}
+          </StructuredListBody>
+        </StructuredListWrapper>
+      )}
+
+      <h2>Evaluation</h2>
+      <p className="lifecycle__empty">
+        One query per line, as <code>query | relevantRowId,relevantRowId</code>. Omit the ids to
+        measure index recall only. Results are written onto the index&apos;s manifest entry, so the
+        numbers a promotion was based on stay attached to the artifact.
+      </p>
+      <TextArea
+        id="eval-queries"
+        labelText="Queries and relevance labels"
+        rows={4}
+        value={evalQueries}
+        onChange={event => setEvalQueries(event.target.value)}
+      />
+      <p className="lifecycle__empty lifecycle__eval-note">
+        <strong>Index recall</strong> compares the index against an exhaustive scan — it measures
+        the <em>index</em> and needs no labels. <strong>Precision</strong> compares against your
+        labels — it measures the <em>model</em>. A tiny index can score perfect recall and useless
+        precision, so promote on precision and treat low recall as a build-parameter problem.
+      </p>
+
+      {Object.keys(evalReports).length > 0 && (
+        <StructuredListWrapper>
+          <StructuredListHead>
+            <StructuredListRow head>
+              <StructuredListCell head>Index</StructuredListCell>
+              <StructuredListCell head>Queries</StructuredListCell>
+              <StructuredListCell head>Index recall@k</StructuredListCell>
+              <StructuredListCell head>Precision@k</StructuredListCell>
+            </StructuredListRow>
+          </StructuredListHead>
+          <StructuredListBody>
+            {Object.values(evalReports).map(report => (
+              <StructuredListRow key={report.indexId}>
+                <StructuredListCell><code>{report.indexId.slice(0, 12)}</code></StructuredListCell>
+                <StructuredListCell>{report.queryCount}</StructuredListCell>
+                <StructuredListCell>{report.indexRecallAtK.toFixed(3)}</StructuredListCell>
+                <StructuredListCell>
+                  {report.precisionAtK === null
+                    ? <span className="lifecycle__muted">no labels</span>
+                    : report.precisionAtK.toFixed(3)}
                 </StructuredListCell>
               </StructuredListRow>
             ))}

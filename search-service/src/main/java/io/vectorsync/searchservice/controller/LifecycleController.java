@@ -89,10 +89,18 @@ public class LifecycleController {
 
         // Recorded on the manifest for provenance; the snapshot id addresses the source version
         // even though the sequence number is what ordered it.
-        long snapshotId = vectors.stream()
-                .mapToLong(VectorRecord::getSourceSnapshotId)
-                .max()
-                .orElseGet(() -> vectorSyncReader.latestSourceSnapshot(request.sourceTable()));
+        // Ordering comes from the sequence number; the snapshot id is carried alongside it for
+        // identity. Picking the snapshot id by max() would be wrong -- Iceberg snapshot ids are
+        // random longs -- so select the row with the highest sequence number and take its id.
+        VectorRecord newest = vectors.stream()
+                .max(java.util.Comparator.comparingLong(VectorRecord::getSourceSequenceNumber))
+                .orElse(null);
+        long snapshotId = newest != null
+                ? newest.getSourceSnapshotId()
+                : vectorSyncReader.latestSourceSnapshot(request.sourceTable());
+        long sequenceNumber = newest != null
+                ? newest.getSourceSequenceNumber()
+                : vectorSyncReader.latestSourceSequenceNumber(request.sourceTable());
 
         if (vectors.isEmpty()) {
             return ResponseEntity.badRequest().body(Map.of(
@@ -102,7 +110,7 @@ public class LifecycleController {
 
         try {
             IndexManifestEntry entry = builder.build(
-                    request.sourceTable(), snapshotId, parts[0], parts[1], vectors);
+                    request.sourceTable(), snapshotId, sequenceNumber, parts[0], parts[1], vectors);
             return ResponseEntity.status(HttpStatus.CREATED).body(entry);
         } catch (Exception e) {
             log.error("Index build failed: {}", e.getMessage(), e);
@@ -196,6 +204,41 @@ public class LifecycleController {
         return ResponseEntity.ok(sourceTable == null
                 ? registry.manifest().list()
                 : registry.indexesFor(sourceTable));
+    }
+
+    /**
+     * Indexes for a table, annotated with whether each still covers the newest source version.
+     * An index built over a superseded snapshot stays in the manifest for audit and rollback, but
+     * serving it would return results from stale data.
+     */
+    @GetMapping("/indexes/status")
+    public ResponseEntity<List<Map<String, Object>>> indexStatus(
+            @RequestParam("sourceTable") String sourceTable) {
+        long newest = registry.manifest().latestCoveredSequenceNumber(sourceTable);
+        String promoted = registry.promotedAlias(sourceTable)
+                .map(alias -> alias.getIndexId())
+                .orElse(null);
+
+        List<Map<String, Object>> rows = registry.indexesFor(sourceTable).stream()
+                .map(entry -> {
+                    Map<String, Object> row = new java.util.LinkedHashMap<>();
+                    row.put("indexId", entry.getIndexId());
+                    row.put("embeddingModel", entry.getEmbeddingModel());
+                    row.put("embeddingVersion", entry.getEmbeddingVersion());
+                    row.put("dimension", entry.getDimension());
+                    row.put("vectorCount", entry.getVectorCount());
+                    row.put("status", String.valueOf(entry.getStatus()));
+                    row.put("sourceSnapshotId", entry.getSourceSnapshotId());
+                    row.put("sourceSequenceNumber", entry.getSourceSequenceNumber());
+                    row.put("current", entry.getSourceSequenceNumber() >= newest);
+                    row.put("serving", entry.getIndexId().equals(promoted));
+                    row.put("evalMetrics", entry.getEvalMetrics());
+                    row.put("builtAt", String.valueOf(entry.getBuiltAt()));
+                    return row;
+                })
+                .toList();
+
+        return ResponseEntity.ok(rows);
     }
 
     @GetMapping("/promoted")
