@@ -2,9 +2,13 @@ package io.vectorsync.controlplane;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.EnableAsync;
 
 @SpringBootApplication
+// Required for LeaseReaper: a @Scheduled method is inert without it, and the work queue's only
+// recovery path from a crashed worker is the periodic lease reclaim.
+@EnableScheduling
 // Without this, @Async on table discovery was a no-op: the crawl ran on the request
 // thread and its failures became a 500 even though the endpoint returns 202.
 @EnableAsync

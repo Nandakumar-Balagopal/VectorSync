@@ -12,6 +12,15 @@ public class Constants {
     public static final String INDEX_MANIFEST_TABLE_NAME = "vector_index_manifest";
     public static final String INDEX_ALIAS_TABLE_NAME = "vector_index_alias";
 
+    /** Tier 1: deduplicated vectors keyed by content, not by row. */
+    public static final String EMBEDDING_STORE_TABLE_NAME = "embedding_store";
+    /** Tier 1: which content each source row/chunk carried at a given source version. */
+    public static final String CONTENT_MAP_TABLE_NAME = "content_map";
+
+    public static final String CONTENT_HASH_COLUMN = "content_hash";
+    public static final String HASH_PREFIX_COLUMN = "hash_prefix";
+    public static final String CONFIG_ID_COLUMN = "config_id";
+
     // vector_embeddings columns
     public static final String VECTOR_ID_COLUMN = "vector_id";
     public static final String SOURCE_TABLE_COLUMN = "source_table";

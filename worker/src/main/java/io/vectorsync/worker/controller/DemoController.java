@@ -56,6 +56,16 @@ public class DemoController {
     public record SeedTableRequest(String tableName, List<DemoSeedService.SeedRow> rows) {
     }
 
+    /** Appends to an existing table so its snapshot ancestry survives, unlike a re-seed. */
+    @PostMapping("/tables/append")
+    public ResponseEntity<?> appendToTable(@RequestBody SeedTableRequest request) {
+        try {
+            return ResponseEntity.ok(demoSeedService.appendToTable(request.tableName(), request.rows()));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
+        }
+    }
+
     @PostMapping("/products")
     public ResponseEntity<DemoSeedService.DemoMutationResult> appendProduct(@RequestBody DemoProductRequest request) {
         return ResponseEntity.ok(demoSeedService.appendProduct(

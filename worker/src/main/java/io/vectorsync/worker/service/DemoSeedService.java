@@ -98,6 +98,38 @@ public class DemoSeedService {
      * <p>Unlike {@link #seedProductsTable()} this does not touch the vector table, so several
      * source tables can be seeded and materialized alongside each other.
      */
+    /**
+     * Appends rows to an existing demo table, leaving its snapshot history intact.
+     *
+     * <p>Separate from {@link #seedTable} because that drops and recreates, which produces a table
+     * with no ancestry. An incremental pass is defined relative to a prior snapshot, so testing it
+     * needs a real append: a new snapshot whose parent is the one already materialized.
+     */
+    public DemoMutationResult appendToTable(String qualifiedName, List<SeedRow> rows) {
+        if (rows == null || rows.isEmpty()) {
+            throw new IllegalArgumentException("At least one row is required");
+        }
+
+        Catalog catalog = catalogService.getCatalog();
+        TableIdentifier identifier = qualifiedName.contains(".")
+                ? TableIdentifier.parse(qualifiedName)
+                : TableIdentifier.of(Namespace.of(DEMO_NAMESPACE), qualifiedName);
+
+        if (!catalog.tableExists(identifier)) {
+            throw new IllegalArgumentException("Table does not exist: " + qualifiedName);
+        }
+
+        Table table = catalog.loadTable(identifier);
+        List<Record> records = new ArrayList<>(rows.size());
+        for (SeedRow row : rows) {
+            records.add(buildRecord(table.schema(), row.id(), row.name(), row.description(),
+                    row.category(), row.price()));
+        }
+
+        appendRecords(table, records);
+        return new DemoMutationResult("APPEND", qualifiedName, records.size());
+    }
+
     public DemoSeedResult seedTable(String qualifiedName, List<SeedRow> rows) {
         if (rows == null || rows.isEmpty()) {
             throw new IllegalArgumentException("At least one row is required");
