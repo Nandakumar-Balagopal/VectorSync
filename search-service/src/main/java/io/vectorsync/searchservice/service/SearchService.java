@@ -188,7 +188,38 @@ public class SearchService {
     public List<SearchResult> searchExact(String query, int k, String sourceTable, String modelVersion)
             throws Exception {
         // Embedded with the model of the version being scanned, for the same reason.
-        return searchExact(embedQuery(query, modelOf(modelVersion)), k, sourceTable, modelVersion);
+        String scoped = resolveScope(sourceTable, modelVersion);
+        return searchExact(embedQuery(query, modelOf(scoped)), k, sourceTable, scoped);
+    }
+
+    /**
+     * Picks the single embedding version an exhaustive scan will run against.
+     *
+     * <p>An unscoped scan is not merely imprecise, it is meaningless: the query gets embedded by
+     * whatever the default model is and then scored against vectors from every materialized
+     * version, so most similarities compare two different embedding spaces and the same row appears
+     * once per version. Callers that leave the version out are asking for "the table's current
+     * answer", which is what the promoted index defines, so resolve it the same way
+     * {@link #search} does rather than scanning everything.
+     */
+    public String resolveScope(String sourceTable, String requestedModelVersion) {
+        if (requestedModelVersion != null && !requestedModelVersion.isBlank()) {
+            return requestedModelVersion;
+        }
+        if (sourceTable == null || sourceTable.isBlank()) {
+            return null;
+        }
+
+        Optional<IndexManifestEntry> promoted = registry.promotedIndex(sourceTable);
+        if (promoted.isPresent()) {
+            return promoted.get().modelVersion();
+        }
+
+        String newest = vectorSyncReader.modelVersionsFor(sourceTable).stream()
+                .reduce((first, second) -> second)
+                .orElse(null);
+        log.info("Exact search on {} was unscoped; resolved to {}", sourceTable, newest);
+        return newest;
     }
 
     public Map<String, Object> getIndexStats() {

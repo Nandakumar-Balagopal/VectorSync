@@ -30,6 +30,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
+import java.util.Set;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -103,13 +104,21 @@ class LifecycleIntegrationTest {
     }
 
     private VectorRecord vector(String rowId, long snapshotId, String version, int seed) {
+        return vectorFor(SOURCE_TABLE, rowId, snapshotId, version, seed);
+    }
+
+    private VectorRecord vectorFor(String sourceTable,
+                                   String rowId,
+                                   long snapshotId,
+                                   String version,
+                                   int seed) {
         List<Double> embedding = new java.util.ArrayList<>(DIM);
         for (int i = 0; i < DIM; i++) {
             embedding.add(Math.sin(seed + 1 + i * 0.01));
         }
 
         VectorRecord record = VectorRecord.builder()
-                .sourceTable(SOURCE_TABLE)
+                .sourceTable(sourceTable)
                 .sourceRowId(rowId)
                 .sourceSnapshotId(snapshotId)
                 .sourceSequenceNumber(snapshotId / 100)
@@ -271,6 +280,57 @@ class LifecycleIntegrationTest {
         assertFalse(metrics.containsKey("precision@3"),
                 "an unattributable score on the artifact would look like audit evidence");
         assertFalse(metrics.containsKey("eval_fixture"));
+    }
+
+    @Test
+    @DisplayName("staleness is measured against the vector table, not against other indexes")
+    void stalenessComesFromTheDataNotTheManifest() {
+        // Its own source table: appending newer data to the shared one would change the version
+        // list and vector counts the other tests assert on.
+        String table = "default.staleness_probe";
+        Table vectorTable = VectorTableSchema.loadOrCreate(catalogService.getCatalog(), "vector");
+
+        appendOne(vectorTable, vectorFor(table, "s-1", 100L, "v1", 20));
+        IndexManifestEntry entry = builder.build(table, 100L, 1L, MODEL, "v1",
+                vectorSyncReader.readForIndex(table, V1));
+        assertEquals(1L, entry.getSourceSequenceNumber());
+
+        // The data moves on. The index is now stale by construction.
+        appendOne(vectorTable, vectorFor(table, "s-2", 200L, "v1", 21));
+
+        assertEquals(2L, vectorSyncReader.latestSourceSequenceNumber(table),
+                "the source of truth for 'has the data moved on'");
+
+        // The manifest only knows what indexes cover, so it names this index as the newest thing in
+        // existence and the index compares favourably against itself forever. That was the bug.
+        assertEquals(1L, indexRegistry.manifest().latestCoveredSequenceNumber(table));
+        assertTrue(entry.getSourceSequenceNumber()
+                        >= indexRegistry.manifest().latestCoveredSequenceNumber(table),
+                "comparing an index against other indexes can never mark it stale");
+        assertFalse(entry.getSourceSequenceNumber()
+                        >= vectorSyncReader.latestSourceSequenceNumber(table),
+                "comparing it against the data does");
+    }
+
+    private void appendOne(Table vectorTable, VectorRecord record) {
+        IcebergAppender.append(vectorTable,
+                List.of(VectorRecordCodec.toIcebergRecord(vectorTable.schema(), record)));
+    }
+
+    @Test
+    @DisplayName("an unscoped exact scan resolves to one embedding space instead of mixing them")
+    void unscopedExactSearchDoesNotMixModelVersions() throws Exception {
+        String resolved = searchService.resolveScope(SOURCE_TABLE, null);
+        assertNotNull(resolved, "an unscoped scan must still pick a version");
+        assertTrue(vectorSyncReader.modelVersionsFor(SOURCE_TABLE).contains(resolved));
+
+        // Ask for more results than one version holds. Scanning every version would return the
+        // same source row once per version, scored across incompatible embedding spaces.
+        List<SearchResult> results = searchService.searchExact("product p-100", 20, SOURCE_TABLE, null);
+        List<String> rowIds = results.stream().map(SearchResult::getSourceRowId).toList();
+
+        assertEquals(rowIds.size(), Set.copyOf(rowIds).size(),
+                "a row appearing twice means the scan spanned more than one embedding version");
     }
 
     @Test

@@ -34,6 +34,7 @@ public class SearchController {
 
             SearchResponse response = SearchResponse.builder()
                     .query(request.getQuery())
+                    .modelVersion(searchService.resolveScope(request.getSourceTable(), null))
                     .executionTimeMs(System.currentTimeMillis() - startTime)
                     .totalResults(results.size())
                     .results(results)
@@ -75,11 +76,14 @@ public class SearchController {
     public ResponseEntity<?> searchExact(@RequestBody SearchRequest request) {
         try {
             int k = request.getTopK() == null ? 10 : request.getTopK();
+            String scoped = searchService.resolveScope(
+                    request.getSourceTable(), request.getModelVersion());
             List<SearchResult> results = searchService.searchExact(
-                    request.getQuery(), k, request.getSourceTable(), request.getModelVersion());
+                    request.getQuery(), k, request.getSourceTable(), scoped);
 
             return ResponseEntity.ok(SearchResponse.builder()
                     .query(request.getQuery())
+                    .modelVersion(scoped)
                     .totalResults(results.size())
                     .results(results)
                     .build());

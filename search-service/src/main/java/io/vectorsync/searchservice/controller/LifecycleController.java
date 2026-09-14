@@ -236,7 +236,11 @@ public class LifecycleController {
     @GetMapping("/indexes/status")
     public ResponseEntity<List<Map<String, Object>>> indexStatus(
             @RequestParam("sourceTable") String sourceTable) {
-        long newest = registry.manifest().latestCoveredSequenceNumber(sourceTable);
+        // The vector table's newest version, not the manifest's. Asking the manifest for
+        // latestCoveredSequenceNumber compares indexes against each other, so the newest index
+        // always satisfies it and "current" could never go false no matter how far the data moved
+        // ahead -- which defeats the only purpose of the flag.
+        long newest = vectorSyncReader.latestSourceSequenceNumber(sourceTable);
         String promoted = registry.promotedAlias(sourceTable)
                 .map(alias -> alias.getIndexId())
                 .orElse(null);
