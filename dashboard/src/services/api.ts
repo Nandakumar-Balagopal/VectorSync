@@ -17,15 +17,19 @@ import type {
  * did not exist. Failures now surface to the caller so the UI can say "unavailable" instead of
  * showing numbers that were never measured.
  */
+/**
+ * No baseURL: the three prefixes below are siblings at the root, not children of one base.
+ * Setting baseURL to '/api' silently produced '/api/worker-api/...' and '/api/search-api/...',
+ * which nginx does not serve, so every worker and search call 404'd.
+ */
 const api = axios.create({
-  baseURL: '/api',
   headers: { 'Content-Type': 'application/json' },
 });
 
-// nginx proxies: /api -> control-plane, /worker-api -> worker, /search-api -> search-service
-const CONTROL = '';
-const WORKER = '/worker-api';
-const SEARCH = '/search-api';
+// Must match the location blocks in dashboard/nginx.conf.
+const CONTROL = '/api';          // -> control-plane:8080/api/
+const WORKER = '/worker-api';    // -> worker:8081/api/
+const SEARCH = '/search-api';    // -> search-service:8083/api/
 
 export const vectorSyncApi = {
   // ---------- tables (control-plane) ----------
