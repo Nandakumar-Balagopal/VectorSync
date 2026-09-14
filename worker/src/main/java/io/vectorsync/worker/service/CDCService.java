@@ -91,6 +91,7 @@ public class CDCService {
                                 entry.record().getVectorId(),
                                 entry.record().getSourceTable(),
                                 entry.record().getSourceRowId(),
+                                entry.record().getEmbeddingModel(),
                                 entry.text()))
                         .toList();
 

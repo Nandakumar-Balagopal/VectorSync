@@ -50,18 +50,40 @@ public class SearchService {
 
     public List<SearchResult> search(String query, Integer topK, String sourceTable) throws Exception {
         int k = topK != null ? topK : Constants.DEFAULT_TOP_K;
-        List<Double> queryEmbedding = embeddingClientService.generateEmbedding(query);
 
         Optional<IndexManifestEntry> promoted = sourceTable == null || sourceTable.isBlank()
                 ? Optional.empty()
                 : registry.promotedIndex(sourceTable);
 
         if (promoted.isPresent()) {
-            return searchIndex(promoted.get(), queryEmbedding, k);
+            // The query is embedded by the promoted index's own model, so the two vector spaces
+            // match. Embedding first and resolving the index afterwards would silently compare
+            // across models.
+            IndexManifestEntry entry = promoted.get();
+            return searchIndex(entry, embedQuery(query, entry.getEmbeddingModel()), k);
         }
 
-        log.info("No promoted index for {}; falling back to exact search", sourceTable);
-        return searchExact(queryEmbedding, k, sourceTable, null);
+        // Nothing promoted: scope the exhaustive scan to the table's newest model version, so one
+        // query embedding is comparable with every candidate.
+        String modelVersion = vectorSyncReader.modelVersionsFor(sourceTable).stream()
+                .reduce((first, second) -> second)
+                .orElse(null);
+
+        log.info("No promoted index for {}; exact search scoped to {}", sourceTable, modelVersion);
+        return searchExact(query, k, sourceTable, modelVersion);
+    }
+
+    /** Splits a "model:version" pair down to its model, for embedding a query. */
+    private static String modelOf(String modelVersion) {
+        if (modelVersion == null) {
+            return null;
+        }
+        int separator = modelVersion.lastIndexOf(':');
+        return separator <= 0 ? modelVersion : modelVersion.substring(0, separator);
+    }
+
+    private List<Double> embedQuery(String query, String model) throws Exception {
+        return embeddingClientService.generateEmbedding(query, model);
     }
 
     /** Searches a specific index version, which is how a candidate is evaluated before promotion. */
@@ -69,7 +91,7 @@ public class SearchService {
         IndexManifestEntry entry = registry.manifest().findById(indexId)
                 .orElseThrow(() -> new IllegalArgumentException("Unknown index: " + indexId));
 
-        return searchIndex(entry, embeddingClientService.generateEmbedding(query), k);
+        return searchIndex(entry, embedQuery(query, entry.getEmbeddingModel()), k);
     }
 
     private List<SearchResult> searchIndex(IndexManifestEntry entry, List<Double> queryEmbedding, int k)
@@ -150,7 +172,8 @@ public class SearchService {
 
     public List<SearchResult> searchExact(String query, int k, String sourceTable, String modelVersion)
             throws Exception {
-        return searchExact(embeddingClientService.generateEmbedding(query), k, sourceTable, modelVersion);
+        // Embedded with the model of the version being scanned, for the same reason.
+        return searchExact(embedQuery(query, modelOf(modelVersion)), k, sourceTable, modelVersion);
     }
 
     public Map<String, Object> getIndexStats() {

@@ -49,8 +49,17 @@ public class ExternalQueryEmbeddingService implements QueryEmbeddingService {
         this.restTemplate = new RestTemplate();
     }
 
+    private String resolveModel(String requested) {
+        return requested == null || requested.isBlank() ? modelName : requested;
+    }
+
     @Override
     public List<Double> generateEmbedding(String text) {
+        return generateEmbedding(text, null);
+    }
+
+    @Override
+    public List<Double> generateEmbedding(String text, String requestedModel) {
         if (text == null || text.isBlank()) {
             throw new IllegalArgumentException("Text cannot be null or empty");
         }
@@ -68,16 +77,16 @@ public class ExternalQueryEmbeddingService implements QueryEmbeddingService {
             switch (normalizedType) {
                 case "openai":
                     headers.set("Authorization", "Bearer " + apiKey);
-                    body = "{\"model\":\"" + escape(modelName) + "\",\"input\":\"" + escape(text) + "\"}";
+                    body = "{\"model\":\"" + escape(resolveModel(requestedModel)) + "\",\"input\":\"" + escape(text) + "\"}";
                     return parseEmbedding(responseJsonPointer, restTemplate.postForObject(apiUrl, new HttpEntity<>(body, headers), String.class));
                 case "http":
                     applyApiKeyHeader(headers);
-                    body = buildTemplateBody(text);
+                    body = buildTemplateBody(text, resolveModel(requestedModel));
                     return parseEmbedding(responseJsonPointer, restTemplate.postForObject(apiUrl, new HttpEntity<>(body, headers), String.class));
                 case "gemini":
                 default:
                     headers.set("X-goog-api-key", apiKey);
-                    body = "{\"model\":\"models/" + escape(modelName) + "\",\"content\":{\"parts\":[{\"text\":\"" + escape(text) + "\"}]}}";
+                    body = "{\"model\":\"models/" + escape(resolveModel(requestedModel)) + "\",\"content\":{\"parts\":[{\"text\":\"" + escape(text) + "\"}]}}";
                     return parseEmbedding("/embedding/values", restTemplate.postForObject(apiUrl, new HttpEntity<>(body, headers), String.class));
             }
         } catch (Exception e) {
@@ -110,11 +119,12 @@ public class ExternalQueryEmbeddingService implements QueryEmbeddingService {
         headers.set(apiKeyHeader, value);
     }
 
-    private String buildTemplateBody(String text) {
+    private String buildTemplateBody(String text, String model) {
         if (requestTemplate == null || requestTemplate.isBlank()) {
             return "{\"input\":\"" + escape(text) + "\"}";
         }
         return requestTemplate
+                .replace("__MODEL__", escape(model))
                 .replace("__TEXT__", escape(text))
                 .replace("${text}", escape(text))
                 .replace("{text}", escape(text));

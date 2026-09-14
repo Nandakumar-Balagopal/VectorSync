@@ -68,8 +68,9 @@ public class TableController {
     }
 
     /**
-     * Updates a registered table. Changing {@code embeddingVersion} starts a migration: the new
-     * version is materialized alongside the existing one rather than replacing it.
+     * Updates a registered table. Changing {@code modelName} or {@code embeddingVersion} starts a
+     * migration: the new combination is materialized alongside the existing one rather than
+     * replacing it.
      */
     @PutMapping("/{tableId}")
     public ResponseEntity<?> updateTable(@PathVariable("tableId") String tableId,
@@ -77,8 +78,13 @@ public class TableController {
         try {
             Optional<TableConfig> result = Optional.empty();
 
-            if (update.getEmbeddingVersion() != null && !update.getEmbeddingVersion().isBlank()) {
-                result = tableConfigService.setEmbeddingVersion(tableId, update.getEmbeddingVersion());
+            boolean changingModel = update.getModelName() != null && !update.getModelName().isBlank();
+            boolean changingVersion = update.getEmbeddingVersion() != null
+                    && !update.getEmbeddingVersion().isBlank();
+
+            if (changingModel || changingVersion) {
+                result = tableConfigService.setEmbedding(
+                        tableId, update.getModelName(), update.getEmbeddingVersion());
             }
 
             return result

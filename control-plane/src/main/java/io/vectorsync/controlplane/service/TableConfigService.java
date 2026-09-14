@@ -86,24 +86,46 @@ public class TableConfigService {
      * both coexist and the new one can be evaluated before promotion.
      */
     public Optional<TableConfig> setEmbeddingVersion(String tableId, String embeddingVersion) {
-        if (embeddingVersion == null || embeddingVersion.isBlank()) {
-            throw new IllegalArgumentException("embeddingVersion is required");
+        return setEmbedding(tableId, null, embeddingVersion);
+    }
+
+    /**
+     * Repoints a table at a new embedding model and/or version.
+     *
+     * <p>A real migration changes the model, not just a version label, so both are settable. The
+     * sync watermark resets whenever either changes, because the new combination is a fresh
+     * materialization of data the worker has already seen -- without the reset, incremental CDC
+     * finds no source changes and the new embeddings are never produced. Existing combinations
+     * are untouched, so they coexist and the candidate can be evaluated before promotion.
+     */
+    public Optional<TableConfig> setEmbedding(String tableId, String modelName, String embeddingVersion) {
+        boolean changingModel = modelName != null && !modelName.isBlank();
+        boolean changingVersion = embeddingVersion != null && !embeddingVersion.isBlank();
+        if (!changingModel && !changingVersion) {
+            throw new IllegalArgumentException("modelName or embeddingVersion is required");
         }
 
         return tableConfigRepository.findById(tableId).map(entity -> {
-            String previous = entity.getEmbeddingVersion();
-            entity.setEmbeddingVersion(embeddingVersion);
+            String previous = entity.getModelName() + ":" + entity.getEmbeddingVersion();
+
+            if (changingModel) {
+                entity.setModelName(modelName);
+            }
+            if (changingVersion) {
+                entity.setEmbeddingVersion(embeddingVersion);
+            }
             entity.setUpdatedAt(Instant.now());
             tableConfigRepository.save(entity);
 
-            if (!embeddingVersion.equals(previous)) {
+            String current = entity.getModelName() + ":" + entity.getEmbeddingVersion();
+            if (!current.equals(previous)) {
                 syncStateRepository.findById(tableId).ifPresent(state -> {
                     state.setLastSnapshotId(null);
                     state.setLastSyncAt(Instant.now());
                     syncStateRepository.save(state);
                 });
-                log.info("Table {} embedding version {} -> {}; sync watermark reset for re-materialization",
-                        tableId, previous, embeddingVersion);
+                log.info("Table {} embedding {} -> {}; sync watermark reset for re-materialization",
+                        tableId, previous, current);
             }
 
             return toDto(entity);

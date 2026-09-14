@@ -92,6 +92,56 @@ public class DemoSeedService {
         return new DemoSeedResult(identifier.toString(), records.size(), !existed, vectorsReset);
     }
 
+    /**
+     * Creates (replacing any existing) an Iceberg source table with the given rows.
+     *
+     * <p>Unlike {@link #seedProductsTable()} this does not touch the vector table, so several
+     * source tables can be seeded and materialized alongside each other.
+     */
+    public DemoSeedResult seedTable(String qualifiedName, List<SeedRow> rows) {
+        if (rows == null || rows.isEmpty()) {
+            throw new IllegalArgumentException("At least one row is required");
+        }
+
+        Catalog catalog = catalogService.getCatalog();
+        TableIdentifier identifier = qualifiedName.contains(".")
+                ? TableIdentifier.parse(qualifiedName)
+                : TableIdentifier.of(Namespace.of(DEMO_NAMESPACE), qualifiedName);
+
+        boolean existed = false;
+        try {
+            existed = catalog.tableExists(identifier);
+            if (existed) {
+                catalog.dropTable(identifier, true);
+            }
+        } catch (Exception e) {
+            log.warn("Could not drop existing table {}: {}", identifier, e.getMessage());
+        }
+
+        Schema schema = new Schema(
+                Types.NestedField.required(1, "id", Types.StringType.get()),
+                Types.NestedField.required(2, "name", Types.StringType.get()),
+                Types.NestedField.optional(3, "description", Types.StringType.get()),
+                Types.NestedField.optional(4, "category", Types.StringType.get()),
+                Types.NestedField.optional(5, "price", Types.DoubleType.get())
+        );
+
+        Table table = catalog.createTable(identifier, schema, PartitionSpec.unpartitioned());
+
+        List<Record> records = rows.stream()
+                .map(row -> buildRecord(schema, row.id(), row.name(), row.description(),
+                        row.category(), row.price()))
+                .toList();
+
+        appendRecords(table, records);
+        log.info("Seeded {} with {} rows", identifier, records.size());
+
+        return new DemoSeedResult(identifier.toString(), records.size(), !existed, false);
+    }
+
+    public record SeedRow(String id, String name, String description, String category, Double price) {
+    }
+
     public DemoMutationResult appendProduct(String id,
                                             String name,
                                             String description,
