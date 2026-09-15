@@ -29,7 +29,29 @@ public record DeriveResult(int rowsProcessed,
                            int distinctHashes,
                            int cacheHits,
                            int inferenceCalls,
-                           int failed) {
+                           int failed,
+                           java.util.List<Written> written) {
+
+    /**
+     * One embedding this pass durably committed to the store.
+     *
+     * <p>Returned rather than recorded here so that the record of it lands in the same transaction
+     * as the work item's completion. Recording it at write time is what made the previous dedup set
+     * unfalsifiable: the claim "this content has a vector" outlived any evidence that the commit
+     * carrying it had survived.
+     */
+    public record Written(String contentHash, int embeddingDim) {
+    }
+
+    public DeriveResult(int rowsProcessed,
+                        int chunksProcessed,
+                        int distinctHashes,
+                        int cacheHits,
+                        int inferenceCalls,
+                        int failed) {
+        this(rowsProcessed, chunksProcessed, distinctHashes, cacheHits, inferenceCalls, failed,
+                java.util.List.of());
+    }
 
     /** Nothing to do. A legitimate, watermark-advancing outcome. */
     public static DeriveResult empty() {

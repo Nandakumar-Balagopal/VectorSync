@@ -4,6 +4,7 @@ import io.vectorsync.controlplane.model.WorkItemEntity;
 import io.vectorsync.controlplane.model.WorkItemEntity.Kind;
 import io.vectorsync.controlplane.model.WorkItemEntity.State;
 import io.vectorsync.controlplane.repository.WorkItemRepository;
+import io.vectorsync.controlplane.repository.EmbeddedContentRepository;
 import io.vectorsync.format.derive.ContentHash;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -17,6 +18,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -80,8 +84,16 @@ public class WorkQueueService {
 
     private final WorkItemRepository workItemRepository;
 
-    public WorkQueueService(WorkItemRepository workItemRepository) {
+    private final EmbeddedContentRepository embeddedContentRepository;
+
+    public WorkQueueService(WorkItemRepository workItemRepository,
+                            EmbeddedContentRepository embeddedContentRepository) {
         this.workItemRepository = workItemRepository;
+        this.embeddedContentRepository = embeddedContentRepository;
+    }
+
+    /** One embedding a worker durably committed, reported alongside the completion that wrote it. */
+    public record EmbeddedContent(String modelVersion, String configId, String contentHash, int embeddingDim) {
     }
 
     /**
@@ -241,6 +253,25 @@ public class WorkQueueService {
      */
     @Transactional
     public void complete(String id) {
+        complete(id, List.of());
+    }
+
+    /**
+     * Marks an item done and records the embeddings it committed, in one transaction.
+     *
+     * <p>The single transaction is the correctness property, not an optimisation. "This content has
+     * a durable vector" and "the work that wrote it finished" must not be separately observable: if
+     * the record were written first and completion failed, a retry would trust a cache hit for a
+     * vector whose write may have been rolled back; if completion were written first and the record
+     * failed, the content would be silently re-embedded forever with no way to notice.
+     *
+     * <p>The worker commits to Iceberg <em>before</em> calling this, which makes the remaining error
+     * one-directional. A completion that never lands leaves the content unrecorded, so a retry pays
+     * for a byte-identical embedding again -- wasteful and harmless. The reverse, a record without a
+     * vector, is the one that cannot happen.
+     */
+    @Transactional
+    public void complete(String id, List<EmbeddedContent> embedded) {
         WorkItemEntity item = mustFind(id);
         if (item.getState() == State.DONE) {
             return;
@@ -256,7 +287,44 @@ public class WorkQueueService {
         item.setLastError(null);
         item.setUpdatedAt(Instant.now());
         workItemRepository.save(item);
-        log.debug("Work item {} done ({} rows from {})", id, item.getRecordCount(), item.getDataFilePath());
+
+        Instant now = Instant.now();
+        int recorded = 0;
+        for (EmbeddedContent content : embedded == null ? List.<EmbeddedContent>of() : embedded) {
+            if (content == null || blank(content.contentHash())
+                    || blank(content.modelVersion()) || blank(content.configId())) {
+                continue;
+            }
+            recorded += embeddedContentRepository.recordIfAbsent(
+                    content.modelVersion(), content.configId(), content.contentHash(),
+                    content.embeddingDim(), now);
+        }
+
+        log.debug("Work item {} done ({} rows from {}), {} of {} embeddings newly recorded",
+                id, item.getRecordCount(), item.getDataFilePath(), recorded,
+                embedded == null ? 0 : embedded.size());
+    }
+
+    /**
+     * Which of {@code contentHashes} already have a durable vector.
+     *
+     * <p>Read-only and safe to call from any worker: the answer is a property of committed state
+     * rather than of the caller's process.
+     */
+    @Transactional(readOnly = true)
+    public Set<String> findExistingHashes(String modelVersion,
+                                          String configId,
+                                          Collection<String> contentHashes) {
+        if (contentHashes == null || contentHashes.isEmpty()) {
+            return Set.of();
+        }
+        return new HashSet<>(embeddedContentRepository.findExistingHashes(
+                modelVersion, configId, contentHashes));
+    }
+
+    @Transactional(readOnly = true)
+    public long countEmbedded(String modelVersion, String configId) {
+        return embeddedContentRepository.countForScope(modelVersion, configId);
     }
 
     /** Records a failed attempt without claiming which lease it belongs to. */
@@ -421,6 +489,10 @@ public class WorkQueueService {
         }
         return workItemRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Unknown work item: " + id));
+    }
+
+    private static boolean blank(String value) {
+        return value == null || value.isBlank();
     }
 
     private static String requireText(String value, String field) {

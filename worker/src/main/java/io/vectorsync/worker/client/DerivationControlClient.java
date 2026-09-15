@@ -19,9 +19,11 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The worker's view of the control plane: materializations to run, and the queue they run through.
@@ -230,8 +232,51 @@ public class DerivationControlClient {
         return items;
     }
 
-    public void complete(String itemId) {
-        post("/api/queue/" + itemId + "/complete", Map.of());
+    /** One embedding durably committed, reported with the completion that wrote it. */
+    public record EmbeddedContent(String modelVersion, String configId, String contentHash, int embeddingDim) {
+    }
+
+    /**
+     * @return true only when the control plane confirmed the completion
+     *
+     * <p>The return value matters here because the embeddings are recorded in the same transaction.
+     * A swallowed failure means neither the completion nor the dedup records landed, and the caller
+     * must not cache those hashes as confirmed.
+     */
+    public boolean complete(String itemId, List<EmbeddedContent> embedded) {
+        return post("/api/queue/" + itemId + "/complete",
+                Map.of("embedded", embedded == null ? List.of() : embedded)) != null;
+    }
+
+    public boolean complete(String itemId) {
+        return complete(itemId, List.of());
+    }
+
+    /**
+     * Which of {@code contentHashes} already have a durable embedding.
+     *
+     * <p>Returns null on failure rather than an empty set. An empty set is a valid answer meaning
+     * "none of these are embedded", and conflating it with "we could not find out" would re-embed
+     * an entire batch on a transient control-plane blip.
+     */
+    public Set<String> probeEmbedded(String modelVersion, String configId, Collection<String> contentHashes) {
+        if (contentHashes == null || contentHashes.isEmpty()) {
+            return Set.of();
+        }
+
+        JsonNode response = post("/api/queue/embedded/probe", Map.of(
+                "modelVersion", modelVersion,
+                "configId", configId,
+                "contentHashes", contentHashes));
+        if (response == null) {
+            return null;
+        }
+
+        Set<String> existing = new java.util.HashSet<>();
+        for (JsonNode node : response.path("existing")) {
+            existing.add(node.asText());
+        }
+        return existing;
     }
 
     public void fail(String itemId, String owner, String error) {

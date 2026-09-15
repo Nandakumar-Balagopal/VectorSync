@@ -47,6 +47,7 @@ public class MaterializationRunner {
     private final IncrementalChangeDetector detector;
     private final DeriveService deriveService;
     private final IcebergCatalogService catalogService;
+    private final ContentHashIndex hashIndex;
 
     /**
      * Lease owner. Defaults to host and pid rather than a constant, because the fence in the queue
@@ -94,11 +95,13 @@ public class MaterializationRunner {
     public MaterializationRunner(DerivationControlClient control,
                                  IncrementalChangeDetector detector,
                                  DeriveService deriveService,
-                                 IcebergCatalogService catalogService) {
+                                 IcebergCatalogService catalogService,
+                                 ContentHashIndex hashIndex) {
         this.control = control;
         this.detector = detector;
         this.deriveService = deriveService;
         this.catalogService = catalogService;
+        this.hashIndex = hashIndex;
     }
 
     public record CycleReport(int materializationsSeen,
@@ -247,8 +250,34 @@ public class MaterializationRunner {
                                     file.sequenceNumber(), file.committedAtMillis());
 
                     if (result == null || result.complete()) {
-                        control.complete(item.getId());
-                        processed++;
+                        // The hashes this pass durably wrote are reported WITH the completion, so
+                        // the control plane records them in the same transaction. Only once that
+                        // transaction is confirmed may they enter the local cache: caching on the
+                        // strength of a local write is what made the previous dedup set claim
+                        // vectors whose commit had not survived.
+                        List<DerivationControlClient.EmbeddedContent> embedded = result == null
+                                ? List.of()
+                                : result.written().stream()
+                                        .map(w -> new DerivationControlClient.EmbeddedContent(
+                                                spec.modelVersion(), spec.configId(),
+                                                w.contentHash(), w.embeddingDim()))
+                                        .toList();
+
+                        if (control.complete(item.getId(), embedded)) {
+                            hashIndex.cacheConfirmed(
+                                    embedded.stream()
+                                            .map(DerivationControlClient.EmbeddedContent::contentHash)
+                                            .toList(),
+                                    spec.modelVersion(), spec.configId());
+                            processed++;
+                        } else {
+                            // Neither the completion nor the dedup records landed. The lease will
+                            // expire and the item is redone; the vectors are already durable, so the
+                            // retry re-embeds them, which is wasteful and correct.
+                            log.warn("Completion for {} was not confirmed; leaving it to expire",
+                                    item.getDataFilePath());
+                            failed++;
+                        }
                     } else {
                         control.fail(item.getId(), owner,
                                 result.failed() + " rows did not materialize");

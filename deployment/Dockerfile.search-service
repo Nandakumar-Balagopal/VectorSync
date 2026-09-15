@@ -14,4 +14,8 @@ FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app
 COPY --from=builder /app/search-service/target/vectorsync-search-service-*.jar app.jar
 EXPOSE 8083
-ENTRYPOINT ["java", "-jar", "app.jar"]
+# An OOM must kill the process, not leave a wedged JVM that a TCP healthcheck still reports as
+# live. MaxRAMPercentage sizes the heap from the container limit rather than from the host, which
+# is what makes a cgroup memory limit meaningful.
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp"
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar app.jar"]

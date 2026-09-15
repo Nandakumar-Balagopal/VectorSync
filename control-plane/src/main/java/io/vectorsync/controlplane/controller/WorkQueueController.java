@@ -114,10 +114,51 @@ public class WorkQueueController {
         }
     }
 
+    /**
+     * Probes which content already has a durable embedding.
+     *
+     * <p>POST because the hash batch is a body, not a URL: a probe carries hundreds of 64-character
+     * hashes and would exceed practical query-string limits as a GET.
+     */
+    @PostMapping("/embedded/probe")
+    public ResponseEntity<?> probeEmbedded(@RequestBody ProbeRequest request) {
+        if (request == null || request.getModelVersion() == null || request.getConfigId() == null) {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("error", "modelVersion and configId are required"));
+        }
+        return ResponseEntity.ok(Map.of(
+                "existing", workQueueService.findExistingHashes(
+                        request.getModelVersion(), request.getConfigId(),
+                        request.getContentHashes() == null ? List.of() : request.getContentHashes())));
+    }
+
+    @GetMapping("/embedded/count")
+    public ResponseEntity<?> countEmbedded(@RequestParam("modelVersion") String modelVersion,
+                                           @RequestParam("configId") String configId) {
+        return ResponseEntity.ok(Map.of(
+                "modelVersion", modelVersion, "configId", configId,
+                "embedded", workQueueService.countEmbedded(modelVersion, configId)));
+    }
+
+    @lombok.Data
+    public static class ProbeRequest {
+        private String modelVersion;
+        private String configId;
+        private List<String> contentHashes;
+    }
+
+    @lombok.Data
+    public static class CompleteRequest {
+        /** Embeddings this item durably committed, recorded in the same transaction as completion. */
+        private List<WorkQueueService.EmbeddedContent> embedded;
+    }
+
     @PostMapping("/{id}/complete")
-    public ResponseEntity<?> complete(@PathVariable("id") String id) {
+    public ResponseEntity<?> complete(@PathVariable("id") String id,
+                                      @RequestBody(required = false) CompleteRequest request) {
         try {
-            workQueueService.complete(id);
+            workQueueService.complete(id,
+                    request == null || request.getEmbedded() == null ? List.of() : request.getEmbedded());
             return ResponseEntity.ok(Map.of("id", id, "state", WorkItemEntity.State.DONE.name()));
         } catch (IllegalArgumentException e) {
             log.warn("Completion for unknown work item {}", id);

@@ -1,9 +1,18 @@
 spring:
   application:
     name: ${APP_NAME:vectorsync-control-api}
+  flyway:
+    enabled: ${FLYWAY_ENABLED:true}
+    # Adopts a database that predates Flyway (its tables came from ddl-auto) as version 1 rather
+    # than trying to re-create them.
+    baseline-on-migrate: true
+    baseline-version: 1
   jpa:
     hibernate:
-      ddl-auto: ${JPA_DDL_AUTO:update}
+      # Off: Flyway owns the schema. Left at "update" this would silently add columns that no
+      # migration records, so environments drift and a correctness-path table's shape depends on
+      # whichever build last started against the database.
+      ddl-auto: ${JPA_DDL_AUTO:none}
     properties:
       hibernate:
         dialect: ${JPA_DIALECT:org.hibernate.dialect.PostgreSQLDialect}

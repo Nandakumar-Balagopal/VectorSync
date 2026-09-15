@@ -226,6 +226,7 @@ public class DeriveService {
         // Hashes with no vector in the store once this batch is done. Rows referencing any of them
         // must not be mapped, or search would resolve them to nothing.
         Set<String> unavailable = new HashSet<>();
+        List<DeriveResult.Written> written = new ArrayList<>();
         int inferenceCalls = 0;
 
         if (!novelByHash.isEmpty()) {
@@ -243,12 +244,13 @@ public class DeriveService {
             if (!newVectors.isEmpty()) {
                 try {
                     EmbeddingStore.append(store, newVectors);
-                    // Only after the commit succeeded. Recording earlier would have the index claim
-                    // a vector that does not exist, and every row carrying that content would map
-                    // to nothing.
-                    hashIndex.recordWritten(
-                            newVectors.stream().map(EmbeddingEntry::getContentHash).toList(),
-                            modelVersion, configId);
+                    // Collected, not recorded. The durable record of these hashes is written by the
+                    // control plane in the same transaction that marks this work item complete, so
+                    // "the vector exists" and "the work finished" cannot be observed separately.
+                    for (EmbeddingEntry entry : newVectors) {
+                        written.add(new DeriveResult.Written(
+                                entry.getContentHash(), entry.getEmbeddingDim()));
+                    }
                 } catch (Exception e) {
                     // A single commit, so a failure means none of these vectors landed. Inference
                     // was still paid for and stays counted; the retry re-embeds only these hashes.
@@ -299,11 +301,11 @@ public class DeriveService {
             log.error("Appending {} content map entries failed for {}: {}",
                     mapEntries.size(), spec.getSourceTable(), e.getMessage(), e);
             return new DeriveResult(0, chunksProcessed, distinctHashes, cacheHits,
-                    inferenceCalls, sourceRows.size());
+                    inferenceCalls, sourceRows.size(), written);
         }
 
         DeriveResult result = new DeriveResult(rowsProcessed, chunksProcessed, distinctHashes,
-                cacheHits, inferenceCalls, planFailures + heldBack);
+                cacheHits, inferenceCalls, planFailures + heldBack, written);
 
         log.info("Derived {} / {}: {} rows, {} chunks, {} distinct, {} cache hits ({} dedup), "
                         + "{} inference calls, {} failed",
