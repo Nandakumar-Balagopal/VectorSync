@@ -13,8 +13,9 @@ import java.util.regex.Pattern;
  * catalog configured can rank rows by cosine similarity without an index build, a sidecar service,
  * or a new dependency -- the projection is an ordinary Iceberg table and the arithmetic is ordinary
  * SQL. The reason to generate it rather than document it is that neither engine has a dense-vector
- * cosine function suited to an {@code array<float>} column, so the honest expression is a
- * {@code reduce} over a {@code zip_with}, written three times (dot product and both norms), and no
+ * cosine function suited to an {@code array<float>} column -- Trino does, from release 465, so its
+ * view is a single function call; Spark does not, so its body is a {@code reduce} over a
+ * {@code zip_with} written three times (dot product and both norms), and no
  * analyst should be asked to type that correctly per query.
  *
  * <p>The view is a convenience, not the fast path: it reads every vector in the partition. It is
@@ -38,7 +39,11 @@ public final class SqlViewGenerator {
     public static final String VIEW_NAME_SUFFIX = "_cosine";
 
     /** Alias of the similarity column, so callers can {@code ORDER BY} it by name. */
-    public static final String SIMILARITY_COLUMN = "cosine_similarity";
+    /**
+     * Output column name. Deliberately not "cosine_similarity": Trino's built-in has that name, and
+     * aliasing a column to it inside the same SELECT is legal but reads as a shadowing bug.
+     */
+    public static final String SIMILARITY_COLUMN = "similarity";
 
     /**
      * Columns the view exposes. The embedding itself is deliberately absent: shipping the vector
@@ -94,36 +99,30 @@ public final class SqlViewGenerator {
         StringBuilder sql = new StringBuilder();
         sql.append("-- Exact cosine similarity over ").append(projectionTable)
                 .append(" (dimension ").append(dimension).append(").\n");
+        sql.append("-- cosine_similarity(array(double), array(double)) is built in from Trino 465\n");
+        sql.append("-- (Nov 2024); cosine_distance is available alongside it. Earlier releases only\n");
+        sql.append("-- had the sparse map-based overload, which does not apply to an array column.\n");
         sql.append("-- CREATE OR REPLACE VIEW requires Trino 431 or newer; on older releases DROP\n");
-        sql.append("-- VIEW first and use CREATE VIEW. reduce/zip_with/transform are available from\n");
-        sql.append("-- Trino 300. Trino 447 added array_cosine_similarity(array(real), array(real)),\n");
-        sql.append("-- which is faster where available; this body is written with array arithmetic so\n");
-        sql.append("-- one generated view works across every release in between.\n");
+        sql.append("-- VIEW first and use CREATE VIEW.\n");
         sql.append("-- ").append(QUERY_VECTOR_PARAMETER)
                 .append(" is a template placeholder: substitute an ARRAY[...] literal before running\n");
         sql.append("-- this DDL, because a Trino view body cannot take a runtime parameter.\n");
         sql.append("CREATE OR REPLACE VIEW ").append(view).append(" AS\n");
-        // The query vector is materialized once in a CTE rather than repeated in three places, so
-        // substituting the placeholder rewrites one occurrence and the engine computes the query
-        // norm once per query instead of once per row.
+        // The query vector is materialized once in a CTE rather than repeated, so substituting the
+        // placeholder rewrites one occurrence.
         sql.append("WITH query AS (\n");
         sql.append("    SELECT CAST(").append(QUERY_VECTOR_PARAMETER)
                 .append(" AS array(double)) AS qv\n");
         sql.append(")\n");
         sql.append("SELECT\n");
         appendColumns(sql);
-        String embedding = "CAST(v." + Constants.EMBEDDING_COLUMN + " AS array(double))";
-        sql.append("    ").append(trinoDotProduct(embedding, "q.qv")).append("\n");
-        // NULLIF, not a bare division: Trino raises DIVISION_BY_ZERO on a zero denominator, so a
-        // single zero-norm vector would abort the whole query instead of scoring as unknown.
-        sql.append("        / NULLIF(\n");
-        sql.append("            ").append(trinoNorm(embedding)).append("\n");
-        sql.append("          * ").append(trinoNorm("q.qv")).append(",\n");
-        sql.append("            0.0) AS ").append(SIMILARITY_COLUMN).append("\n");
+        sql.append("    cosine_similarity(CAST(v.").append(Constants.EMBEDDING_COLUMN)
+                .append(" AS array(double)), q.qv) AS ").append(SIMILARITY_COLUMN).append("\n");
         sql.append("FROM ").append(table).append(" v\n");
         sql.append("CROSS JOIN query q\n");
-        // zip_with pads the shorter array with NULL, which would silently produce NULL scores for
-        // every row. An explicit width check makes a wrong-dimension query return nothing instead.
+        // The built-in returns NULL on a length mismatch rather than raising, so a wrong-dimension
+        // query would silently produce an all-NULL ranking. The explicit width check turns that
+        // into an empty result, which is a visible failure instead of a plausible one.
         sql.append("WHERE cardinality(q.qv) = ").append(dimension).append("\n");
         return sql.toString();
     }
@@ -222,15 +221,7 @@ public final class SqlViewGenerator {
      * sum back into one decimal digit, for which there is no implicit coercion, so the whole
      * function fails to resolve and the DDL is rejected at view creation.
      */
-    private static String trinoDotProduct(String left, String right) {
-        return "reduce(zip_with(" + left + ", " + right
-                + ", (e, p) -> e * p), CAST(0 AS double), (s, x) -> s + x, s -> s)";
-    }
 
-    private static String trinoNorm(String vector) {
-        return "sqrt(reduce(transform(" + vector + ", e -> e * e),"
-                + " CAST(0 AS double), (s, x) -> s + x, s -> s))";
-    }
 
     /** Spark spells the same fold {@code aggregate}, with no output function. */
     private static String sparkDotProduct(String left, String right) {
