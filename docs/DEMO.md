@@ -155,3 +155,64 @@ The demo fails loudly with the failing URL and response body rather than printin
 | stuck at `VALIDATED` | scheduler interval is 15s; give it one cycle |
 | `DEGRADED` | a delete/overwrite landed on the source table; use a fresh table name |
 | beat 4 shows zeros | worker restarted after deriving; counters are in-memory per process |
+
+---
+
+## Measured on real data
+
+The synthetic figures in `bench/cluster.py` said not to quote them. `bench/real.py` re-runs the same
+measurement on BEIR — real documents, the benchmark's own test queries, and its relevance
+judgements — so retrieval quality is measured rather than index agreement.
+
+```bash
+mkdir -p /tmp/beir && cd /tmp/beir
+for d in nfcorpus fiqa; do curl -O https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/$d.zip && unzip -o $d.zip; done
+python3 bench/real.py --dataset nfcorpus --clusters 64
+python3 bench/real.py --dataset fiqa --clusters 256 --limit 20000
+```
+
+### FiQA — 20,000 financial forum posts, 256 clusters, 40 judged test queries
+
+| probes | recall@10 | nDCG@10 | rows read | fraction | quality retained |
+|---|---|---|---|---|---|
+| 1 | 0.465 | 0.063 | 94 | 0.5% | 47% |
+| 2 | 0.630 | 0.123 | 183 | 0.9% | 91% |
+| 8 | **0.847** | **0.136** | 668 | **3.3%** | **100.6%** |
+| 64 | 0.985 | 0.135 | 5,175 | 25.9% | 100% |
+| 256 | 1.000 | 0.135 | 20,000 | 100% | ceiling |
+
+**8 of 256 clusters gives the same retrieval quality as a full scan while reading 3.3% of the table
+— a 30x I/O reduction.**
+
+### NFCorpus — 3,593 biomedical abstracts, 64 clusters
+
+| probes | recall@10 | nDCG@10 | fraction | quality retained |
+|---|---|---|---|---|
+| 2 | 0.737 | 0.329 | 3.8% | 94.5% |
+| 8 | 0.907 | 0.334 | 14.0% | 96.0% |
+| 64 | 1.000 | 0.348 | 100% | ceiling |
+
+### The finding that matters
+
+**Recall against the exact neighbour set badly understates quality retention.** On FiQA, recall
+0.847 delivered 100% of exact nDCG: the neighbours pruning missed were not the relevant ones. Anyone
+tuning this on recall alone would over-provision probes by 8x.
+
+### Caveats, all of which cut against the result
+
+- **The absolute nDCG ceiling is low** (0.135 on FiQA) because `all-MiniLM-L6-v2` is weak on
+  financial text and titles were excluded. Hitting "100% of a low ceiling" is easier than hitting
+  100% of a strong one. A better model may prove more sensitive to pruning — re-measure before
+  claiming this generalises.
+- **Cluster count needs tuning, and badly.** NFCorpus at 16 clusters needed 53% of the table for
+  comparable quality; at 64 clusters it needed 3.8%. This is the standard IVF `nlist`/`nprobe` trade
+  and there is no auto-tuning here.
+- **Clusters are skewed** (FiQA: 14 to 295 members), so fraction-read varies per query and the
+  average hides the worst case.
+- **Deduplication is worth almost nothing on these corpora.** NFCorpus deduplicated 1.1%
+  (3,633 documents to 3,593 vectors); FiQA 0.00%. The measured 95% savings came from synthetic
+  duplication. Real IR corpora are near-unique by construction, so the content-addressed cost
+  argument applies to catalogs, logs, support macros and document revisions — not to search corpora.
+  Say this before being asked.
+- **Derivation is slow**: 569s for 20,000 vectors, roughly 28ms each, where embedding itself is about
+  1ms. Over 95% is per-batch overhead, not inference.
