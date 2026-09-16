@@ -36,6 +36,16 @@ public class ClusterIndexService {
 
     private final IcebergCatalogService catalogService;
 
+    /**
+     * Centroids and scope size per scope, cached for the life of the index.
+     *
+     * <p>Both were read from Iceberg on every query. Centroids are a table scan, and neither value
+     * changes until a rebuild -- so the query path was paying catalog load and scan planning twice
+     * over for constants. Cleared by {@link #build}, which is the only thing that can invalidate them.
+     */
+    private final java.util.Map<String, List<float[]>> centroidCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Map<String, Long> scopeSizeCache = new java.util.concurrent.ConcurrentHashMap<>();
+
     @Value("${iceberg.vector.namespace:vector}")
     private String vectorNamespace;
 
@@ -134,6 +144,10 @@ public class ClusterIndexService {
             clusterSizes.add(size);
         }
 
+        String scope = modelVersion + "\u001F" + configId;
+        centroidCache.remove(scope);
+        scopeSizeCache.remove(scope);
+
         log.info("Clustered {} vectors for {} / {} into {} clusters in {} iterations",
                 entries.size(), modelVersion, configId, model.clusterCount(), model.iterations());
         return new BuildReport(sourceTable, modelVersion, configId, model.clusterCount(),
@@ -147,11 +161,14 @@ public class ClusterIndexService {
                                             float[] query,
                                             int k,
                                             int probes) {
-        Table centroidTable = ClusteredIndex.loadCentroidsOrCreate(
-                catalogService.getCatalog(), vectorNamespace);
-        List<float[]> centroids =
-                ClusteredIndex.readCentroids(centroidTable, modelVersion, configId);
+        String scope = modelVersion + "\u001F" + configId;
+        List<float[]> centroids = centroidCache.computeIfAbsent(scope, key -> {
+            Table centroidTable = ClusteredIndex.loadCentroidsOrCreate(
+                    catalogService.getCatalog(), vectorNamespace);
+            return ClusteredIndex.readCentroids(centroidTable, modelVersion, configId);
+        });
         if (centroids.isEmpty()) {
+            centroidCache.remove(scope);
             throw new IllegalStateException("No centroids for " + configId + "; build the index first");
         }
 
@@ -159,7 +176,8 @@ public class ClusterIndexService {
         Table clustered = ClusteredIndex.loadOrCreate(
                 catalogService.getCatalog(), vectorNamespace, sourceTable);
 
-        long total = countScope(clustered, modelVersion, configId);
+        long total = scopeSizeCache.computeIfAbsent(scope,
+                key -> countScope(clustered, modelVersion, configId));
         return ClusteredIndex.probe(clustered, modelVersion, configId, query,
                 model.probe(query, probes), k, total);
     }
@@ -175,15 +193,24 @@ public class ClusterIndexService {
         return ClusteredIndex.exact(clustered, modelVersion, configId, query, k);
     }
 
+    /**
+     * Size of a scope, from manifest metadata rather than from the rows.
+     *
+     * <p>This used to scan every row in the scope, on every probe, to produce a denominator for a
+     * benchmark. That made the fixed cost of a query proportional to the whole table and hid the
+     * actual pruning: probing one cluster read 103 rows and still took 1,176ms, because it had
+     * silently scanned all 20,000 to count them. Iceberg records per-file row counts in the
+     * manifests, so planning answers this without opening a data file.
+     */
     private long countScope(Table table, String modelVersion, String configId) {
         long count = 0;
-        try (CloseableIterable<Record> rows = IcebergGenerics.read(table)
-                .where(Expressions.equal(Constants.MODEL_VERSION_COLUMN, modelVersion))
-                .where(Expressions.equal(Constants.CONFIG_ID_COLUMN, configId))
-                .select(ClusteredIndex.CLUSTER_ID_COLUMN, Constants.CONFIG_ID_COLUMN)
-                .build()) {
-            for (Record ignored : rows) {
-                count++;
+        try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+                     table.newScan()
+                             .filter(Expressions.equal(Constants.MODEL_VERSION_COLUMN, modelVersion))
+                             .filter(Expressions.equal(Constants.CONFIG_ID_COLUMN, configId))
+                             .planFiles()) {
+            for (org.apache.iceberg.FileScanTask task : tasks) {
+                count += task.file().recordCount();
             }
         } catch (Exception e) {
             throw new IllegalStateException("Could not size scope " + configId, e);
