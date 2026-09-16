@@ -45,6 +45,16 @@ public class IcebergCatalogConfig {
     /** Bearer token or {@code id:secret} credential for a REST catalog. */
     private final String catalogCredential;
 
+    /**
+     * Credentials for a JDBC catalog, which keeps its namespace and table pointers in a relational
+     * database. Named explicitly rather than left to {@link #extraProperties} because this is the
+     * catalog to use for local multi-engine work: it commits with a real compare-and-set, and both
+     * VectorSync and a query engine can attach to the same database, which HadoopCatalog cannot
+     * offer safely and REST needs a server for.
+     */
+    private final String jdbcUser;
+    private final String jdbcPassword;
+
     /** Catalog name as the server knows it, when it differs from the warehouse path. */
     private final String catalogWarehouse;
 
@@ -114,6 +124,18 @@ public class IcebergCatalogConfig {
             properties.put("catalog-impl", catalogType);
         }
 
+        // Off, deliberately, and this is not a tuning choice.
+        //
+        // CatalogUtil.buildIcebergCatalog wraps the catalog in a CachingCatalog whenever
+        // cache-enabled is absent, and its default is true. A cached catalog hands back Table
+        // objects with the metadata they had when first loaded, which is precisely wrong for a
+        // system whose entire job is to notice that a source table has a new snapshot: the worker
+        // pins a stale anchor, then fails forever because that snapshot is "no longer in history".
+        // The predecessor, CatalogUtil.loadCatalog, added no caching, so switching to
+        // buildIcebergCatalog silently introduced this. The cost of disabling it is one metadata
+        // read per loadTable, which is the correct price for change detection that works.
+        properties.put("cache-enabled", "false");
+
         if (!isBlank(warehousePath)) {
             properties.put("warehouse", warehousePath);
         }
@@ -127,6 +149,12 @@ public class IcebergCatalogConfig {
         }
         if (!isBlank(catalogCredential)) {
             properties.put("credential", catalogCredential);
+        }
+        if (!isBlank(jdbcUser)) {
+            properties.put("jdbc.user", jdbcUser);
+        }
+        if (!isBlank(jdbcPassword)) {
+            properties.put("jdbc.password", jdbcPassword);
         }
 
         if (usesNativeS3FileIO()) {

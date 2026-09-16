@@ -40,6 +40,12 @@ public class IcebergCatalogService {
     @Value("${iceberg.catalog.credential:}")
     private String catalogCredential;
 
+    @Value("${iceberg.catalog.jdbc.user:}")
+    private String jdbcUser;
+
+    @Value("${iceberg.catalog.jdbc.password:}")
+    private String jdbcPassword;
+
     /** Server-side catalog name for a REST catalog, where it differs from the warehouse path. */
     @Value("${iceberg.catalog.name:}")
     private String catalogWarehouse;
@@ -66,6 +72,8 @@ public class IcebergCatalogService {
                 .pathStyleAccess(pathStyleAccess)
                 .catalogUri(catalogUri)
                 .catalogCredential(catalogCredential)
+                .jdbcUser(jdbcUser)
+                .jdbcPassword(jdbcPassword)
                 .catalogWarehouse(catalogWarehouse)
                 .allowUnsafeHadoopCatalog(allowUnsafeHadoopCatalog)
                 .build();

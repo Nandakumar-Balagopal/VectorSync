@@ -198,4 +198,20 @@ class IcebergCatalogConfigTest {
         assertEquals("s3://override/wh", properties.get("warehouse"),
                 "an operator must be able to correct anything this class computed");
     }
+
+    @Test
+    @DisplayName("the catalog metadata cache is disabled, because change detection depends on it")
+    void metadataCacheIsOff() {
+        // CatalogUtil.buildIcebergCatalog wraps the catalog in a CachingCatalog unless told
+        // otherwise, and cache-enabled defaults to true. A cached Table keeps the metadata it was
+        // first loaded with, so a worker polling for new snapshots never sees one -- it pins a
+        // stale anchor and then fails permanently because that snapshot left history. This is not
+        // a performance setting and must not be "optimised" back on.
+        assertEquals("false", IcebergCatalogConfig.builder()
+                .catalogType("rest")
+                .catalogUri("https://catalog.example.com/iceberg")
+                .build()
+                .catalogProperties()
+                .get("cache-enabled"));
+    }
 }

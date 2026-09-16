@@ -218,6 +218,23 @@ services:
       timeout: 10s
       retries: 3
 
+  # Present to verify one claim rather than to serve anything: that the cluster-partitioned index
+  # is pruned by a real engine, not just by VectorSync's own scan counters. Attaches to the same
+  # JDBC catalog the worker writes through.
+  trino:
+    image: trinodb/trino:latest
+    container_name: vectorsync-trino
+    ports:
+      - "8090:8080"
+    volumes:
+      - ./deployment/trino/catalog:/etc/trino/catalog:ro
+    # No depends_on: Compose will not resolve a dependency from a profiled service onto an
+    # unprofiled one here, and this is started by hand after the stack is already up anyway.
+    networks:
+      - vectorsync-network
+    profiles:
+      - engine
+
 volumes:
   postgres_data:
   minio_data:

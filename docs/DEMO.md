@@ -216,3 +216,77 @@ tuning this on recall alone would over-provision probes by 8x.
   Say this before being asked.
 - **Derivation is slow**: 569s for 20,000 vectors, roughly 28ms each, where embedding itself is about
   1ms. Over 95% is per-batch overhead, not inference.
+
+---
+
+## Engine verification (Trino)
+
+Everything above measured pruning with VectorSync's own scan counters, which is not evidence that a
+query engine prunes anything. This section is the same claim checked by Trino's own counters.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.engine.yml --profile engine up -d
+python3 bench/cluster.py --clusters 32 --top-k 10 --per-category 400
+docker compose --profile engine exec trino trino
+```
+
+The override exists because **Trino's Iceberg connector has no `hadoop` catalog type**, so the
+default stack's warehouse is unreachable from it. Both attach to a JDBC catalog over the Postgres
+already in the stack. Trino does not create that catalog's tables; VectorSync must run first.
+
+### Trino sees every derived table
+
+```
+trino> SHOW TABLES FROM iceberg.vectorsync;
+ clustered_demo_cluster_corpus          -- Tier 3, partitioned by cluster_id
+ content_map                            -- Tier 1 lineage
+ embedding_store                         -- Tier 1 canonical vectors
+ vector_centroids                        -- routing table
+ vectors_demo_cluster_corpus_c3b74338b3cfb584   -- Tier 2 projection
+```
+
+### Exact search, zero install
+
+`cosine_similarity(array(double), array(double))` is built into Trino from release 465:
+
+```sql
+WITH q AS (
+  SELECT CAST(embedding AS array(double)) AS qv
+  FROM iceberg.vectorsync.vectors_demo_cluster_corpus_c3b74338b3cfb584
+  WHERE source_row_id = 'c-00007' LIMIT 1
+)
+SELECT v.source_row_id, v.text,
+       cosine_similarity(CAST(v.embedding AS array(double)), q.qv) AS similarity
+FROM iceberg.vectorsync.vectors_demo_cluster_corpus_c3b74338b3cfb584 v
+CROSS JOIN q ORDER BY similarity DESC LIMIT 5;
+```
+
+Returned the query row at 1.0 and its semantic neighbours at 0.944, 0.944, 0.942, 0.935.
+
+### Pruning, confirmed by Trino
+
+`EXPLAIN ANALYZE` reports physical input:
+
+| query | partitions read | rows read | fraction |
+|---|---|---|---|
+| `SELECT count(*)` (full) | 32 | 2,000 | 100% |
+| `WHERE cluster_id IN (3, 7)` | 2 | 82 | 4.1% |
+| two-step search, literal ids | 2 | 135 | 6.75% |
+
+The two-step search returned **the identical top-5 to a full scan** — same rows, same scores — for
+6.75% of the I/O.
+
+### The finding that changes how you write the query
+
+**Cluster ids must be literals.** Ranking centroids in a subquery inside the same statement does not
+prune:
+
+| predicate form | rows read |
+|---|---|
+| `cluster_id IN (3, 2)` | **135** |
+| `cluster_id IN (SELECT ... FROM vector_centroids ORDER BY ... LIMIT 2)` | **1,699** |
+
+Dynamic filtering trimmed 2,000 to 1,699 and no further — 85% of the table. Partition pruning happens
+during planning, and the planner cannot know a subquery's result. So the flow is two statements, or
+one cheap centroid query plus one search. A single self-contained SQL statement looks more elegant
+and costs 12x the I/O.

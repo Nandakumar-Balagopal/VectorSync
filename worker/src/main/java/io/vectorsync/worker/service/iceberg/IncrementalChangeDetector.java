@@ -625,10 +625,23 @@ public class IncrementalChangeDetector {
         return partitionPaths.contains(spec.partitionToPath(file.partition()));
     }
 
+    /**
+     * The anchor snapshot is gone, so incremental progress from it is impossible.
+     *
+     * <p>Typed rather than a plain {@code IllegalStateException} because the caller has to
+     * distinguish it from a transient failure: this condition never resolves on its own, so retrying
+     * it every cycle consumes the cycle forever while the materialization looks merely unlucky.
+     */
+    public static class ReanchorRequiredException extends IllegalStateException {
+        public ReanchorRequiredException(String message) {
+            super(message);
+        }
+    }
+
     private Snapshot requireSnapshot(Table table, TableConfig config, long snapshotId) {
         Snapshot snapshot = table.snapshot(snapshotId);
         if (snapshot == null) {
-            throw new IllegalStateException(String.format(
+            throw new ReanchorRequiredException(String.format(
                     "Snapshot %d is no longer in the history of %s; the sync must be re-anchored "
                             + "with a backfill against a current snapshot",
                     snapshotId, config.getTableName()));

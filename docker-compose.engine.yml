@@ -1,0 +1,29 @@
+# Switches VectorSync onto a JDBC catalog so a real query engine can attach to the same tables.
+#
+# Used only for the engine verification. The default stack runs HadoopCatalog, which works for a
+# single writer against local MinIO but is unreachable from Trino: Trino's Iceberg connector has no
+# "hadoop" catalog type, by deliberate decision. A JDBC catalog over the Postgres already in this
+# stack is the cheapest thing both can attach to, and it commits with a real compare-and-set.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.engine.yml --profile engine up -d
+services:
+  control-plane:
+    environment:
+      ICEBERG_CATALOG_TYPE: jdbc
+      ICEBERG_CATALOG_URI: jdbc:postgresql://postgres:5432/vectorsync
+      ICEBERG_CATALOG_JDBC_USER: vectorsync
+      ICEBERG_CATALOG_JDBC_PASSWORD: vectorsync123
+
+  worker:
+    environment:
+      ICEBERG_CATALOG_TYPE: jdbc
+      ICEBERG_CATALOG_URI: jdbc:postgresql://postgres:5432/vectorsync
+      ICEBERG_CATALOG_JDBC_USER: vectorsync
+      ICEBERG_CATALOG_JDBC_PASSWORD: vectorsync123
+
+  search-service:
+    environment:
+      ICEBERG_CATALOG_TYPE: jdbc
+      ICEBERG_CATALOG_URI: jdbc:postgresql://postgres:5432/vectorsync
+      ICEBERG_CATALOG_JDBC_USER: vectorsync
+      ICEBERG_CATALOG_JDBC_PASSWORD: vectorsync123

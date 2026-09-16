@@ -144,6 +144,19 @@ public class MaterializationRunner {
                     projected++;
                     advanced++;
                 }
+            } catch (IncrementalChangeDetector.ReanchorRequiredException e) {
+                // Never resolves by retrying: the anchor snapshot has been expired or the source
+                // table was replaced. Parked with the reason so it stops consuming a cycle and an
+                // operator can re-admit it, rather than throwing every interval forever.
+                log.warn("Materialization {} ({}) needs re-anchoring: {}",
+                        materialization.getId(), materialization.getSourceTable(), e.getMessage());
+                control.markDegraded(materialization.getId(), e.getMessage());
+            } catch (org.apache.iceberg.exceptions.NoSuchTableException e) {
+                // The source table is gone. Also terminal without intervention.
+                log.warn("Materialization {} ({}) has no source table; parking it",
+                        materialization.getId(), materialization.getSourceTable());
+                control.markDegraded(materialization.getId(),
+                        "source table no longer exists: " + e.getMessage());
             } catch (Exception e) {
                 log.error("Materialization {} ({}) failed this cycle: {}",
                         materialization.getId(), materialization.getSourceTable(), e.getMessage(), e);
