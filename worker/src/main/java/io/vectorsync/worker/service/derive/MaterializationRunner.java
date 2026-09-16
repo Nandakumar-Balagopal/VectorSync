@@ -48,6 +48,7 @@ public class MaterializationRunner {
     private final DeriveService deriveService;
     private final IcebergCatalogService catalogService;
     private final ContentHashIndex hashIndex;
+    private final DeriveMetricsRegistry metrics;
 
     /**
      * Lease owner. Defaults to host and pid rather than a constant, because the fence in the queue
@@ -96,12 +97,14 @@ public class MaterializationRunner {
                                  IncrementalChangeDetector detector,
                                  DeriveService deriveService,
                                  IcebergCatalogService catalogService,
-                                 ContentHashIndex hashIndex) {
+                                 ContentHashIndex hashIndex,
+                                 DeriveMetricsRegistry metrics) {
         this.control = control;
         this.detector = detector;
         this.deriveService = deriveService;
         this.catalogService = catalogService;
         this.hashIndex = hashIndex;
+        this.metrics = metrics;
     }
 
     public record CycleReport(int materializationsSeen,
@@ -248,6 +251,11 @@ public class MaterializationRunner {
                             ? null
                             : deriveService.derive(spec, rows, file.snapshotId(),
                                     file.sequenceNumber(), file.committedAtMillis());
+
+                    // Recorded regardless of outcome: a pass that failed is exactly the one an
+                    // operator needs counted, and a registry that only sees successes reports a
+                    // healthy dedup rate for a materialization that is not progressing.
+                    metrics.record(spec.getSourceTable(), spec.configId(), result);
 
                     if (result == null || result.complete()) {
                         // The hashes this pass durably wrote are reported WITH the completion, so

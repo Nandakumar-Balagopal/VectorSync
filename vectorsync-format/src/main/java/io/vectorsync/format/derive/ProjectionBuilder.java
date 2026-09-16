@@ -170,11 +170,28 @@ public final class ProjectionBuilder {
      * abandoned independently instead of overwriting each other.
      */
     public static String tableName(MaterializationSpec spec) {
-        return TABLE_NAME_PREFIX + sanitize(spec.getSourceTable()) + "_" + spec.configId();
+        return tableName(spec.getSourceTable(), spec.configId());
+    }
+
+    /**
+     * The projection name from the two values it actually depends on.
+     *
+     * <p>Needed by callers that hold a source table and a configuration id but not the spec that
+     * produced them -- an inspection endpoint, or anything reading a projection recorded elsewhere.
+     * Reconstructing a spec to get the name does not work: the name contains the configuration id,
+     * the id is a hash of the spec's fields, and a spec assembled with placeholder fields therefore
+     * addresses a table that does not exist.
+     */
+    public static String tableName(String sourceTable, String configId) {
+        return TABLE_NAME_PREFIX + sanitize(sourceTable) + "_" + configId;
     }
 
     public static TableIdentifier identifier(String namespace, MaterializationSpec spec) {
         return TableIdentifier.of(Namespace.of(namespace), tableName(spec));
+    }
+
+    public static TableIdentifier identifier(String namespace, String sourceTable, String configId) {
+        return TableIdentifier.of(Namespace.of(namespace), tableName(sourceTable, configId));
     }
 
     /** Loads the projection for a spec, creating it empty when absent. */

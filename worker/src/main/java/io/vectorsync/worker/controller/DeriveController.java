@@ -2,12 +2,16 @@ package io.vectorsync.worker.controller;
 
 import io.vectorsync.common.dto.TableConfig;
 import io.vectorsync.format.derive.MaterializationSpec;
+import io.vectorsync.worker.service.derive.DeriveMetricsRegistry;
 import io.vectorsync.worker.service.derive.DeriveOrchestrationService;
+import io.vectorsync.worker.service.derive.ProjectionReader;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
@@ -27,9 +31,59 @@ import java.util.Map;
 public class DeriveController {
 
     private final DeriveOrchestrationService orchestration;
+    private final DeriveMetricsRegistry metrics;
+    private final ProjectionReader projections;
 
-    public DeriveController(DeriveOrchestrationService orchestration) {
+    public DeriveController(DeriveOrchestrationService orchestration,
+                            DeriveMetricsRegistry metrics,
+                            ProjectionReader projections) {
         this.orchestration = orchestration;
+        this.metrics = metrics;
+        this.projections = projections;
+    }
+
+    /**
+     * Derivation counters for one scope.
+     *
+     * <p>Exposed because the project's central claim -- inference tracks distinct content, not rows
+     * -- was only ever observable by grepping logs, so it could be asserted but not verified or
+     * alerted on.
+     */
+    @GetMapping("/metrics")
+    public ResponseEntity<?> metrics(@RequestParam("sourceTable") String sourceTable,
+                                     @RequestParam("configId") String configId) {
+        return ResponseEntity.ok(metrics.snapshot(sourceTable, configId));
+    }
+
+    @GetMapping("/metrics/all")
+    public ResponseEntity<?> allMetrics() {
+        return ResponseEntity.ok(metrics.all());
+    }
+
+    /**
+     * Samples the serving projection: the rows a query engine actually reads.
+     *
+     * <p>Deliberately excludes the embedding array. The point of looking at this table is the
+     * lineage carried alongside each vector -- content hash, model version, source snapshot and
+     * sequence number -- and returning several hundred floats per row over HTTP would bury it.
+     */
+    @GetMapping("/projection/sample")
+    public ResponseEntity<?> sampleProjection(@RequestParam("sourceTable") String sourceTable,
+                                              @RequestParam("configId") String configId,
+                                              @RequestParam(value = "limit", defaultValue = "5") int limit) {
+        try {
+            List<Map<String, Object>> rows =
+                    projections.sample(sourceTable, configId, Math.max(1, Math.min(limit, 100)));
+            return ResponseEntity.ok(Map.of(
+                    "sourceTable", sourceTable, "configId", configId,
+                    "rows", rows, "sampled", rows.size()));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
+        } catch (Exception e) {
+            log.error("Projection sample failed for {}: {}", sourceTable, e.getMessage(), e);
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", "sample failed", "message", String.valueOf(e.getMessage())));
+        }
     }
 
     /**
