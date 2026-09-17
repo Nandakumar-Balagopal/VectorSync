@@ -28,6 +28,25 @@ planning, partition pruning and scoring -- not just our own scan. Without it, th
 computed over the projection directly, which isolates data cost from engine cost. Run both: the
 difference between them is the engine's overhead and it is worth knowing separately.
 
+!! READ THIS BEFORE TRUSTING A COST NUMBER FROM THIS SCRIPT !!
+
+It drives POST /api/derive/run, and that endpoint does NOT record what it embedded. The durable
+dedup record in embedded_content is written by WorkQueueService.complete, in the same transaction
+that completes a work item -- an invariant asserted in DurableDedupTest and documented in
+docs/DEMO.md. DeriveOrchestrationService, which backs /api/derive/run, has no control-plane
+reference at all, so nothing it embeds is ever recorded and the probe cannot hit on a later
+invocation.
+
+Consequence, measured: nfcorpus at 400 rows with ~31 rows changed per round reported 391, 384 and
+377 inference calls per round -- essentially the whole corpus every time -- for 12.387 calls per
+changed row, where a row-keyed pipeline pays 1.000. That number is real and it is a fact about this
+endpoint, not about the architecture. The production path is the scheduler plus the work queue,
+which does record, and that is the path a cost claim has to be measured on.
+
+Fixing this properly means registering a materialization through the control plane and letting the
+runner drive it, rather than calling the derive endpoint directly. Until that is done, treat the
+freshness and latency columns as meaningful and the inference column as measuring the wrong thing.
+
 Usage
   python3 bench/mutation.py --dataset nfcorpus --rows 3000 --rounds 10 --mutate 0.05
   python3 bench/mutation.py --dataset fiqa --rows 20000 --rounds 20 --mutate 0.02 --trino
@@ -77,8 +96,8 @@ class Workload:
     """
 
     def __init__(self, docs, mutate_fraction, delete_share, seed=20260917):
-        self.docs = list(docs)
-        self.live = {doc["id"]: doc for doc in self.docs}
+        # docs is {id: text}, which is what real.load_beir produces.
+        self.live = dict(docs)
         self.mutate_fraction = mutate_fraction
         self.delete_share = delete_share
         self.random = random.Random(seed)
@@ -111,25 +130,26 @@ class Workload:
 
         upserts = []
         for doc_id in to_update:
-            doc = dict(self.live[doc_id])
             # Text that is new but still natural: a real edit, not a random string, so chunking and
-            # embedding behave as they would on a genuine revision.
-            doc["text"] = doc["text"] + " Revised in round %d." % self.round_marker
-            self.live[doc_id] = doc
-            upserts.append(doc)
+            # embedding behave as they would on a genuine revision. It must actually differ, or a
+            # content-addressed pipeline treats the update as a no-op and the round proves nothing.
+            self.live[doc_id] = self.live[doc_id] + " Revised in round %d." % self.round_marker
+            upserts.append(doc_id)
 
         return upserts, deletes
 
     round_marker = 0
 
 
+def as_rows(live):
+    """{id: text} to the seed-row shape the demo endpoints take."""
+    return [{"id": doc_id, "name": "", "description": text} for doc_id, text in live.items()]
+
+
 def seed_source(table, live_docs):
     """Creates the table for round zero. Drops and recreates, so there is no prior history."""
-    rows = [
-        {"id": doc["id"], "name": doc.get("title", "") or "", "description": doc["text"]}
-        for doc in live_docs
-    ]
-    post("%s/api/demo/tables" % WORKER, {"tableName": table, "rows": rows}, timeout=3600)
+    post("%s/api/demo/tables" % WORKER,
+         {"tableName": table, "rows": as_rows(live_docs)}, timeout=3600)
 
 
 def rewrite_source(table, live_docs):
@@ -140,13 +160,9 @@ def rewrite_source(table, live_docs):
     UPDATE/DELETE on a table with no delete files, it is the shape the pipeline's assess() classifies
     as needing a reconcile, and it exercises the path that matters instead of the one that is easy.
     """
-    rows = [
-        {"id": doc["id"], "name": doc.get("title", "") or "", "description": doc["text"]}
-        for doc in live_docs
-    ]
     post(
         "%s/api/demo/tables/replace" % WORKER,
-        {"tableName": table, "rows": rows},
+        {"tableName": table, "rows": as_rows(live_docs)},
         timeout=3600,
     )
 
@@ -206,11 +222,24 @@ def main():
     parser.add_argument("--table", default="default.mutation_bench")
     args = parser.parse_args()
 
-    docs, queries, qrels = load_beir(args.dataset, args.rows)
+    docs, queries, qrels = load_beir(args.dataset, 0)
+
+    # Judged documents first. A leading slice of the corpus is the obvious way to take a subset and
+    # it makes nDCG structurally zero: nfcorpus has 3,633 documents and its qrels reference ids
+    # scattered throughout, so the first 400 contained none of them and every round reported 0.0000.
+    # A relevance number that cannot be nonzero is worse than no relevance number, because it looks
+    # like a retrieval failure.
+    judged = {doc_id for relevant in qrels.values() for doc_id in relevant}
+    ordered = [d for d in docs if d in judged] + [d for d in docs if d not in judged]
+    docs = {doc_id: docs[doc_id] for doc_id in ordered[: args.rows]}
+    covered = len([d for d in docs if d in judged])
+    print("judged documents in the subset: %d of %d" % (covered, len(docs)))
+    if covered == 0:
+        print("  !! no judged documents -- nDCG will be 0.0000 and means nothing")
     print("corpus %s: %d documents, %d judged queries"
           % (args.dataset, len(docs), len(queries)))
 
-    distinct_initial = len({content_hash(d["text"]) for d in docs})
+    distinct_initial = len({content_hash(text) for text in docs.values()})
     print("distinct content: %d of %d rows (%.1f%% duplicated)"
           % (distinct_initial, len(docs), 100.0 * (1 - distinct_initial / max(1, len(docs)))))
 
@@ -226,15 +255,15 @@ def main():
         workload.round_marker = round_index
 
         if round_index == 0:
-            upserts, deletes = list(workload.live.values()), []
+            upserts, deletes = list(workload.live.keys()), []
         else:
             upserts, deletes = workload.next_round()
 
         committed_at = time.time()
         if round_index == 0:
-            seed_source(args.table, list(workload.live.values()))
+            seed_source(args.table, workload.live)
         else:
-            rewrite_source(args.table, list(workload.live.values()))
+            rewrite_source(args.table, workload.live)
 
         # Wait for the pipeline to make the change queryable, which is the number a user feels.
         # Polled rather than assumed: the whole point is to measure the lag, not to sleep past it.
