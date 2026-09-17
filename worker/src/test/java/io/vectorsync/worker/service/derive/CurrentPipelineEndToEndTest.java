@@ -91,6 +91,10 @@ class CurrentPipelineEndToEndTest {
     EmbeddingService embeddings;
     @Autowired
     ContentHashIndex hashIndex;
+    @Autowired
+    ReconcileService reconcile;
+    @Autowired
+    io.vectorsync.worker.service.iceberg.IncrementalChangeDetector detector;
 
     @MockitoBean
     DerivationControlClient control;
@@ -324,8 +328,8 @@ class CurrentPipelineEndToEndTest {
     }
 
     @Test
-    @DisplayName("what this pipeline cannot do: a deleted source row stays retrievable")
-    void deletedRowsStayServable() {
+    @DisplayName("a deleted source row is swept out of serving")
+    void deletedRowsAreReconciled() {
         appendSource(List.<String[]>of(
                 new String[]{"p-100", "Trail Runner", "Lightweight shoe for rocky mountain trails"},
                 new String[]{"p-200", "Espresso Machine", "Pulls a double shot in twenty seconds"}));
@@ -348,17 +352,84 @@ class CurrentPipelineEndToEndTest {
         appendSource(List.<String[]>of(
                 new String[]{"p-200", "Espresso Machine", "Pulls a double shot in twenty seconds"}));
 
-        // No reconcile exists, so the projection is not rebuilt from the delete and p-100 is still
-        // served. This test documents the gap deliberately rather than leaving it to be discovered:
-        // it is the one capability the LEGACY pipeline has and this one does not, and it is the
-        // reason the legacy path cannot simply be deleted.
+        // This assertion used to be the inverse: it asserted p-100 stayed retrievable, and said
+        // that if it ever failed the reconcile had landed and the test should be inverted. It has,
+        // so it is.
+        var version = detectorVersion();
+        ReconcileService.SweepResult swept = reconcile.sweep(
+                spec, config(), version[0], version[1], System.currentTimeMillis());
+
+        assertTrue(swept.complete(), "the sweep refused: " + swept.note());
+        assertEquals(1, swept.tombstoned(),
+                "expected exactly p-100 to be retired, not " + swept.tombstoned()
+                        + " rows -- over-tombstoning here retires live serving data");
+        assertEquals(1, swept.keysPresent(), "the source should still hold one key");
+
         ProjectionBuilder.build(catalogService.getCatalog(), NAMESPACE, spec);
-        assertEquals(List.of("p-100"),
+
+        assertEquals(1, projectionRowCount(), "the tombstoned row is still in the projection");
+        assertEquals(List.of("p-200"),
                 topK(canonical("Trail Runner", "Lightweight shoe for rocky mountain trails"), 1),
-                "if this now fails, delete reconciliation has been implemented and this test "
-                        + "should be inverted to assert the row is gone");
-        assertFalse(projectionRowCount() < 2,
-                "the projection shrank, which would mean deletes are being applied somewhere");
+                "a query for the deleted row's own text still returns it, so serving is stale");
+    }
+
+    /** {@code {snapshotId, sequenceNumber}} of the source's current version. */
+    private long[] detectorVersion() {
+        var v = detector.currentVersion(config());
+        return new long[]{v.snapshotId(), v.sequenceNumber()};
+    }
+
+    @Test
+    @DisplayName("a sweep over an unchanged source tombstones nothing")
+    void sweepIsANoOpWhenNothingVanished() {
+        appendSource(List.<String[]>of(
+                new String[]{"p-100", "Trail Runner", "Lightweight shoe for rocky mountain trails"},
+                new String[]{"p-200", "Espresso Machine", "Pulls a double shot in twenty seconds"}));
+        MaterializationSpec spec = spec();
+        orchestration.backfill(spec, config(), System.currentTimeMillis());
+        ProjectionBuilder.build(catalogService.getCatalog(), NAMESPACE, spec);
+
+        var version = detectorVersion();
+        ReconcileService.SweepResult swept = reconcile.sweep(
+                spec, config(), version[0], version[1], System.currentTimeMillis());
+
+        // The safety property that matters more than the feature: a sweep that runs when nothing was
+        // deleted must be inert. If this ever tombstones anything, every reconcile silently retires
+        // live rows.
+        assertTrue(swept.complete());
+        assertEquals(0, swept.tombstoned(), "a no-op sweep retired rows: " + swept.note());
+        assertEquals(2, projectionRowCount());
+        assertEquals(List.of("p-100"),
+                topK(canonical("Trail Runner", "Lightweight shoe for rocky mountain trails"), 1));
+    }
+
+    @Test
+    @DisplayName("a sweep that would retire every row refuses instead")
+    void sweepRefusesToEmptyTheScope() {
+        appendSource(List.<String[]>of(
+                new String[]{"p-100", "Trail Runner", "Lightweight shoe for rocky mountain trails"},
+                new String[]{"p-200", "Espresso Machine", "Pulls a double shot in twenty seconds"}));
+        MaterializationSpec spec = spec();
+        orchestration.backfill(spec, config(), System.currentTimeMillis());
+        ProjectionBuilder.build(catalogService.getCatalog(), NAMESPACE, spec);
+
+        // Every row gone. An empty present-set is far more often a key projection that read nothing
+        // -- a renamed column, an unreadable snapshot, a spec aimed at the wrong table -- than a
+        // genuinely emptied table, and being wrong retires an entire materialization's serving data.
+        Table source = catalogService.getCatalog()
+                .loadTable(TableIdentifier.of(Namespace.of("default"), "e2e_products"));
+        source.newDelete()
+                .deleteFromRowFilter(org.apache.iceberg.expressions.Expressions.alwaysTrue())
+                .commit();
+
+        var version = detectorVersion();
+        ReconcileService.SweepResult swept = reconcile.sweep(
+                spec, config(), version[0], version[1], System.currentTimeMillis());
+
+        assertFalse(swept.complete(), "an all-rows sweep was allowed to proceed");
+        assertEquals(0, swept.tombstoned());
+        assertEquals(2, projectionRowCount(), "serving data was retired despite the refusal");
+        assertTrue(swept.note().contains("refusing"), swept.note());
     }
 
     // ------------------------------------------------------- update / merge behaviour

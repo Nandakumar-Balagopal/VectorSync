@@ -449,6 +449,17 @@ public class DeriveService {
      * {@code id} and threw otherwise, which excluded every join table and every natural-key table
      * in the warehouse.
      */
+    /**
+     * The row id this spec would assign to a source row.
+     *
+     * <p>Exposed for the reconcile sweep, which has to compare the keys a source still holds
+     * against the keys the content map lists live -- and both sides must be computed by the same
+     * function or the comparison finds differences that are only a difference of spelling.
+     */
+    public String rowIdOf(MaterializationSpec spec, Record row) {
+        return rowId(spec, row);
+    }
+
     private String rowId(MaterializationSpec spec, Record row) {
         List<String> keyValues = new ArrayList<>(spec.getKeyColumns().size());
         for (String column : spec.getKeyColumns()) {
