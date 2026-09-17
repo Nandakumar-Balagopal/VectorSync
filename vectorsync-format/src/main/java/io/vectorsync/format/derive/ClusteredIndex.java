@@ -4,8 +4,11 @@ import io.vectorsync.common.Constants;
 import io.vectorsync.format.catalog.Namespaces;
 import io.vectorsync.format.io.IcebergAppender;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.OverwriteFiles;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
@@ -14,6 +17,7 @@ import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
+import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.types.Types;
@@ -168,17 +172,174 @@ public final class ClusteredIndex {
         }
     }
 
+    /**
+     * Drops the whole clustered table, purging its data files.
+     *
+     * <p>An operator primitive, not a rebuild primitive, and the distinction cost this index its
+     * data. {@code purge = true} physically deletes every data file, and the table holds every
+     * scope: one table serves all {@code (model_version, config_id)} pairs derived from a source
+     * table, because scope is a partition and not a table boundary. A rebuild that reached for this
+     * therefore deleted the rows of every other scope as a side effect, and deleted them before the
+     * replacement rows had been written. {@link #replaceScope} is what a rebuild wants.
+     */
     public static boolean drop(Catalog catalog, String namespace, String sourceTable) {
         return catalog.dropTable(identifier(namespace, sourceTable), true);
     }
 
     // ---------------------------------------------------------------- writes
 
+    /**
+     * Appends entries in their own commit, removing nothing.
+     *
+     * <p>Add-only, and so not usable for a rebuild: refitting centroids relabels every vector, so a
+     * second generation appended over the first leaves each vector present under both its old and
+     * its new cluster id and the probe scores a mixture of two assignments. {@link #replaceScope}
+     * exists for that case.
+     */
     public static void append(Table table, Collection<Entry> entries) {
         if (entries.isEmpty()) {
             return;
         }
+        IcebergAppender.append(table, toRecords(table.schema(), entries));
+    }
+
+    /**
+     * Replaces one scope's rows in a single snapshot: the row filter deletes what
+     * {@code (model_version, config_id)} held and the new data files land in the same commit, so a
+     * reader sees the old generation or the new one and never a half-built mixture.
+     *
+     * <p>This replaces a drop-and-append that destroyed data two different ways. The drop was
+     * {@code dropTable(purge = true)}, issued after the centroids had been committed and before the
+     * new rows were written, so any failure in that window had already physically deleted every
+     * data file of the index with nothing left to recover from. And the drop was per <em>table</em>
+     * while the contents are per <em>scope</em>: rebuilding {@code (m1, c1)} purged the rows of
+     * {@code (m2, c2)} in the same clustered table while their centroids survived in
+     * {@code vector_centroids}, so a probe against the purged scope ranked the query against live
+     * centroids, read partitions that no longer had files, and returned nothing without erroring.
+     *
+     * <p>The filter names only {@code model_version} and {@code config_id}, which is load-bearing
+     * rather than incidental. Iceberg deletes whole files by row filter and refuses -- "Cannot
+     * delete file where some, but not all, rows match the filter" -- when it cannot prove a filter
+     * covers an entire file, and both of these are identity partition fields so the projection is
+     * provable. {@code cluster_id} is an identity field too, but it cannot be used to narrow this:
+     * a filter on the clusters the new assignment happens to produce would leave every other
+     * cluster of the old generation in place.
+     *
+     * <p>The conflict validation below is not optional bookkeeping. Iceberg's overwrite conflict
+     * checks are opt-in, and without them a concurrent append into this scope is deleted by this
+     * overwrite silently -- the commit succeeds, no exception is raised, and the rows are gone.
+     *
+     * <p>Passing no entries retires the scope: the delete still happens and the scope is left
+     * empty. The guard against emptying a scope that is serving lives where the vectors are read,
+     * in {@code ClusterIndexService.build}, because only the caller can tell an empty source from
+     * an unreadable one.
+     */
+    public static void replaceScope(Table table,
+                                    String modelVersion,
+                                    String configId,
+                                    Collection<Entry> entries) {
+        // Read before the write, so conflict detection covers exactly the commits that landed while
+        // this rebuild was running. Leaving the starting snapshot unset makes Iceberg validate every
+        // ancestor instead, which reports this scope's own previous generation as a conflict and
+        // fails every rebuild after the first.
+        Snapshot base = table.currentSnapshot();
+        List<DataFile> dataFiles =
+                IcebergAppender.writeFiles(table, toRecords(table.schema(), entries));
+
+        commitScopeReplacement(table, modelVersion, configId, dataFiles, base);
+        log.info("Replaced scope {} / {} in {}: {} vectors in {} data files",
+                modelVersion, configId, table.name(), entries.size(), dataFiles.size());
+    }
+
+    /**
+     * Replaces one scope's centroids in a single snapshot, so at most one centroid generation per
+     * scope exists on disk.
+     *
+     * <p>The predecessor only ever appended, and nothing deleted, so after one rebuild the table
+     * held two fitted generations for the same scope. That did not surface as an error:
+     * {@link #readCentroids} keys by cluster id, so the two generations collapsed into one list of
+     * {@code k} centroids drawn arbitrarily from two different k-means solutions. The probe then
+     * ranked the query against centroids that did not describe the assignment on disk and selected
+     * cluster ids accordingly -- wrong neighbours, exactly scored, with no signal that anything had
+     * happened.
+     *
+     * <p>The filter is the same {@code (model_version, config_id)} pair as for the data table, and
+     * for the same reason: {@link #centroidsPartitionSpec} makes both identity partition fields, so
+     * the delete is provably whole-file. {@code cluster_id} is a plain column here, not a partition
+     * field, so naming it in the filter would fail at commit time.
+     */
+    public static void replaceCentroids(Table table,
+                                        String modelVersion,
+                                        String configId,
+                                        List<float[]> centroids) {
+        Snapshot base = table.currentSnapshot();
         Schema schema = table.schema();
+        List<Record> records = new ArrayList<>(centroids.size());
+        for (int cluster = 0; cluster < centroids.size(); cluster++) {
+            GenericRecord record = GenericRecord.create(schema);
+            record.setField(Constants.MODEL_VERSION_COLUMN, modelVersion);
+            record.setField(Constants.CONFIG_ID_COLUMN, configId);
+            record.setField(CLUSTER_ID_COLUMN, cluster);
+            record.setField(CENTROID_COLUMN, toList(centroids.get(cluster)));
+            records.add(record);
+        }
+
+        List<DataFile> dataFiles = IcebergAppender.writeFiles(table, records);
+        commitScopeReplacement(table, modelVersion, configId, dataFiles, base);
+        log.info("Replaced {} centroids for {} / {}", centroids.size(), modelVersion, configId);
+    }
+
+    /**
+     * The one commit both replacements make.
+     *
+     * <p>Modelled on {@code ProjectionBuilder.commitReplacement}, with conflict validation added.
+     * Iceberg's commit retry resolves two writers in <em>different</em> scopes on its own, because
+     * their row filters are disjoint. What it cannot resolve is a writer in the <em>same</em> scope:
+     * a concurrent {@link #append} or a second rebuild lands files this overwrite's filter covers,
+     * and Iceberg's default behaviour is to delete them and report success. So the commit fails
+     * instead, and the caller rebuilds against the state that actually won.
+     */
+    private static void commitScopeReplacement(Table table,
+                                               String modelVersion,
+                                               String configId,
+                                               List<DataFile> dataFiles,
+                                               Snapshot base) {
+        Expression scope = scopeFilter(modelVersion, configId);
+
+        OverwriteFiles overwrite = table.newOverwrite().overwriteByRowFilter(scope);
+        dataFiles.forEach(overwrite::addFile);
+        if (!dataFiles.isEmpty()) {
+            // Catches a row written under the wrong partition values before it becomes a file that
+            // the next rebuild's filter cannot delete. Enabled only when files were added: the
+            // validation reads the spec of the added files, so on a pure delete (retiring a scope)
+            // it fails with "Cannot determine partition spec".
+            overwrite.validateAddedFilesMatchOverwriteFilter();
+        }
+
+        // validateNoConflictingData is what turns the check on; setting the filter alone validates
+        // nothing. The filter is passed explicitly rather than left to default to the row filter so
+        // that the two cannot drift apart later, since the set of rows this commit removes and the
+        // set a concurrent writer must not have added are the same set by construction.
+        overwrite.conflictDetectionFilter(scope);
+        overwrite.validateNoConflictingData();
+        if (base != null) {
+            overwrite.validateFromSnapshot(base.snapshotId());
+        }
+
+        overwrite.commit();
+    }
+
+    /**
+     * The scope predicate. Identity partition fields only, in both tables, which is what makes the
+     * delete whole-file provable in one and the same expression usable for the other.
+     */
+    private static Expression scopeFilter(String modelVersion, String configId) {
+        return Expressions.and(
+                Expressions.equal(Constants.MODEL_VERSION_COLUMN, modelVersion),
+                Expressions.equal(Constants.CONFIG_ID_COLUMN, configId));
+    }
+
+    private static List<Record> toRecords(Schema schema, Collection<Entry> entries) {
         List<Record> records = new ArrayList<>(entries.size());
         for (Entry entry : entries) {
             GenericRecord record = GenericRecord.create(schema);
@@ -191,29 +352,19 @@ public final class ClusteredIndex {
             record.setField(Constants.TEXT_COLUMN, entry.text());
             records.add(record);
         }
-        IcebergAppender.append(table, records);
-    }
-
-    public static void appendCentroids(Table table,
-                                       String modelVersion,
-                                       String configId,
-                                       List<float[]> centroids) {
-        Schema schema = table.schema();
-        List<Record> records = new ArrayList<>(centroids.size());
-        for (int cluster = 0; cluster < centroids.size(); cluster++) {
-            GenericRecord record = GenericRecord.create(schema);
-            record.setField(Constants.MODEL_VERSION_COLUMN, modelVersion);
-            record.setField(Constants.CONFIG_ID_COLUMN, configId);
-            record.setField(CLUSTER_ID_COLUMN, cluster);
-            record.setField(CENTROID_COLUMN, toList(centroids.get(cluster)));
-            records.add(record);
-        }
-        IcebergAppender.append(table, records);
+        return records;
     }
 
     // ---------------------------------------------------------------- reads
 
-    /** Centroids for one scope, indexed by cluster id. */
+    /**
+     * Centroids for one scope, indexed by cluster id.
+     *
+     * <p>Keying by cluster id assumes one generation per scope, which is what
+     * {@link #replaceCentroids} guarantees. It is also why the two-generation bug it fixed was
+     * invisible: with two fits on disk this returns {@code k} centroids either way, just half of
+     * them from a solution the rows were never assigned against.
+     */
     public static List<float[]> readCentroids(Table table, String modelVersion, String configId) {
         Map<Integer, float[]> byCluster = new HashMap<>();
         try (CloseableIterable<Record> rows = IcebergGenerics.read(table)

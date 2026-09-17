@@ -125,6 +125,29 @@ property a row-keyed design and a vector database both lack.
 The `dup00` row is the control: every row distinct, nothing to reuse, so the design wins nothing and
 pays full price. Reporting only `dup95` would be advocacy.
 
+### The same measurement on real corpora
+
+The sweep above sets duplication as a parameter. These two corpora came as they are — BEIR
+documents, unedited, measured by `bench/real.py` (full numbers in `docs/DEMO.md`):
+
+| corpus | documents | distinct content | dedup savings |
+|---|---|---|---|
+| NFCorpus | 3,633 | 3,593 | **1.1%** |
+| FiQA (20,000-post sample) | 20,000 | 20,000 | **0.00%** |
+
+**Dedup savings are a property of the workload, not of the system.** A warehouse table with
+repeated product descriptions, shared boilerplate, revisions of the same document, or the same
+content registered from several tables gets the sweep's numbers. A curated IR corpus is near-unique
+by construction and gets nothing — NFCorpus's 1.1% is 40 documents out of 3,633 whose text was
+already embedded, and FiQA had not one. On such a corpus the value here is the incremental and
+reproducibility machinery: knowing which source snapshot and model revision produced each vector,
+and re-deriving only what changed.
+
+The Tier-1 embedding store is partitioned by `model_version`, which is the dimension a reader
+actually prunes on — a model migration reads only its own partition. A dedup probe is not served by
+partition pruning at all but by `ContentHashIndex`, for the reason measured below: content hashes are
+uniformly distributed, so no hash-derived partitioning prunes a multi-hundred-hash batch.
+
 ### Incremental passes
 
 One table, appends only, measured by `bench/incremental.py`:
@@ -285,3 +308,17 @@ Stated plainly rather than implied:
   file paths, so compaction is safe when it arrives.
 - **Branch/tag publish** is designed but not built; promotion still uses the alias table.
 - **No exporter yet.** The highest-value next integration.
+- **No authentication on any HTTP endpoint.** The deployment posture is trusted-network-only; see
+  [SECURITY.md](SECURITY.md).
+
+---
+
+## License and contributing
+
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The patent grant in section 3 is the
+reason: the stated ambition includes proposing a vector index specification to the Apache Iceberg
+community, and that contribution path is effectively closed under anything else.
+
+Build and test commands, the Docker/Colima setup the Testcontainers tests need, and the comment
+convention this codebase is strict about are in [CONTRIBUTING.md](CONTRIBUTING.md). Vulnerability
+reports go through [SECURITY.md](SECURITY.md).

@@ -208,7 +208,11 @@ public final class ContentMap {
         log.debug("Appended {} content map entries", records.size());
     }
 
-    /** The current mapping: one entry per live chunk, tombstoned chunks removed. */
+    /**
+     * The current mapping: one entry per live chunk, tombstoned chunks removed.
+     *
+     * <p>The returned order is unspecified; see {@link #liveEntriesAsOf}.
+     */
     public static List<ContentMapEntry> liveEntries(Table table, String sourceTable, String configId) {
         return liveEntriesAsOf(table, sourceTable, configId, Long.MAX_VALUE);
     }
@@ -219,6 +223,11 @@ public final class ContentMap {
      * the same target version always resolve to the same content hashes.
      *
      * <p>Takes a sequence number, not a snapshot id, because only sequence numbers are ordered.
+     *
+     * <p>The order of the returned list is unspecified and callers must not depend on it. It
+     * follows whatever order the scan happens to hand rows back in, which Iceberg is free to change
+     * with file layout, split planning, or a compaction. Callers that need an order impose one --
+     * {@link ProjectionBuilder} sorts by content hash for its own reasons.
      */
     public static List<ContentMapEntry> liveEntriesAsOf(Table table,
                                                         String sourceTable,
@@ -240,31 +249,45 @@ public final class ContentMap {
                     Constants.SOURCE_SEQUENCE_NUMBER_COLUMN, asOfSourceSequenceNumber));
         }
 
-        List<ContentMapEntry> history = new ArrayList<>();
+        // History collapses while the scan streams, keeping only the current winner per chunk key.
+        // The predecessor materialized every version of every row into a list and sorted it before
+        // collapsing, which made peak heap proportional to how long the table had existed rather
+        // than to how much of it is live -- the append-only design guarantees the first number grows
+        // without bound. That is the measured OOM in this system: a 100M-row table at three chunks
+        // per row holds on the order of 120 GB of entries before the first one can be discarded.
+        // Peak is now O(live chunks).
+        Map<String, ContentMapEntry> newestByChunk = new LinkedHashMap<>();
         try (CloseableIterable<Record> rows = IcebergGenerics.read(table)
                 .where(filter)
                 .build()) {
 
             for (Record row : rows) {
-                history.add(fromRecord(row));
+                ContentMapEntry candidate = fromRecord(row);
+                // Same winner as sorting OLDEST_FIRST and overwriting into a map: the candidate
+                // replaces the incumbent whenever it is not strictly older. The <= is what keeps
+                // ties resolving as they did -- a stable sort left equal entries in scan order, so
+                // the last one encountered won, and it still does. Comparing on the full
+                // OLDEST_FIRST ordering rather than on the sequence number alone matters for the
+                // same reason: the two tiebreakers decide which of two materializations of one
+                // source version is current.
+                newestByChunk.merge(candidate.chunkKey(), candidate,
+                        (incumbent, next) -> OLDEST_FIRST.compare(incumbent, next) <= 0 ? next : incumbent);
             }
         } catch (Exception e) {
             throw new IllegalStateException(String.format(
                     "Failed to read content map for %s / %s", sourceTable, configId), e);
         }
 
-        // Sorting oldest-first and overwriting into a map is how history collapses: the last write
-        // per chunk key is by definition the newest entry for that chunk.
-        Map<String, ContentMapEntry> newestByChunk = new LinkedHashMap<>();
-        history.stream()
-                .sorted(OLDEST_FIRST)
-                .forEach(entry -> newestByChunk.put(entry.chunkKey(), entry));
-
-        // Tombstones are dropped only after resolution. Filtering them out earlier would let an
+        // Tombstones are dropped only after resolution, which is why they are merge candidates
+        // above instead of being skipped during the scan. Filtering them out earlier would let an
         // older live entry win and resurrect a deleted row.
-        return newestByChunk.values().stream()
-                .filter(ContentMapEntry::isLive)
-                .toList();
+        List<ContentMapEntry> live = new ArrayList<>(newestByChunk.size());
+        for (ContentMapEntry entry : newestByChunk.values()) {
+            if (entry.isLive()) {
+                live.add(entry);
+            }
+        }
+        return List.copyOf(live);
     }
 
     /**
