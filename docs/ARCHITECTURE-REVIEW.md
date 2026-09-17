@@ -570,6 +570,57 @@ which predates even v3 stability (1.11.0, May 2026).
 
 ---
 
+## 18b. Implemented since this review: content-addressed index identity
+
+Three mechanisms landed after the sections above were written, and they change what §12, §13 and
+§19 say is true. Recorded here rather than by editing those sections, so the original assessment
+and what was done about it stay separable.
+
+**The clustered index is identified by the content it covers, not by a source snapshot.** A scope
+records a coverage digest — SHA-256 over the sorted distinct content hashes it was built from — in
+`vector_index_coverage`, partitioned by `(model_version, config_id)` and replaced with the same
+scoped overwrite the rows and centroids use. A build recomputes the digest and, when it matches,
+returns without refitting and without committing.
+
+The consequence is the only claim here that the surveyed prior art does not obviously cover.
+Compaction, `rewrite_data_files`, a sort reorganisation and a partition rewrite all produce a new
+Iceberg snapshot and change no content, so all of them leave the digest identical and the existing
+index provably still correct. Those are routine scheduled lakehouse maintenance. A per-file index
+(the 2026 per-file IVF work) or a snapshot-keyed index must rebuild for every one of them — and so
+must this repository's own legacy HNSW path, because `VectorIds.indexId` takes `sourceSnapshotId`,
+which makes one index valid for exactly one snapshot by construction. That asymmetry is now internal
+to the repo and should be resolved by retiring the legacy path rather than by re-keying it.
+
+The digest is order-independent and duplicate-insensitive, and both properties are load-bearing:
+scan order is a property of a scan rather than of the data, and two derive passes writing the same
+content legitimately leave two rows for one hash in an append-only store. If the digest responded to
+either, a layout-only rewrite would change it and the mechanism would be inert.
+
+**Added content is appended against the existing centroids rather than refitting.** Nothing is
+relabelled, so no vector can appear under two cluster ids — the failure `ClusteredIndex.append`'s
+javadoc warns about for a rebuild does not apply when the centroids are not moving. Three
+conditions gate it, and two are constraints rather than preferences: nothing may have been removed,
+because `content_hash` is not a partition field of the clustered table and Iceberg refuses a row
+filter it cannot prove covers whole files; centroids must already exist; and growth is bounded at a
+fraction of the scope, because each append assigns against centroids fitted over older content and
+that drift compounds. The drift costs recall and not correctness, since whatever the probe reads is
+still scored exactly.
+
+**DEGRADED is recoverable.** §12 recorded that it was a one-way door. `resume` now accepts a
+DEGRADED materialization and re-anchors it: the anchor moves to the source's current snapshot, the
+watermark resets, and the planner treats it as a fresh backfill. Re-anchoring rather than merely
+clearing the state is the substance — the anchor was written once at admission and never advanced,
+so clearing alone would re-degrade on the next cycle against the same range. What it costs is a
+replan; what it does not cost is inference, because every hash the store has seen resolves on the
+dedup probe.
+
+The gap that remains is the one §12 identifies: the anchor jump skips the range that degraded the
+materialization without tombstoning anything in it, so rows deleted in that window keep serving
+stale vectors. The error is therefore preserved and annotated rather than cleared, so an operator
+knows a range was skipped.
+
+---
+
 ## 19. What is actually novel — corrected
 
 I previously told you the content-addressed two-table design was something "nobody else offers."
