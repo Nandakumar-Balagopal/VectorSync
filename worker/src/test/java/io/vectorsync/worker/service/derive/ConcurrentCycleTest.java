@@ -73,7 +73,8 @@ class ConcurrentCycleTest {
     private MaterializationRunner runner(int parallelism, String catalogType) {
         when(catalogConfig.type()).thenReturn(catalogType);
         MaterializationRunner runner = new MaterializationRunner(
-                control, detector, deriveService, catalogService, hashIndex, metrics);
+                control, detector, deriveService, catalogService, hashIndex, metrics,
+                Mockito.mock(ReconcileService.class));
         ReflectionTestUtils.setField(runner, "parallelism", parallelism);
         ReflectionTestUtils.setField(runner, "configuredOwner", "test-owner");
         ReflectionTestUtils.setField(runner, "leaseBatch", 8);
@@ -81,6 +82,7 @@ class ConcurrentCycleTest {
         ReflectionTestUtils.setField(runner, "maxBatchesPerCycle", 32);
         ReflectionTestUtils.setField(runner, "vectorNamespace", "vector");
         ReflectionTestUtils.setField(runner, "publishProjection", false);
+        ReflectionTestUtils.setField(runner, "reconcileEnabled", false);
         return runner;
     }
 

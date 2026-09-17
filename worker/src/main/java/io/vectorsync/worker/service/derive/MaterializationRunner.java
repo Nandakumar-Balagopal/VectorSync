@@ -56,6 +56,7 @@ public class MaterializationRunner {
     private final IcebergCatalogService catalogService;
     private final ContentHashIndex hashIndex;
     private final DeriveMetricsRegistry metrics;
+    private final ReconcileService reconcileService;
 
     /**
      * Lease owner. Defaults to host and pid rather than a constant, because the fence in the queue
@@ -157,18 +158,31 @@ public class MaterializationRunner {
     @Value("${vectorsync.runner.publish-projection:true}")
     private boolean publishProjection;
 
+    /**
+     * Whether a range containing deletes or overwrites is reconciled automatically.
+     *
+     * <p>On by default, because the alternative is the materialization stopping. The refusal it
+     * replaces was correct but terminal, and a reconcile that is correct is strictly better than a
+     * halt an operator has to notice. A deployment that would rather be told than repaired can turn
+     * it off and get the old behaviour exactly.
+     */
+    @Value("${vectorsync.runner.reconcile-enabled:true}")
+    private boolean reconcileEnabled;
+
     public MaterializationRunner(DerivationControlClient control,
                                  IncrementalChangeDetector detector,
                                  DeriveService deriveService,
                                  IcebergCatalogService catalogService,
                                  ContentHashIndex hashIndex,
-                                 DeriveMetricsRegistry metrics) {
+                                 DeriveMetricsRegistry metrics,
+                                 ReconcileService reconcileService) {
         this.control = control;
         this.detector = detector;
         this.deriveService = deriveService;
         this.catalogService = catalogService;
         this.hashIndex = hashIndex;
         this.metrics = metrics;
+        this.reconcileService = reconcileService;
     }
 
     public record CycleReport(int materializationsSeen,
@@ -356,6 +370,9 @@ public class MaterializationRunner {
         IncrementalChangeDetector.ScanAssessment assessment =
                 detector.assess(config, materialization.getAnchorSnapshotId(), current.snapshotId());
         if (!assessment.incrementalSafe()) {
+            if (assessment.reconcileRequired() && reconcileEnabled) {
+                return reconcile(materialization, spec, config, current);
+            }
             log.warn("Materialization {} needs a reconcile: {}", materialization.getId(),
                     assessment.verdict());
             control.markDegraded(materialization.getId(),
@@ -367,6 +384,68 @@ public class MaterializationRunner {
         List<SourceFileWork> work = detector.incrementalWork(
                 config, materialization.getAnchorSnapshotId(), current.snapshotId());
         return control.enqueue(materialization.getId(), work, "INCREMENTAL");
+    }
+
+    /**
+     * Repairs a range an append scan cannot describe: re-derive the source at the new version, then
+     * sweep away whatever no longer exists.
+     *
+     * <p><b>Why this is one operation and not two steps.</b> The obvious shape -- enqueue the files,
+     * let {@code drain} process them, then sweep in {@code publish} -- cannot be made safe here, and
+     * the reason is worth stating because it is not obvious. {@code publish} begins
+     * {@code if (processedThisCycle == 0 && live) return false;}, and {@code enqueue} is idempotent
+     * on {@code (materializationId, dataFilePath, snapshotId)} <em>including rows already DONE</em>.
+     * So a crash between the derive and the sweep leaves a cycle that enqueues nothing, drains
+     * nothing, and returns before sweeping -- permanently. The materialization would read LIVE and
+     * healthy while serving deleted rows, which is strictly worse than the loud refusal this
+     * replaces.
+     *
+     * <p>So the sweep runs here, in the same call that did the derive, before anything advances. If
+     * this method throws or the sweep refuses, no watermark moves and the range is re-assessed next
+     * cycle -- the same range, with the same verdict, arriving here again. Failure is a retry rather
+     * than a gap.
+     *
+     * <p>The sweep is deliberately ordered after the derive. A row that was rewritten rather than
+     * removed must already have its new content-map version committed before the sweep asks which
+     * keys exist, or the sweep and the derive would disagree about the same row.
+     *
+     * @return files enqueued, so the caller's accounting is unchanged
+     */
+    private int reconcile(Materialization materialization,
+                          MaterializationSpec spec,
+                          TableConfig config,
+                          IncrementalChangeDetector.SourceVersion target) {
+        log.info("Materialization {} reconciling to snapshot {} (sequence {})",
+                materialization.getId(), target.snapshotId(), target.sequenceNumber());
+
+        // Pinned to the target version, not "current". The re-derive and the sweep have to describe
+        // the same source version or a commit landing between them tombstones rows the derive never
+        // looked at.
+        List<SourceFileWork> work = detector.backfillWork(config, target.snapshotId());
+        int enqueued = control.enqueue(materialization.getId(), work, "BACKFILL");
+
+        int[] drained = drain(materialization);
+        if (drained[1] > 0) {
+            control.markDegraded(materialization.getId(),
+                    drained[1] + " files failed during a reconcile; the sweep was not attempted "
+                            + "because tombstoning against a partial re-derive would retire rows "
+                            + "whose new version had not been written");
+            return enqueued;
+        }
+
+        ReconcileService.SweepResult swept = reconcileService.sweep(
+                spec, config, target.snapshotId(), target.sequenceNumber(),
+                System.currentTimeMillis());
+
+        if (!swept.complete()) {
+            log.warn("Materialization {} sweep refused: {}", materialization.getId(), swept.note());
+            control.markDegraded(materialization.getId(), "reconcile sweep refused: " + swept.note());
+            return enqueued;
+        }
+
+        log.info("Materialization {} reconciled: {} of {} mapped rows retired",
+                materialization.getId(), swept.tombstoned(), swept.liveBefore());
+        return enqueued;
     }
 
     /** @return {processed, failed} */

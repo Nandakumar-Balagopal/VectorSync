@@ -110,7 +110,13 @@ public class DerivationControlClient {
         return runnable;
     }
 
-    private List<Materialization> list(String state) {
+    /**
+     * Materializations in one state.
+     *
+     * <p>Public for the cluster scheduler, which needs LIVE specifically rather than the union
+     * {@link #runnable()} returns -- a scope still backfilling has no settled content to cluster.
+     */
+    public List<Materialization> list(String state) {
         try {
             JsonNode body = restTemplate.exchange(
                     controlApiUrl + "/api/materializations?state=" + state,

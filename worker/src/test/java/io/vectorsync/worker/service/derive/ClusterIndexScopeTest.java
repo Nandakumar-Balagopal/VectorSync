@@ -511,4 +511,80 @@ class ClusterIndexScopeTest {
         assertEquals(3, indexedRows(),
                 "the removed content is still in the index, so the refit did not replace the scope");
     }
+
+    // ------------------------------------------------------- drift bound
+    //
+    // The incremental guard originally compared an append against the CURRENT index size, and that
+    // is self-defeating under steady growth: a scope growing a few percent per pass never exceeds
+    // the fraction, so every pass appends, centroids fitted over the original corpus are never
+    // refit, and the assignment drifts without bound. The guard written to prevent drift was
+    // exactly what permitted it. It now measures against the size at the last refit, which makes
+    // the comparison cumulative by construction.
+
+    @Test
+    @DisplayName("repeated small appends eventually force a refit rather than drifting forever")
+    void steadyGrowthEventuallyRefits() {
+        seed(0, 1, 2, 3);
+        ClusterIndexService.BuildReport first =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, 2);
+        assertFalse(first.incremental(), "the first build establishes the baseline");
+
+        // One content at a time over a baseline of four. Every single append is 25% or less of the
+        // CURRENT size at the moment it happens, so the old guard admitted all of them and never
+        // refit. Against the baseline, the second one crosses.
+        boolean refitted = false;
+        for (int ordinal = 4; ordinal < 9 && !refitted; ordinal++) {
+            seed(ordinal);
+            ClusterIndexService.BuildReport report =
+                    clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, 2);
+            if (!report.incremental() && !report.reused()) {
+                refitted = true;
+            }
+        }
+
+        assertTrue(refitted,
+                "five successive single-content appends over a baseline of four never triggered a "
+                        + "refit, so centroid drift is unbounded and the guard is measuring against "
+                        + "the current size rather than the last refit");
+    }
+
+    @Test
+    @DisplayName("a refit re-establishes the baseline, so growth is measured from there")
+    void refitResetsTheBaseline() {
+        seed(0, 1, 2, 3);
+        clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, 2);
+
+        // Double it, which forces a refit and should reset the baseline to 8.
+        seed(4, 5, 6, 7);
+        ClusterIndexService.BuildReport refit =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, 2);
+        assertFalse(refit.incremental(), "doubling should refit");
+
+        // One more content over a baseline of eight is well inside the fraction, so it must append.
+        // If the baseline had not been reset, this would still be measured against four and refit.
+        seed(8);
+        ClusterIndexService.BuildReport after =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, 2);
+        assertTrue(after.incremental(),
+                "the baseline was not reset by the refit, so a small append is still being "
+                        + "measured against the pre-refit size");
+        assertEquals(9, indexedRows());
+    }
+
+    @Test
+    @DisplayName("cluster count is sized from the corpus, not fixed")
+    void clusterCountFollowsCorpusSize() {
+        // sqrt(n), the standard IVF sizing heuristic. A fixed count cannot be right across corpus
+        // sizes, and being wrong is expensive rather than merely suboptimal: NFCorpus needed 53% of
+        // the table at 16 clusters for the quality it reached at 3.8% with 64.
+        assertEquals(1, ClusterIndexService.suggestedClusters(0));
+        assertEquals(1, ClusterIndexService.suggestedClusters(4));
+        assertEquals(10, ClusterIndexService.suggestedClusters(100));
+        assertEquals(100, ClusterIndexService.suggestedClusters(10_000));
+        // Near the corpus this project actually measured: sqrt(3593) is 60, against the 64 that
+        // measured well. Agreement on one corpus is encouraging, not proof it generalises.
+        assertEquals(60, ClusterIndexService.suggestedClusters(3_593));
+        // Capped, so a very large corpus cannot mint more partitions than a catalog wants to track.
+        assertEquals(4096, ClusterIndexService.suggestedClusters(1_000_000_000L));
+    }
 }

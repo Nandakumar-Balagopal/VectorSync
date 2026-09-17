@@ -65,6 +65,7 @@ public final class ClusteredIndex {
     public static final String CENTROID_COLUMN = "centroid";
     public static final String COVERAGE_DIGEST_COLUMN = "coverage_digest";
     public static final String COVERAGE_COUNT_COLUMN = "content_count";
+    public static final String REFIT_COUNT_COLUMN = "refit_content_count";
 
     private ClusteredIndex() {
     }
@@ -171,7 +172,22 @@ public final class ClusteredIndex {
                 // count says "how different", which is the first thing anyone asks.
                 Types.NestedField.required(4, COVERAGE_COUNT_COLUMN, Types.LongType.get()),
                 Types.NestedField.required(5, Constants.CREATED_AT_COLUMN,
-                        Types.TimestampType.withZone()));
+                        Types.TimestampType.withZone()),
+                // Distinct content at the last full refit, which is what bounds centroid drift.
+                //
+                // The obvious guard -- refuse an append larger than a fraction of the CURRENT index
+                // -- is self-defeating under steady growth, and shipped that way. A table growing a
+                // few percent per pass never exceeds the fraction, so every pass appends, centroids
+                // fitted over the original corpus are never refit, and the assignment drifts without
+                // bound. The guard written to prevent drift is exactly what permits it.
+                //
+                // Measured against a baseline instead, the comparison is cumulative by construction:
+                // no accumulator to keep in step with reality, and a scope that has doubled since its
+                // last refit is recognisable as such however many appends it took to get there.
+                // Optional at a new field id, so coverage rows written before this column existed
+                // read back as absent rather than as zero -- zero would force an immediate refit of
+                // every scope on upgrade.
+                Types.NestedField.optional(6, REFIT_COUNT_COLUMN, Types.LongType.get()));
     }
 
     public static PartitionSpec coveragePartitionSpec(Schema schema) {
@@ -379,8 +395,15 @@ public final class ClusteredIndex {
         return hashes;
     }
 
-    /** What a scope's index covers, as recorded at build time. */
-    public record Coverage(String digest, long contentCount) {
+    /**
+     * What a scope's index covers, as recorded at build time.
+     *
+     * @param refitContentCount distinct content at the last full refit, or empty for a coverage row
+     *                          written before that was tracked. Absent means "unknown", which
+     *                          callers must treat as "do not force a refit on this basis" rather
+     *                          than as zero.
+     */
+    public record Coverage(String digest, long contentCount, Optional<Long> refitContentCount) {
     }
 
     /**
@@ -401,8 +424,12 @@ public final class ClusteredIndex {
             for (Record row : rows) {
                 String digest = String.valueOf(row.getField(COVERAGE_DIGEST_COLUMN));
                 Object count = row.getField(COVERAGE_COUNT_COLUMN);
+                Object refit = row.getField(REFIT_COUNT_COLUMN);
                 return Optional.of(new Coverage(digest,
-                        count instanceof Number number ? number.longValue() : 0L));
+                        count instanceof Number number ? number.longValue() : 0L,
+                        refit instanceof Number refitNumber
+                                ? Optional.of(refitNumber.longValue())
+                                : Optional.empty()));
             }
         } catch (Exception e) {
             // Unreadable coverage must not be read as "matches". Reporting empty makes the caller
@@ -425,20 +452,22 @@ public final class ClusteredIndex {
                                        String modelVersion,
                                        String configId,
                                        String digest,
-                                       long contentCount) {
+                                       long contentCount,
+                                       long refitContentCount) {
         Snapshot base = table.currentSnapshot();
         GenericRecord record = GenericRecord.create(table.schema());
         record.setField(Constants.MODEL_VERSION_COLUMN, modelVersion);
         record.setField(Constants.CONFIG_ID_COLUMN, configId);
         record.setField(COVERAGE_DIGEST_COLUMN, digest);
         record.setField(COVERAGE_COUNT_COLUMN, contentCount);
+        record.setField(REFIT_COUNT_COLUMN, refitContentCount);
         record.setField(Constants.CREATED_AT_COLUMN,
                 OffsetDateTime.ofInstant(Instant.now(), ZoneOffset.UTC));
 
         List<DataFile> dataFiles = IcebergAppender.writeFiles(table, List.of(record));
         commitScopeReplacement(table, modelVersion, configId, dataFiles, base);
-        log.info("Recorded index coverage {} ({} contents) for {} / {}",
-                digest, contentCount, modelVersion, configId);
+        log.info("Recorded index coverage {} ({} contents, {} at last refit) for {} / {}",
+                digest, contentCount, refitContentCount, modelVersion, configId);
     }
 
     /**

@@ -169,6 +169,44 @@ public class ClusterIndexService {
      * candidates that are read are still scored exactly -- rather than pointing the probe at
      * partitions that hold no files.
      */
+    /**
+     * Clusters to fit for a corpus of {@code contentCount} distinct vectors.
+     *
+     * <p>The standard IVF sizing heuristic, {@code sqrt(n)}, because a fixed count cannot be right
+     * across corpus sizes and being wrong is expensive rather than merely suboptimal: NFCorpus at 16
+     * clusters needed 53% of the table for the same retrieval quality it reached at 3.8% with 64.
+     * An index that reads half the table prunes nothing while still costing a refit to maintain, so
+     * a scheduler using one fixed number would maintain an index worth less than no index.
+     *
+     * <p>Encouragingly the heuristic agrees with the measurement -- sqrt(3593) is 60, against the 64
+     * that measured well -- though one corpus agreeing is not evidence that it generalises, and the
+     * cluster-count sensitivity recorded in docs/DEMO.md still applies.
+     *
+     * <p>Floored at 2 because one cluster is a full scan with extra steps, and capped so a very
+     * large corpus cannot produce more partitions than a catalog wants to track.
+     */
+    /**
+     * Distinct content Tier 1 holds for a scope, or 0 when there is none.
+     *
+     * <p>Exposed for the scheduler, which has to size the cluster count from the corpus and has to
+     * know whether there is a corpus at all -- building over nothing would commit an empty scope and
+     * record coverage for it, which the next tick would read as up to date.
+     */
+    public long canonicalCount(String modelVersion, String configId) {
+        Table store = EmbeddingStore.loadIfExists(catalogService.getCatalog(), vectorNamespace);
+        if (store == null) {
+            return 0;
+        }
+        return countCanonical(store, modelVersion, configId).count();
+    }
+
+    public static int suggestedClusters(long contentCount) {
+        if (contentCount <= 4) {
+            return 1;
+        }
+        return (int) Math.max(2, Math.min(4096, Math.round(Math.sqrt((double) contentCount))));
+    }
+
     public BuildReport build(String sourceTable, String modelVersion, String configId, int clusters) {
         Table store = EmbeddingStore.loadIfExists(catalogService.getCatalog(), vectorNamespace);
         if (store == null) {
@@ -229,7 +267,8 @@ public class ClusterIndexService {
                 catalogService.getCatalog(), vectorNamespace, sourceTable);
 
         BuildReport incremental = tryIncrement(clusteredTable, coverageTable, sourceTable,
-                modelVersion, configId, canonical, hashes, coverageDigest);
+                modelVersion, configId, canonical, hashes, coverageDigest,
+                recorded.flatMap(ClusteredIndex.Coverage::refitContentCount));
         if (incremental != null) {
             return incremental;
         }
@@ -256,8 +295,9 @@ public class ClusterIndexService {
         // Last, deliberately. A coverage row that ran ahead of the rows and centroids it describes
         // would make the next build skip against an index that was never finished -- the same
         // ordering rule the derive path follows when it appends vectors before the pointers to them.
-        ClusteredIndex.replaceCoverage(
-                coverageTable, modelVersion, configId, coverageDigest, hashes.size());
+        // A refit re-establishes the baseline: the centroids now describe exactly this content.
+        ClusteredIndex.replaceCoverage(coverageTable, modelVersion, configId, coverageDigest,
+                hashes.size(), hashes.size());
 
         List<Integer> clusterSizes = new ArrayList<>(sizes.length);
         for (int size : sizes) {
@@ -319,7 +359,8 @@ public class ClusterIndexService {
                                      String configId,
                                      Canonical canonical,
                                      List<String> hashes,
-                                     String coverageDigest) {
+                                     String coverageDigest,
+                                     Optional<Long> recordedRefitCount) {
         List<float[]> centroids = ClusteredIndex.readCentroids(clusteredTable == null
                 ? null : ClusteredIndex.loadCentroidsOrCreate(
                         catalogService.getCatalog(), vectorNamespace), modelVersion, configId);
@@ -359,9 +400,21 @@ public class ClusterIndexService {
             // build. Refit rather than silently accept it.
             return null;
         }
-        if (added.size() > Math.max(1, (long) (indexed.size() * maxIncrementalFraction))) {
-            log.info("Scope {} / {} grew by {} over {} indexed, beyond the incremental fraction {}; refitting",
-                    modelVersion, configId, added.size(), indexed.size(), maxIncrementalFraction);
+        // Measured against the size at the last full refit, not against the current size. The
+        // latter is self-defeating under steady growth and shipped that way: a table growing a few
+        // percent per pass never exceeds the fraction, so every pass appends, the centroids fitted
+        // over the original corpus are never refit, and the assignment drifts without bound. The
+        // guard written to prevent drift was exactly what permitted it.
+        //
+        // An absent baseline means the coverage row predates this column. Treated as "unknown" and
+        // therefore permissive, because the alternative -- reading it as zero -- forces a full refit
+        // of every scope in the warehouse on upgrade.
+        long baseline = recordedRefitCount.orElse((long) indexed.size());
+        long ceiling = baseline + Math.max(1, (long) (baseline * maxIncrementalFraction));
+        if (hashes.size() > ceiling) {
+            log.info("Scope {} / {} holds {} contents against {} at its last refit, beyond the "
+                            + "incremental fraction {}; refitting rather than appending",
+                    modelVersion, configId, hashes.size(), baseline, maxIncrementalFraction);
             return null;
         }
 
@@ -379,8 +432,10 @@ public class ClusterIndexService {
         ClusteredIndex.append(clusteredTable, newEntries);
         // Centroids are deliberately left alone: they are what the appended rows were assigned
         // against, and rewriting them here would describe an assignment that is not on disk.
-        ClusteredIndex.replaceCoverage(
-                coverageTable, modelVersion, configId, coverageDigest, hashes.size());
+        // Baseline carried forward unchanged: this append did not refit, so the centroids still
+        // describe the corpus as it stood at the recorded count.
+        ClusteredIndex.replaceCoverage(coverageTable, modelVersion, configId, coverageDigest,
+                hashes.size(), baseline);
 
         String scope = scopeKey(modelVersion, configId);
         centroidCache.remove(scope);
