@@ -46,10 +46,6 @@ aws:
     path-style-access: ${AWS_S3_PATH_STYLE_ACCESS:true}
     region: ${AWS_REGION:}
 
-search:
-  use-hnsw-index: ${SEARCH_USE_HNSW_INDEX:true}
-  index-rebuild-threshold: ${SEARCH_INDEX_REBUILD_THRESHOLD:100}
-
 logging:
   level:
     root: ${LOG_LEVEL_ROOT:INFO}

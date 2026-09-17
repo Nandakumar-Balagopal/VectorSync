@@ -2,10 +2,13 @@ package io.vectorsync.worker.controller;
 
 import io.vectorsync.common.dto.TableConfig;
 import io.vectorsync.format.derive.MaterializationSpec;
+import io.vectorsync.format.derive.ProjectionBuilder;
+import io.vectorsync.format.derive.SqlViewGenerator;
 import io.vectorsync.worker.service.derive.DeriveMetricsRegistry;
 import io.vectorsync.worker.service.derive.DeriveOrchestrationService;
 import io.vectorsync.worker.service.derive.ProjectionReader;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -163,5 +166,53 @@ public class DeriveController {
             return ResponseEntity.internalServerError().body(Map.of(
                     "error", "Derive failed", "message", String.valueOf(e.getMessage())));
         }
+    }
+
+    /**
+     * The engine-side SQL that makes a projection queryable, for Trino or Spark.
+     *
+     * <p>This closes the gap between what this project claims and what it hands you. The thesis is
+     * that vectors are an open table queried by the engine you already run, with no VectorSync
+     * process in the query path -- and until now {@code SqlViewGenerator} had zero callers, so the
+     * generated DDL existed in the codebase and was reachable only by copying it out of a test.
+     * Every benchmark and every document that shows a Trino query was pasting SQL by hand.
+     *
+     * <p>The dimension is read from the projection rather than taken as a parameter, because it is
+     * the one value a caller cannot guess and must not get wrong: the emitted view carries a
+     * {@code cardinality(...)} guard, and Trino's {@code cosine_similarity} returns NULL rather than
+     * raising on a length mismatch, so a wrong width yields an all-NULL ranking that looks like a
+     * working query returning bad results.
+     *
+     * @param qualifier how far to qualify the table name for the target session, e.g.
+     *                  {@code iceberg.vectorsync}. Empty leaves it unqualified.
+     */
+    @GetMapping(value = "/view", produces = MediaType.TEXT_PLAIN_VALUE)
+    public ResponseEntity<String> view(@RequestParam String sourceTable,
+                                       @RequestParam String configId,
+                                       @RequestParam(defaultValue = "trino") String engine,
+                                       @RequestParam(defaultValue = "") String qualifier) {
+        int width = projections.dimension(sourceTable, configId);
+        if (width <= 0) {
+            return ResponseEntity.status(409).body(
+                    "No published projection for " + sourceTable + " / " + configId
+                            + ". Run a derivation pass before asking for its view.\n");
+        }
+
+        String table = ProjectionBuilder.tableName(sourceTable, configId);
+        String qualified = qualifier == null || qualifier.isBlank()
+                ? table
+                : qualifier.trim() + "." + table;
+
+        String normalised = engine == null ? "trino" : engine.trim().toLowerCase();
+        String ddl = switch (normalised) {
+            case "trino" -> SqlViewGenerator.trino(qualified, width);
+            case "spark" -> SqlViewGenerator.spark(qualified, width);
+            default -> null;
+        };
+        if (ddl == null) {
+            return ResponseEntity.badRequest().body(
+                    "Unknown engine '" + engine + "'; supported: trino, spark\n");
+        }
+        return ResponseEntity.ok(ddl);
     }
 }

@@ -176,9 +176,6 @@ services:
       EMBEDDING_EXTERNAL_HTTP_API_KEY_PREFIX: ${EMBEDDING_EXTERNAL_HTTP_API_KEY_PREFIX:-}
       EMBEDDING_EXTERNAL_HTTP_REQUEST_TEMPLATE: ${EMBEDDING_EXTERNAL_HTTP_REQUEST_TEMPLATE:-{"text":"__TEXT__","model_name":"__MODEL__","provider":"self_hosted"}}
       EMBEDDING_EXTERNAL_HTTP_RESPONSE_JSON_POINTER: ${EMBEDDING_EXTERNAL_HTTP_RESPONSE_JSON_POINTER:-/embedding}
-      SEARCH_DEFAULT_LIMIT: ${SEARCH_DEFAULT_LIMIT:-10}
-      SEARCH_MAX_LIMIT: ${SEARCH_MAX_LIMIT:-100}
-      SEARCH_MIN_SIMILARITY: ${SEARCH_MIN_SIMILARITY:-0.7}
     depends_on:
       control-plane:
         condition: service_healthy
@@ -198,9 +195,10 @@ services:
     container_name: vectorsync-dashboard
     ports:
       - "${DASHBOARD_HOST_PORT:-3000}:80"
-    environment:
-      REACT_APP_CONTROL_PLANE_URL: ${REACT_APP_CONTROL_PLANE_URL:-http://localhost:8080}
-      REACT_APP_SEARCH_SERVICE_URL: ${REACT_APP_SEARCH_SERVICE_URL:-http://localhost:8083}
+    # No environment block: the dashboard is served as static files by nginx, which proxies /api,
+    # /worker-api and /search-api same-origin, so it needs no service URLs at build or run time. The
+    # REACT_APP_* pair that used to be here was doubly dead -- nothing read it, and Vite only exposes
+    # VITE_* to client code in any case.
     depends_on:
       control-plane:
         condition: service_healthy

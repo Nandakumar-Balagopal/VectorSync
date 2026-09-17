@@ -89,4 +89,42 @@ public class ProjectionReader {
         }
         return rows;
     }
+
+    /**
+     * The vector width of a published projection, or 0 when it has not been built.
+     *
+     * <p>Separate from {@link #sample} rather than read out of it, for two reasons that both bite.
+     * {@code sample} stringifies every value for display, so the width would arrive as
+     * {@code "384"} and any numeric use of it is a parse waiting to be forgotten; and it throws when
+     * the projection is absent, which is right for a debugging endpoint and wrong for a caller whose
+     * job is to answer "is there one yet".
+     *
+     * <p>Read from one projected row rather than from the snapshot summary: the summary key is
+     * private to {@code ProjectionBuilder}, and a row is the value actually on disk rather than what
+     * the last commit claimed.
+     */
+    public int dimension(String sourceTable, String configId) {
+        org.apache.iceberg.catalog.TableIdentifier identifier =
+                ProjectionBuilder.identifier(vectorNamespace, sourceTable, configId);
+        if (!catalogService.getCatalog().tableExists(identifier)) {
+            return 0;
+        }
+
+        Table table = catalogService.getCatalog().loadTable(identifier);
+        try (CloseableIterable<Record> scan = IcebergGenerics.read(table)
+                .where(Expressions.equal(Constants.CONFIG_ID_COLUMN, configId))
+                .select(Constants.EMBEDDING_DIM_COLUMN, Constants.CONFIG_ID_COLUMN)
+                .build()) {
+            for (Record record : scan) {
+                Object value = record.getField(Constants.EMBEDDING_DIM_COLUMN);
+                if (value instanceof Number width) {
+                    return width.intValue();
+                }
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "Could not read the embedding dimension for " + sourceTable, e);
+        }
+        return 0;
+    }
 }
