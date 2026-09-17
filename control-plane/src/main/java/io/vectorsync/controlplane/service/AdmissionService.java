@@ -314,15 +314,80 @@ public class AdmissionService {
     @Transactional
     public Optional<MaterializationEntity> resume(String id) {
         return materializationRepository.findById(id).map(entity -> {
+            if (entity.getState() == State.DEGRADED) {
+                return reanchor(entity);
+            }
             if (entity.getState() != State.PAUSED) {
                 throw new IllegalStateException(String.format(
-                        "Materialization %s is %s, not PAUSED", id, entity.getState()));
+                        "Materialization %s is %s, not PAUSED or DEGRADED", id, entity.getState()));
             }
             State target = isCaughtUp(entity) ? State.LIVE : State.VALIDATED;
             entity.transitionTo(target);
             entity.setLastError(null);
             return materializationRepository.save(entity);
         });
+    }
+
+    /**
+     * Recovers a DEGRADED materialization by pinning a fresh anchor and replanning against it.
+     *
+     * <p>DEGRADED was a one-way door. It is reached when {@code assess()} finds commits in the
+     * snapshot range that an incremental append scan cannot describe -- a delete, an overwrite --
+     * and refusing there is correct, because advancing the watermark past changes that were never
+     * materialized would serve deleted rows forever. But nothing could leave the state again:
+     * {@code resume} accepted only PAUSED, and the worker's {@code runnable()} does not ask for
+     * DEGRADED, so the entry simply stopped.
+     *
+     * <p>Clearing the state alone would not have worked either, and this is the part worth being
+     * explicit about. {@code anchor_snapshot_id} was written once at admission and never advanced,
+     * so the next cycle would assess the very same range, find the very same destructive commit, and
+     * degrade again -- an operator would see the state flicker and nothing progress. Recovery
+     * therefore has to re-anchor: the anchor moves to the source's current snapshot, the watermark
+     * resets, and the planner treats it as a fresh backfill from there.
+     *
+     * <p>What that costs is a full replan and a full re-read of the source, and what it does
+     * <em>not</em> cost is inference. Every content hash the store has seen before resolves on the
+     * dedup probe, so a re-anchor after a delete re-embeds only genuinely new text. This is the same
+     * argument the PAUSED path already makes, and it is the property that makes re-anchoring a
+     * reasonable recovery rather than a bill.
+     *
+     * <p>The anchor jump is deliberately not reconciliation: rows deleted between the old anchor and
+     * the new one are not tombstoned by this, so their content-map entries stay live and stale
+     * vectors remain servable until something removes them. That is a known gap, recorded in
+     * docs/ARCHITECTURE-REVIEW.md, and it is why the error is preserved on the entity rather than
+     * cleared -- an operator resuming needs to know the materialization skipped a range.
+     */
+    private MaterializationEntity reanchor(MaterializationEntity entity) {
+        Snapshot current;
+        try {
+            Table table = catalogService.getCatalog()
+                    .loadTable(toIdentifier(entity.getSourceTable(), entity.getCatalogName()));
+            current = table.currentSnapshot();
+        } catch (Exception e) {
+            throw new IllegalStateException(String.format(
+                    "Cannot re-anchor %s: source table %s does not resolve in the catalog (%s). "
+                            + "Fix the catalog or retire the materialization.",
+                    entity.getId(), entity.getSourceTable(), rootMessage(e)), e);
+        }
+        if (current == null) {
+            throw new IllegalStateException(String.format(
+                    "Cannot re-anchor %s: source table %s has no current snapshot, so there is no "
+                            + "version to anchor to.", entity.getId(), entity.getSourceTable()));
+        }
+
+        long previousAnchor = entity.getAnchorSnapshotId();
+        entity.setAnchorSnapshotId(current.snapshotId());
+        entity.setAnchorSequenceNumber(current.sequenceNumber());
+        // Back to zero so plan() takes the backfill branch against the new anchor rather than trying
+        // to continue an incremental range that no longer starts anywhere meaningful.
+        entity.setIncrementalWatermark(0L);
+        entity.transitionTo(State.BACKFILLING);
+        entity.setLastError(String.format(
+                "re-anchored from snapshot %d to %d after: %s",
+                previousAnchor, current.snapshotId(),
+                entity.getLastError() == null ? "degraded" : entity.getLastError()));
+        entity.setUpdatedAt(Instant.now());
+        return materializationRepository.save(entity);
     }
 
     /**
