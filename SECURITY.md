@@ -30,18 +30,36 @@ attacker gains, and the version (commit sha — there are no releases yet, see b
 There are no tagged releases. The project version is `0.1.0-SNAPSHOT` and the only supported code is
 the current `main`. Fixes land there and nowhere else; there is no backport branch to ask about.
 
-## Deployment posture: trusted network only
+## Deployment posture: trusted network by default, authentication available
 
-**No HTTP endpoint in this project has authentication or authorization.** Not the control plane
-(`:8080`), not the worker (`:8081`), not the search service (`:8083`), not the embedding service
-(`:8000`). There is no API key, no token, no `SecurityFilterChain`, and `spring-boot-starter-security`
-is not a dependency of any module. Anyone who can reach a port can register a materialization, drive
-a derivation, promote an index, or read every vector.
+**Authentication exists but is off by default.** The control plane (`:8080`), the worker (`:8081`)
+and the search service (`:8083`) each have a `SecurityFilterChain` providing deny-by-default HTTP
+Basic with two roles, and it is enabled with a single property:
 
-This is a **documented design gap, not a vulnerability report.** The system is intended today to run
-on a trusted network, behind whatever authenticating proxy or network policy the operator already
-runs; adding authentication is deliberate future work, not an oversight to be reported. Two
-consequences an operator should know before deploying:
+```
+vectorsync.auth.enabled=true
+VECTORSYNC_AUTH_ADMIN_PASSWORD=...     # human / automation, ≥16 chars
+VECTORSYNC_AUTH_WORKER_PASSWORD=...    # worker → control plane, machine-to-machine
+```
+
+There is no default password and there is no placeholder that works: with authentication enabled and
+a missing, short, or recognisably-placeholder secret, **the service refuses to start** and names the
+variable to set. A committed default would be worse than none, because every other guard would read
+as satisfied. `/actuator/health` stays anonymous so orchestration can probe it; `/actuator/metrics`
+does not, because the derivation counters are tagged with source table names and configuration ids.
+
+**With `vectorsync.auth.enabled` left at its default, no endpoint is authenticated.** Anyone who can
+reach a port can register a materialization, drive a derivation, promote an index, or read every
+vector. That default is a **documented design gap, not a vulnerability report**, and the reason it is
+still the default is specific: the dashboard's nginx/vite proxy, the five scripts under
+`deployment/`, and the benchmark clients under `bench/` do not yet send a credential, so enabling
+authentication by default would break the demo stack and every script that produced the measurements
+in the docs. Wiring those callers is the remaining work between opt-in and on-by-default, and it is
+tracked as such rather than presented as done.
+
+The embedding service (`:8000`) has no authentication and is not covered by the above.
+
+Two consequences an operator should know before deploying:
 
 - `docker-compose.yml` publishes every service port on all host interfaces (no `127.0.0.1` binding).
   On a host with a public address, that stack is public. The compose file is a demo and development
@@ -52,7 +70,9 @@ consequences an operator should know before deploying:
 
 So the following are **out of scope** as reports, because they are already stated above:
 
-- "Endpoint X requires no authentication."
+- "Endpoint X requires no authentication" — with `vectorsync.auth.enabled` at its default. A path
+  that stays reachable *with* authentication enabled, other than `/actuator/health`, is in scope and
+  worth reporting.
 - "The compose stack ships default credentials." (They are placeholders in `.env.example`; `.env` is
   not tracked.)
 - Findings against the `dashboard` demo UI, or against the mock embedding provider used in tests.
