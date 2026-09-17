@@ -28,24 +28,21 @@ planning, partition pruning and scoring -- not just our own scan. Without it, th
 computed over the projection directly, which isolates data cost from engine cost. Run both: the
 difference between them is the engine's overhead and it is worth knowing separately.
 
-!! READ THIS BEFORE TRUSTING A COST NUMBER FROM THIS SCRIPT !!
+WHICH PATH THIS MEASURES, AND WHY IT MATTERS
 
-It drives POST /api/derive/run, and that endpoint does NOT record what it embedded. The durable
-dedup record in embedded_content is written by WorkQueueService.complete, in the same transaction
-that completes a work item -- an invariant asserted in DurableDedupTest and documented in
-docs/DEMO.md. DeriveOrchestrationService, which backs /api/derive/run, has no control-plane
-reference at all, so nothing it embeds is ever recorded and the probe cannot hit on a later
-invocation.
+It registers a materialization through the control plane and lets the SCHEDULER drive derivation,
+rather than calling POST /api/derive/run. That is not a stylistic preference -- the first version of
+this script called the derive endpoint directly and reported 12.387 inference calls per changed row,
+twelve times worse than the row-keyed baseline it was meant to beat.
 
-Consequence, measured: nfcorpus at 400 rows with ~31 rows changed per round reported 391, 384 and
-377 inference calls per round -- essentially the whole corpus every time -- for 12.387 calls per
-changed row, where a row-keyed pipeline pays 1.000. That number is real and it is a fact about this
-endpoint, not about the architecture. The production path is the scheduler plus the work queue,
-which does record, and that is the path a cost claim has to be measured on.
+The cause was the endpoint, not the architecture. The durable dedup record is written by
+WorkQueueService.complete, in the same transaction that completes a work item, and
+DeriveOrchestrationService -- which backs /api/derive/run -- has no control-plane reference at all.
+So nothing it embedded was ever recorded, the probe could never hit on a later invocation, and every
+pass re-embedded the whole corpus. Anyone scripting that endpoint pays full price every time, which
+is worth knowing separately, but it is not what the system does in production.
 
-Fixing this properly means registering a materialization through the control plane and letting the
-runner drive it, rather than calling the derive endpoint directly. Until that is done, treat the
-freshness and latency columns as meaningful and the inference column as measuring the wrong thing.
+So: materialization, scheduler, work queue. The same path a deployment runs.
 
 Usage
   python3 bench/mutation.py --dataset nfcorpus --rows 3000 --rounds 10 --mutate 0.05
@@ -141,6 +138,15 @@ class Workload:
     round_marker = 0
 
 
+def config_id_of(materialization_id):
+    return get("%s/api/materializations/%s" % (CONTROL, materialization_id))["configId"]
+
+
+def watermark_of(materialization_id):
+    entry = get("%s/api/materializations/%s" % (CONTROL, materialization_id))
+    return entry.get("incrementalWatermark", 0) or 0
+
+
 def as_rows(live):
     """{id: text} to the seed-row shape the demo endpoints take."""
     return [{"id": doc_id, "name": "", "description": text} for doc_id, text in live.items()]
@@ -178,19 +184,72 @@ SPEC = {
 }
 
 
-def derive_and_publish(table, timeout_seconds=1800):
+def admit(table):
     """
-    One derivation pass, publishing Tier 2 so the result is queryable when this returns.
+    Registers the materialization, or returns the existing one.
 
-    publishProjection is what makes the returned elapsed time a freshness number rather than just a
-    derive number: without it the pass writes Tier 1 and leaves publishing to the scheduler, so a
-    query issued immediately afterwards would read the previous projection and the measurement would
-    silently be of the wrong thing.
+    Admission is unique on (source_table, config_id), so a re-run of this benchmark collides rather
+    than creating a second scope -- which is the behaviour we want: the whole point is to accumulate
+    a dedup record across rounds, and a fresh scope each round would measure nothing.
     """
     body = dict(SPEC)
     body["sourceTable"] = table
-    body["publishProjection"] = True
-    return post("%s/api/derive/run" % WORKER, body, timeout=timeout_seconds)
+    body["freshnessSlaSeconds"] = 60
+    try:
+        created = post("%s/api/materializations" % CONTROL, body, timeout=300)
+        if created.get("id"):
+            return created["id"]
+    except Exception as failure:
+        # An "already exists" collision is the expected path on any run after the first.
+        if "already exists" not in str(failure):
+            raise
+
+    for state in ("LIVE", "VALIDATED", "BACKFILLING", "DEGRADED", "REGISTERED"):
+        for entry in get("%s/api/materializations?state=%s" % (CONTROL, state)):
+            if entry.get("sourceTable") == table:
+                return entry["id"]
+    raise RuntimeError("could not admit or find a materialization for %s" % table)
+
+
+def resume_if_degraded(materialization_id):
+    """
+    A range with deletes parks the materialization unless reconcile is enabled.
+
+    Attempted every round rather than only on failure: the benchmark is deliberately generating the
+    mutation shape that degrades a materialization, and a run that silently stalled there would
+    report falling inference counts that looked like excellent dedup.
+    """
+    entry = get("%s/api/materializations/%s" % (CONTROL, materialization_id))
+    if entry.get("state") == "DEGRADED":
+        post("%s/api/materializations/%s/resume" % (CONTROL, materialization_id), {}, timeout=300)
+        return True
+    return False
+
+
+def await_advance(materialization_id, previous_watermark, timeout_seconds=1800):
+    """
+    Waits until the scheduler's watermark moves past where it was before the source commit.
+
+    Compared against the PREVIOUS watermark rather than against the source's current sequence
+    number, which would need an endpoint that does not exist -- and this is the better comparison
+    anyway: it asks "has the pipeline caught up with the change I just made", which is exactly the
+    question a user waiting on freshness is asking.
+
+    Polls rather than sleeps, because the number being measured is the lag and a fixed sleep would
+    report the sleep. Returns (seconds_waited, state, resumed).
+    """
+    started = time.time()
+    resumed = False
+    while time.time() - started < timeout_seconds:
+        entry = get("%s/api/materializations/%s" % (CONTROL, materialization_id))
+        state = entry.get("state")
+        watermark = entry.get("incrementalWatermark", 0) or 0
+        if state == "LIVE" and watermark > previous_watermark:
+            return time.time() - started, state, resumed
+        if state == "DEGRADED":
+            resumed = resume_if_degraded(materialization_id) or resumed
+        time.sleep(2)
+    return time.time() - started, "TIMEOUT", resumed
 
 
 def query_direct(table, config_id, query_text, k):
@@ -245,6 +304,14 @@ def main():
 
     workload = Workload(docs, args.mutate, args.deletes)
 
+    # Seed and admit before the loop: admission validates the spec against a table that must already
+    # exist, and the config id it returns is what every later query and metric read is keyed on.
+    seed_source(args.table, workload.live)
+    materialization_id = admit(args.table)
+    config_id = config_id_of(materialization_id)
+    print("materialization %s, config %s" % (materialization_id, config_id))
+    previous_cumulative = 0
+
     print()
     print("round |   upserts  deletes |  inference | derive_s | lag_s | p50_ms  p95_ms | nDCG@%d"
           % args.k)
@@ -259,23 +326,37 @@ def main():
         else:
             upserts, deletes = workload.next_round()
 
+        # Captured before the commit, so the wait below asks "has the pipeline caught up with the
+        # change I just made" rather than "is it LIVE", which it already was.
+        watermark_before = watermark_of(materialization_id) if round_index > 0 else -1
+
         committed_at = time.time()
-        if round_index == 0:
-            seed_source(args.table, workload.live)
-        else:
+        if round_index > 0:
+            # Round zero's rows were seeded before admission, because admission validates the spec
+            # against a table that has to exist.
             rewrite_source(args.table, workload.live)
 
         # Wait for the pipeline to make the change queryable, which is the number a user feels.
         # Polled rather than assumed: the whole point is to measure the lag, not to sleep past it.
         derive_started = time.time()
-        status = derive_and_publish(args.table)
-        derive_seconds = time.time() - derive_started
+        derive_seconds, state, resumed = await_advance(
+            materialization_id, watermark_before)
         lag_seconds = time.time() - committed_at
-        config_id = status["configId"]
-        inference = status.get("metrics", {}).get("inferenceCalls", 0)
-        if not status.get("metrics", {}).get("complete", False):
-            print("  !! pass incomplete at round %d -- filesFailed=%s. Numbers after this point "
-                  "describe a partial derive." % (round_index, status.get("filesFailed")))
+
+        # Cumulative, so the per-round figure is a difference. The registry counts per scope for the
+        # life of the worker, which is what makes it the right source for a dedup claim -- it cannot
+        # be reset between rounds to flatter a number.
+        totals = get("%s/api/derive/metrics?sourceTable=%s&configId=%s"
+                     % (WORKER, args.table, config_id))
+        cumulative = totals.get("inferenceCalls", 0)
+        inference = cumulative - previous_cumulative
+        previous_cumulative = cumulative
+
+        if state != "LIVE":
+            print("  !! materialization is %s at round %d, not LIVE. Inference counts after this "
+                  "point describe a stalled pipeline, not dedup." % (state, round_index))
+        if resumed:
+            print("  (resumed from DEGRADED -- the round contained deletes)")
 
         latencies = []
         ranked_all = {}
