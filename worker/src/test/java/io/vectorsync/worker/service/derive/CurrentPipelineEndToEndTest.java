@@ -360,4 +360,105 @@ class CurrentPipelineEndToEndTest {
         assertFalse(projectionRowCount() < 2,
                 "the projection shrank, which would mean deletes are being applied somewhere");
     }
+
+    // ------------------------------------------------------- update / merge behaviour
+    //
+    // I argued earlier that updates are the tractable case and only pure deletes are missing,
+    // because the content map keys by source_row_id and collapses by sequence number -- so HOW an
+    // engine expresses an old row version should not reach us. These two tests check that argument
+    // against the code instead of leaving it as an argument.
+
+    /** Rewrites the whole table as one overwrite commit, which is what copy-on-write emits. */
+    private void copyOnWriteRewrite(List<String[]> survivors) {
+        Table source = catalogService.getCatalog()
+                .loadTable(TableIdentifier.of(Namespace.of("default"), "e2e_products"));
+
+        List<Record> records = new ArrayList<>(survivors.size());
+        for (String[] row : survivors) {
+            GenericRecord record = GenericRecord.create(SOURCE_SCHEMA);
+            record.setField("id", row[0]);
+            record.setField("name", row[1]);
+            record.setField("description", row[2]);
+            records.add(record);
+        }
+        List<org.apache.iceberg.DataFile> written =
+                io.vectorsync.format.io.IcebergAppender.writeFiles(source, records);
+
+        // One commit that both removes and adds, so snapshot.operation() is "overwrite" -- the
+        // shape Spark produces for copy-on-write UPDATE and MERGE.
+        org.apache.iceberg.OverwriteFiles overwrite = source.newOverwrite()
+                .overwriteByRowFilter(org.apache.iceberg.expressions.Expressions.alwaysTrue());
+        written.forEach(overwrite::addFile);
+        overwrite.commit();
+    }
+
+    @Test
+    @DisplayName("a copy-on-write UPDATE is refused by assess, not attempted")
+    void copyOnWriteUpdateIsRefused() {
+        appendSource(List.<String[]>of(
+                new String[]{"p-100", "Trail Runner", "Lightweight shoe for rocky mountain trails"},
+                new String[]{"p-200", "Espresso Machine", "Pulls a double shot in twenty seconds"}));
+        MaterializationSpec spec = spec();
+        var first = orchestration.backfill(spec, config(), System.currentTimeMillis());
+        long anchor = first.snapshotId();
+        ProjectionBuilder.build(catalogService.getCatalog(), NAMESPACE, spec);
+
+        // p-100's description changes. No row disappears -- this is a pure update.
+        copyOnWriteRewrite(List.<String[]>of(
+                new String[]{"p-100", "Trail Runner", "Waterproof shoe for alpine scrambling"},
+                new String[]{"p-200", "Espresso Machine", "Pulls a double shot in twenty seconds"}));
+
+        var pass = orchestration.incremental(spec, config(), anchor, System.currentTimeMillis());
+
+        // This is the finding. assess() allowlists only APPEND and REPLACE, so an overwrite is
+        // refused wholesale -- even though a pure update is the case the content map's row-id
+        // keying and sequence collapse are built to absorb. The refusal is over-broad, not wrong:
+        // it cannot distinguish an overwrite that only rewrote rows from one that removed some,
+        // and guessing the difference would serve deleted rows.
+        assertFalse(pass.complete(),
+                "if this now passes, assess() has been narrowed to admit row-preserving "
+                        + "overwrites and this test should assert the new content is retrievable "
+                        + "instead");
+        assertEquals(1, pass.filesFailed(), "the refusal should be reported, not silent");
+        assertEquals(0, pass.inferenceCalls(), "a refused pass must not embed anything");
+    }
+
+    @Test
+    @DisplayName("the updated content is derivable once the refusal is bypassed by re-anchoring")
+    void updateIsCorrectlyDerivedAfterReanchor() {
+        appendSource(List.<String[]>of(
+                new String[]{"p-100", "Trail Runner", "Lightweight shoe for rocky mountain trails"},
+                new String[]{"p-200", "Espresso Machine", "Pulls a double shot in twenty seconds"}));
+        MaterializationSpec spec = spec();
+        orchestration.backfill(spec, config(), System.currentTimeMillis());
+        ProjectionBuilder.build(catalogService.getCatalog(), NAMESPACE, spec);
+
+        copyOnWriteRewrite(List.<String[]>of(
+                new String[]{"p-100", "Trail Runner", "Waterproof shoe for alpine scrambling"},
+                new String[]{"p-200", "Espresso Machine", "Pulls a double shot in twenty seconds"}));
+
+        // Re-anchoring is what DEGRADED recovery does: pin the new snapshot and backfill it. This
+        // is the path an operator already has, and it is what the argument about updates predicts
+        // will work -- so it is worth knowing whether the DERIVE half is actually correct, quite
+        // apart from whether assess() lets the incremental half run.
+        var rederived = orchestration.backfill(spec, config(), System.currentTimeMillis());
+        assertTrue(rederived.complete(), "the re-anchored backfill did not complete");
+        ProjectionBuilder.build(catalogService.getCatalog(), NAMESPACE, spec);
+
+        // The new content wins: the content map collapsed p-100's two versions by sequence number.
+        assertEquals(List.of("p-100"),
+                topK(canonical("Trail Runner", "Waterproof shoe for alpine scrambling"), 1),
+                "the updated content is not retrievable, so collapse did not pick the new version");
+
+        // And the old version is gone from serving rather than coexisting with the new one.
+        assertEquals(2, projectionRowCount(),
+                "the projection holds both versions of p-100, so the collapse kept a superseded row");
+
+        // p-200 was unchanged, so its content hash was identical and cost no inference. This is the
+        // half of MERGE support that already works: the expensive resource is protected even when
+        // the whole file is rewritten.
+        assertTrue(rederived.inferenceCalls() <= 1,
+                "an update to one row of two re-embedded more than the changed row: "
+                        + rederived.inferenceCalls() + " calls");
+    }
 }
