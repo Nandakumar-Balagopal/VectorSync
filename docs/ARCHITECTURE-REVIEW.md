@@ -349,20 +349,61 @@ pool can chew through, and keep the seam so that decision stays cheap.
 
 Be explicit rather than silent. Classify and publish the matrix:
 
-| Source operation | Support | Mechanism |
+| Source operation | Support today | Mechanism, and why |
 |---|---|---|
 | `INSERT` / append | **supported** | incremental append scan |
-| `DELETE` (positional/DV) | **supported (phase 1)** | read delete files for touched partitions; tombstone `content_map` |
-| `UPDATE` / `MERGE` (copy-on-write) | **supported (phase 1)** | overwrite rewrites data files; reconcile touched partitions |
-| `UPDATE` / `MERGE` (merge-on-read, equality deletes) | **requires reconciliation** | equality deletes have no positional anchor; re-derive affected partitions |
+| `UPDATE` / `MERGE` (copy-on-write) | **refused** (tractable) | the rewritten file arrives as an added file; its rows get new content hashes at a higher sequence number and the `content_map` collapse picks them. Unchanged rows in the same file hash identically, so dedup makes them free. |
+| `UPDATE` / `MERGE` (merge-on-read) | **refused** (tractable) | same as above. We key by `source_row_id` and collapse by sequence number, so *how* the engine expressed the old version — position deletes, deletion vectors, equality deletes — is irrelevant to us. |
+| `DELETE` (row vanishes, no successor) | **refused** (the genuinely hard case) | a positional delete or deletion vector carries `(file_path, pos)` and **no key values**, so reading the delete file cannot tell you which `source_row_id` died. The tractable route is to ask the *current* partition which keys it still holds and tombstone the difference. |
 | Schema evolution on an embedded column | **requires re-admission** | `config_id` changes; new materialization side-by-side |
 | Partition-spec evolution | **requires rebuild** | |
 
-**Phase 1 mechanism.** Replace blanket refusal with **partition-scoped reconcile**: when
-`assess()` reports deletes or overwrites between snapshots, compute the affected partitions (already
-implemented — `collectAffectedPartitions`, corrected during review to include copy-on-write *added*
-files) and re-derive only those. A tombstoned source row appends a `content_map` tombstone; the
-canonical vector is **never deleted**, because it is shared.
+An earlier revision of this table marked the delete and copy-on-write rows "supported (phase 1)"
+with the mechanism "read delete files for touched partitions". Both parts were wrong: nothing beyond
+append is supported today — `MaterializationRunner.plan` calls `markDegraded` and returns — and
+reading a positional delete file yields file offsets, not the key values a tombstone needs. The
+equality-delete row was backwards too: equality deletes are the one delete encoding that *does*
+carry key values, which would make them easier rather than harder, though they are being retired
+from the spec and so cannot be relied on.
+
+**Phase 1 mechanism.** Replace blanket refusal with **partition-scoped reconcile**: when `assess()`
+reports deletes or overwrites between snapshots, compute the affected partitions (already
+implemented — `collectAffectedPartitions` at `IncrementalChangeDetector.java:445`, reached from
+`:376`) and re-derive only those via the partition-scoped `backfillWork(config, anchor,
+partitionPaths)` overload that also already exists. A tombstoned source row appends a `content_map`
+tombstone; the canonical vector is **never deleted**, because it is shared — another row may hold
+the same content, which is the entire point of content addressing.
+
+So most of the machinery is written. What blocks it is not the scan, and three specific hazards must
+be solved rather than assumed away:
+
+1. **The sweep cannot be a later step.** `publish()` begins `if (processedThisCycle == 0 && live)
+   return false;` (`MaterializationRunner.java:341-344`), and `enqueue` is idempotent on
+   `(materializationId, dataFilePath, snapshotId)` *including* rows already DONE. So if a crash
+   lands between the derive and the tombstone sweep, the next cycle enqueues nothing, drains
+   nothing, and returns before sweeping — permanently. The materialization then reads LIVE and
+   healthy while serving deleted rows, which is strictly worse than today's loud refusal. The sweep
+   must be part of the unit whose completion advances the watermark.
+2. **A sweep cannot be scoped by `config_id` alone.** `MaterializationSpec.configId` deliberately
+   excludes `keyColumns`, while the content map is partitioned by `(source_table, config_id)`. Two
+   specs over one table with the same embedding configuration but different key columns therefore
+   share a partition with two different row-id spaces, and a naive tombstone-what-is-absent sweep
+   would delete the other spec's rows. Scope by materialization, or add an optional key-identity
+   field at a new field id.
+3. **Tombstone ordering.** A tombstone must carry a source sequence number strictly greater than the
+   entry it retires, or the collapse picks the wrong winner.
+
+**`DEGRADED` is currently a one-way door,** and this is arguably worse than the missing feature. It
+is not among the states `DerivationControlClient.runnable()` requests, `resume()` accepts only
+`PAUSED`, and `anchor_snapshot_id` is written once at admission and never advanced — so even a
+manual un-degrade re-degrades on the next cycle against the same stale anchor. Advancing the anchor
+is independently worth doing: it turns O(snapshots-since-admission) work per idle materialization per
+cycle into O(1).
+
+**The refusal is also too broad.** `assess()` allowlists only `APPEND` and `REPLACE`
+(`IncrementalChangeDetector.java:411`). If a compaction-style `OVERWRITE` with zero deleted records
+is provably row-preserving from the snapshot summary counters alone, then routine compaction stops
+degrading tables — likely the most common real-world trigger, at near-zero risk.
 
 **Why partition-scoped rather than row-level.** Iceberg 1.5.0 has no deletion vectors, and equality
 deletes are being retired. Partition reconcile is coarse but correct, needs no delete files, and the
@@ -427,11 +468,32 @@ Three modes by latency class; VectorSync is in the query path for none of the fi
 | Interactive <100 ms | ANN coordinator over Tier 3 shards, or export to a vector DB | that layer |
 | Embedded | mmap a Tier-3 artifact as a library | the app |
 
-**Delete the current serving half.** `search-service` reads *only* the legacy `VectorTableSchema`,
-whose sole writer is reachable from the now-disabled legacy scheduler — so in a default deployment
-index build, evaluation, promotion, provenance and search are **dead on arrival**. Reduce the module
-to an offline Tier-3 builder; delete `SearchController`, `SearchService`, `HnswIndexCache` and the
-query-time embedders. Keep `EvaluationService` and `ProvenanceService`, repointed at Tier 2.
+**The current serving half is legacy, but it is not dead — an earlier revision of this section said
+it was, and that was wrong.** `search-service` reads only the legacy `VectorTableSchema`, and this
+document previously claimed its "sole writer is reachable from the now-disabled legacy scheduler",
+concluding that index build, evaluation, promotion, provenance and search were all dead on arrival.
+That single sentence was false and it manufactured a proposal to delete roughly forty files.
+
+What is actually true: `DemoController` carries no `@ConditionalOnProperty`, so it is registered in
+every deployment, and its `POST /api/demo/sync` calls `SyncOrchestrationService.syncTable` for every
+enabled table config, which writes `vector_embeddings` through `VectorStoreService`. That endpoint is
+invoked by four scripts under `deployment/` — including `test-e2e-lifecycle.sh`, which asserts on
+fifteen search-service endpoints and on returned row ids. The module has 16 passing tests. The HNSW
+index is not an in-memory toy either; it is a durable `FSDirectory` artifact in object storage.
+`EvaluationService.recordOnManifest` is the only writer of `index_recall@k` and
+`LifecycleController.promotionBlockers` its only reader, so deleting it would silently convert a
+gated, auditable promotion into an ungated one.
+
+So the legacy path is the only end-to-end serving story that currently exists, and removing it
+before its replacement is wired is not removing dead code. The sequencing is the other way round:
+wire the new path first, prove it against the same e2e assertions, then retire this one. Note that
+`SqlViewGenerator` — which emits the Trino and Spark views over Tier 2 — is the one provably dead
+serving class in the repo, with zero Java callers. The action it needs is wiring, not deletion, and
+that is the highest-leverage integration step available.
+
+Four questions must be answered before any of this module is deleted: is `POST /api/demo/sync`
+product or scaffolding; what replaces the e2e lifecycle proof; does the `index_recall@k` promotion
+gate survive; and do `Lifecycle.tsx` / `SemanticSearch.tsx` go or get repointed.
 
 **Query-side embedding.** Measured 20 ms (MiniLM) / 68 ms (mpnet) warm, HTTP included — fine at query
 time, fatal if the model is loaded per call. The API must take a **materialization**, never a model
