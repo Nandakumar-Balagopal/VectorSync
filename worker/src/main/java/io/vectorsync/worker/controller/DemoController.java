@@ -44,6 +44,17 @@ public class DemoController {
     }
 
     /** Seeds an arbitrary source table, for exercising the flow across several tables. */
+    /** Copy-on-write replace, for the mutation benchmark. See DemoSeedService.replaceRows. */
+    @PostMapping("/tables/replace")
+    public ResponseEntity<?> replaceTable(@RequestBody SeedTableRequest request) {
+        try {
+            return ResponseEntity.ok(
+                    demoSeedService.replaceRows(request.tableName(), request.rows()));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
+        }
+    }
+
     @PostMapping("/tables")
     public ResponseEntity<?> seedTable(@RequestBody SeedTableRequest request) {
         try {

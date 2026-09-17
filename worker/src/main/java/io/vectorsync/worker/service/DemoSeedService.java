@@ -130,6 +130,50 @@ public class DemoSeedService {
         return new DemoMutationResult("APPEND", qualifiedName, records.size());
     }
 
+    /**
+     * Replaces the table's contents in one commit, preserving ancestry.
+     *
+     * <p>Distinct from {@link #seedTable}, which drops and recreates and therefore produces a table
+     * with no history -- {@code assess()} sees that as a re-anchor rather than a mutation, which is
+     * the wrong shape for testing anything. This is what an engine emits for {@code UPDATE} or
+     * {@code DELETE} on a table with no delete files: the old data files are removed and the
+     * survivors are rewritten, as a single {@code overwrite} snapshot whose parent is the snapshot
+     * already materialized.
+     *
+     * <p>Exists for the mutation benchmark. Every measurement this project had published was taken
+     * on a table loaded once and left alone, which is the easy case and not the one the
+     * architecture exists for.
+     */
+    public DemoMutationResult replaceRows(String qualifiedName, List<SeedRow> rows) {
+        if (rows == null || rows.isEmpty()) {
+            throw new IllegalArgumentException("At least one row is required");
+        }
+
+        Catalog catalog = catalogService.getCatalog();
+        TableIdentifier identifier = qualifiedName.contains(".")
+                ? TableIdentifier.parse(qualifiedName)
+                : TableIdentifier.of(Namespace.of(DEMO_NAMESPACE), qualifiedName);
+        if (!catalog.tableExists(identifier)) {
+            throw new IllegalArgumentException("Table does not exist: " + qualifiedName);
+        }
+
+        Table table = catalog.loadTable(identifier);
+        List<Record> records = new ArrayList<>(rows.size());
+        for (SeedRow row : rows) {
+            records.add(buildRecord(table.schema(), row.id(), row.name(), row.description(),
+                    row.category(), row.price()));
+        }
+
+        List<org.apache.iceberg.DataFile> written =
+                io.vectorsync.format.io.IcebergAppender.writeFiles(table, records);
+        org.apache.iceberg.OverwriteFiles overwrite = table.newOverwrite()
+                .overwriteByRowFilter(org.apache.iceberg.expressions.Expressions.alwaysTrue());
+        written.forEach(overwrite::addFile);
+        overwrite.commit();
+
+        return new DemoMutationResult("REPLACE", qualifiedName, records.size());
+    }
+
     public DemoSeedResult seedTable(String qualifiedName, List<SeedRow> rows) {
         if (rows == null || rows.isEmpty()) {
             throw new IllegalArgumentException("At least one row is required");
