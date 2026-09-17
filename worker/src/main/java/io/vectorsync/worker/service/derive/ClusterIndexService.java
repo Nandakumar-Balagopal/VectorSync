@@ -2,6 +2,7 @@ package io.vectorsync.worker.service.derive;
 
 import io.vectorsync.common.Constants;
 import io.vectorsync.format.derive.ClusteredIndex;
+import io.vectorsync.format.derive.ContentHash;
 import io.vectorsync.format.derive.EmbeddingStore;
 import io.vectorsync.format.derive.VectorClustering;
 import io.vectorsync.worker.service.iceberg.IcebergCatalogService;
@@ -24,6 +25,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -73,6 +75,13 @@ public class ClusterIndexService {
         this.catalogService = catalogService;
     }
 
+    /**
+     * @param reused true when the recorded coverage digest already matched, so no clustering ran and
+     *               nothing was committed. This is the measurable output of content-addressed index
+     *               identity: after a compaction or any other layout-only rewrite it is true, and
+     *               the rebuild cost is zero.
+     * @param coverageDigest the digest this scope's index covers, whether just written or matched
+     */
     public record BuildReport(String sourceTable,
                               String modelVersion,
                               String configId,
@@ -80,7 +89,9 @@ public class ClusterIndexService {
                               int iterations,
                               long vectors,
                               long canonicalRowsRead,
-                              List<Integer> clusterSizes) {
+                              List<Integer> clusterSizes,
+                              boolean reused,
+                              String coverageDigest) {
     }
 
     /** How the clustered index stands against the canonical vectors it was built from. */
@@ -146,6 +157,35 @@ public class ClusterIndexService {
         List<String> hashes = new ArrayList<>(canonical.vectors().keySet());
         hashes.sort(Comparator.naturalOrder());
 
+        // Identity by coverage, not by source version. The digest is over the content this scope
+        // holds, so a source snapshot that only moved bytes -- a compaction, a data-file rewrite, a
+        // sort reorganisation, a partition rewrite -- yields the same digest and the index already
+        // on disk is provably still correct for it. That is the case this skip exists for: those
+        // operations are routine scheduled maintenance in a lakehouse, they change no embedding, and
+        // an index keyed by snapshot id would rebuild in full for every one of them.
+        //
+        // Note what is NOT claimed here: this proves the covered content set is unchanged, not that
+        // the assignment is optimal. Centroids fitted over the same content are unchanged too, since
+        // fit() is deterministic over a sorted input, so skipping is exact rather than approximate.
+        String coverageDigest = ContentHash.coverageDigest(hashes);
+        Table coverageTable = ClusteredIndex.loadCoverageOrCreate(
+                catalogService.getCatalog(), vectorNamespace);
+        Optional<ClusteredIndex.Coverage> recorded =
+                ClusteredIndex.readCoverage(coverageTable, modelVersion, configId);
+
+        if (recorded.isPresent() && recorded.get().digest().equals(coverageDigest)
+                && indexHasRows(sourceTable, modelVersion, configId)) {
+            // The rows check is not redundant. Coverage is committed after the data it describes, so
+            // a coverage row without rows should be impossible -- but a purge, a manual drop or a
+            // failed migration can produce one, and treating that as "up to date" would serve an
+            // empty index forever with no error.
+            log.info("Index for {} / {} already covers this content ({}, {} contents); skipping rebuild",
+                    modelVersion, configId, coverageDigest, recorded.get().contentCount());
+            return new BuildReport(sourceTable, modelVersion, configId, 0, 0,
+                    (int) recorded.get().contentCount(), canonical.rowsRead(), List.of(), true,
+                    coverageDigest);
+        }
+
         List<float[]> ordered = new ArrayList<>(hashes.size());
         for (String hash : hashes) {
             ordered.add(canonical.vectors().get(hash));
@@ -172,6 +212,12 @@ public class ClusterIndexService {
                 catalogService.getCatalog(), vectorNamespace);
         ClusteredIndex.replaceCentroids(centroidTable, modelVersion, configId, model.centroids());
 
+        // Last, deliberately. A coverage row that ran ahead of the rows and centroids it describes
+        // would make the next build skip against an index that was never finished -- the same
+        // ordering rule the derive path follows when it appends vectors before the pointers to them.
+        ClusteredIndex.replaceCoverage(
+                coverageTable, modelVersion, configId, coverageDigest, hashes.size());
+
         List<Integer> clusterSizes = new ArrayList<>(sizes.length);
         for (int size : sizes) {
             clusterSizes.add(size);
@@ -185,7 +231,24 @@ public class ClusterIndexService {
                 entries.size(), canonical.rowsRead(), modelVersion, configId,
                 model.clusterCount(), model.iterations());
         return new BuildReport(sourceTable, modelVersion, configId, model.clusterCount(),
-                model.iterations(), entries.size(), canonical.rowsRead(), clusterSizes);
+                model.iterations(), entries.size(), canonical.rowsRead(), clusterSizes, false,
+                coverageDigest);
+    }
+
+    /**
+     * Whether a scope's clustered table actually holds rows, from manifest metadata only.
+     *
+     * <p>Guards the coverage skip against a coverage row that outlived its data -- a purge, a manual
+     * drop, or a half-applied migration. Without it, "the digest matches" would be enough to serve
+     * an empty index indefinitely.
+     */
+    private boolean indexHasRows(String sourceTable, String modelVersion, String configId) {
+        Catalog catalog = catalogService.getCatalog();
+        TableIdentifier identifier = ClusteredIndex.identifier(vectorNamespace, sourceTable);
+        if (!catalog.tableExists(identifier)) {
+            return false;
+        }
+        return countScope(catalog.loadTable(identifier), modelVersion, configId) > 0;
     }
 
     /**

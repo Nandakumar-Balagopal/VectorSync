@@ -100,6 +100,23 @@ class ClusterIndexScopeTest {
         catalog.dropTable(
                 TableIdentifier.of(Namespace.of(NAMESPACE), ClusteredIndex.CENTROIDS_TABLE_NAME),
                 true);
+        // Must be dropped too. A coverage row surviving into the next test makes its first build
+        // report "reused" against an index that test never created, which would turn the invariance
+        // assertions below into tautologies that pass for the wrong reason.
+        catalog.dropTable(
+                TableIdentifier.of(Namespace.of(NAMESPACE), ClusteredIndex.COVERAGE_TABLE_NAME),
+                true);
+    }
+
+    /** Snapshots on the clustered table: the direct measure of whether a rebuild wrote anything. */
+    private int clusteredSnapshotCount() {
+        Table clustered = ClusteredIndex.loadOrCreate(
+                catalogService.getCatalog(), NAMESPACE, SOURCE_TABLE);
+        int snapshots = 0;
+        for (org.apache.iceberg.Snapshot ignored : clustered.snapshots()) {
+            snapshots++;
+        }
+        return snapshots;
     }
 
     /** A 64-hex content hash, so the store's two-character prefix partition behaves as in production. */
@@ -194,9 +211,41 @@ class ClusterIndexScopeTest {
         // present twice under two different cluster ids and the probe scored a mixture.
         assertEquals(first.vectors(), second.vectors());
         assertEquals(afterFirst, indexedRows(), "the rebuild added a second generation");
-        assertEquals(first.clusterSizes(), second.clusterSizes(),
-                "the fit is deterministic, so an unchanged scope must reassign identically");
         assertEquals(ClusterIndexService.Freshness.FRESH, status().freshness());
+
+        // The second build does not refit at all now: the coverage digest matched, so it reused.
+        // This assertion used to compare cluster sizes to prove the fit was deterministic, which no
+        // longer applies on this path because no fit runs -- see reassignmentIsDeterministic for
+        // that property, which forces two real fits to test it.
+        assertTrue(second.reused(), "an unchanged scope was refitted rather than reused");
+        assertEquals(List.of(), second.clusterSizes(), "a reuse reported cluster sizes it did not fit");
+    }
+
+    @Test
+    @DisplayName("two real fits over identical content assign identically")
+    void reassignmentIsDeterministic() {
+        seed(0, 1, 2, 3, 4, 5);
+        ClusterIndexService.BuildReport first =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+
+        // Force a second genuine fit by discarding the coverage record only. The content, the
+        // clustered rows and the centroids are all left alone, so this isolates the fit itself --
+        // which must be reproducible, or the recall figures published for one build say nothing
+        // about the next.
+        catalogService.getCatalog().dropTable(
+                TableIdentifier.of(Namespace.of(NAMESPACE), ClusteredIndex.COVERAGE_TABLE_NAME),
+                true);
+
+        ClusterIndexService.BuildReport refitted =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+
+        assertFalse(refitted.reused(), "the coverage record was dropped, so this must refit");
+        assertEquals(first.clusterSizes(), refitted.clusterSizes(),
+                "the fit is deterministic over a sorted input, so an unchanged scope must assign "
+                        + "identically; if it does not, the coverage skip is hiding a real "
+                        + "difference rather than avoiding redundant work");
+        assertEquals(first.coverageDigest(), refitted.coverageDigest());
+        assertEquals(6, indexedRows());
     }
 
     @Test
@@ -261,5 +310,114 @@ class ClusterIndexScopeTest {
                 () -> clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, "ffffffffffffffff", CLUSTERS));
 
         assertEquals(6, indexedRows(), "a refused build must leave the serving scope intact");
+    }
+
+    // ------------------------------------------------------- coverage invariance
+    //
+    // These four are the evidence for the one architectural claim here that the prior art does not
+    // obviously cover: that the index's identity is a function of the CONTENT it covers rather than
+    // of the source snapshot it was built from. The consequence is that layout-only mutations of the
+    // source -- compaction, rewrite_data_files, a sort reorganisation, a partition rewrite -- cost
+    // nothing at the vector layer, where a per-file or per-snapshot index must rebuild for each one.
+    // An index keyed by snapshot id cannot have this property by construction, which is exactly the
+    // limitation of the legacy HNSW path in this repo: VectorIds.indexId takes sourceSnapshotId.
+
+    @Test
+    @DisplayName("a layout-only rewrite of Tier 1 costs no index rebuild")
+    void layoutOnlyRewriteIsFreeForTheIndex() {
+        seed(0, 1, 2, 3, 4, 5);
+        ClusterIndexService.BuildReport first =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+        assertFalse(first.reused(), "the first build cannot be a reuse");
+        int snapshotsAfterBuild = clusteredSnapshotCount();
+
+        // The same six contents appended again. To this layer that is indistinguishable from a
+        // compaction: new data files, a different file count, a different row count, a different
+        // scan order -- and an identical set of covered content hashes.
+        seed(0, 1, 2, 3, 4, 5);
+
+        ClusterIndexService.BuildReport second =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+
+        assertTrue(second.reused(),
+                "the covered content is unchanged, so the index must be reused rather than rebuilt");
+        assertEquals(first.coverageDigest(), second.coverageDigest(),
+                "the digest moved although no content changed, so it is keyed on something "
+                        + "physical -- row count, file identity or scan order -- and the invariance "
+                        + "claim does not hold");
+        assertEquals(0, second.iterations(), "k-means ran during a reuse");
+        assertEquals(snapshotsAfterBuild, clusteredSnapshotCount(),
+                "the clustered table gained a snapshot during a reuse, so it was rewritten after "
+                        + "all and the rebuild was not actually avoided");
+        assertEquals(6, indexedRows(), "the reused index no longer holds the scope's content");
+    }
+
+    @Test
+    @DisplayName("genuinely new content forces a rebuild")
+    void newContentRebuilds() {
+        seed(0, 1, 2, 3, 4, 5);
+        ClusterIndexService.BuildReport first =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+        int snapshotsAfterBuild = clusteredSnapshotCount();
+
+        seed(6, 7);
+        ClusterIndexService.BuildReport second =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+
+        // The other half of the property: skipping must be driven by content, not by "an index
+        // exists". A mechanism that reused unconditionally would pass the test above and serve
+        // stale results forever.
+        assertFalse(second.reused(), "new content was not indexed");
+        assertTrue(!first.coverageDigest().equals(second.coverageDigest()),
+                "the digest did not change although two new contents were added");
+        assertEquals(8, indexedRows());
+        assertTrue(clusteredSnapshotCount() > snapshotsAfterBuild,
+                "a rebuild committed nothing");
+    }
+
+    @Test
+    @DisplayName("a coverage record that outlived its rows does not authorise a reuse")
+    void coverageWithoutRowsRebuilds() {
+        seed(0, 1, 2, 3, 4, 5);
+        clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+
+        // A purge, a manual drop or a half-applied migration can leave the coverage row behind. If
+        // a matching digest alone were enough, this would serve an empty index indefinitely.
+        ClusteredIndex.drop(catalogService.getCatalog(), NAMESPACE, SOURCE_TABLE);
+
+        ClusterIndexService.BuildReport rebuilt =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+
+        assertFalse(rebuilt.reused(),
+                "the digest matched but the rows were gone, and the build was skipped anyway");
+        assertEquals(6, indexedRows(), "the index was not actually rebuilt");
+    }
+
+    @Test
+    @DisplayName("coverage is scoped, so rebuilding one scope does not make a peer look current")
+    void coverageIsPerScope() {
+        seed(0, 1, 2, 3, 4, 5);
+        clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+
+        // Same content, different model version: a distinct scope that has never been built. If
+        // coverage were held in a shared structure -- a snapshot summary map, say -- writing one
+        // scope's digest could make another read as covered, which is the cross-scope interference
+        // that the per-table purge already caused once in this class.
+        Table store = EmbeddingStore.loadOrCreate(catalogService.getCatalog(), NAMESPACE);
+        EmbeddingStore.append(store, List.of(EmbeddingEntry.builder()
+                .contentHash(hash(0))
+                .modelVersion("all-MiniLM-L6-v2:v2")
+                .configId(CONFIG_ID)
+                .embeddingDim(4)
+                .embedding(new float[]{1f, 1f, 1f, 0.5f})
+                .text("content 0")
+                .createdAt(Instant.ofEpochSecond(1_700_000_000L))
+                .build()));
+
+        ClusterIndexService.BuildReport other =
+                clusterIndex.build(SOURCE_TABLE, "all-MiniLM-L6-v2:v2", CONFIG_ID, 1);
+
+        assertFalse(other.reused(),
+                "an unbuilt scope reported as already covered, so coverage is not scope-isolated");
     }
 }

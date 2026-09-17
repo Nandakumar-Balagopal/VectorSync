@@ -183,4 +183,58 @@ class ContentIdentityTest {
                 .embeddingVersion("v1")
                 .build();
     }
+
+    // ------------------------------------------------------- coverage digest
+    //
+    // The digest is what lets a derived index be identified by the content it covers instead of by
+    // the source snapshot it was built from. Every property below is load-bearing for that: if the
+    // digest responds to anything other than the SET of content, then a layout-only rewrite of the
+    // source changes it, and the index has to be rebuilt for a change that touched no embedding.
+
+    @Test
+    @DisplayName("coverage digest ignores order, because scan order is not a property of the data")
+    void coverageDigestIsOrderIndependent() {
+        List<String> ascending = List.of("aa", "bb", "cc");
+        List<String> descending = List.of("cc", "bb", "aa");
+
+        assertEquals(ContentHash.coverageDigest(ascending), ContentHash.coverageDigest(descending),
+                "the same content read back in a different file order looked like different "
+                        + "coverage, which would force a rebuild after any reorganisation");
+    }
+
+    @Test
+    @DisplayName("coverage digest ignores duplicates, because Tier 1 is append-only")
+    void coverageDigestIsDuplicateInsensitive() {
+        // Two derive passes writing the same content leave two rows for one hash. That is a
+        // legitimate state of an append-only store and must not change what the index covers.
+        assertEquals(
+                ContentHash.coverageDigest(List.of("aa", "bb")),
+                ContentHash.coverageDigest(List.of("aa", "bb", "aa", "bb", "bb")),
+                "duplicate rows for one content hash changed the coverage digest");
+    }
+
+    @Test
+    @DisplayName("coverage digest changes when the content set changes")
+    void coverageDigestRespondsToContent() {
+        String base = ContentHash.coverageDigest(List.of("aa", "bb"));
+
+        assertNotEquals(base, ContentHash.coverageDigest(List.of("aa", "bb", "cc")),
+                "adding content did not change the digest, so new content would never be indexed");
+        assertNotEquals(base, ContentHash.coverageDigest(List.of("aa")),
+                "removing content did not change the digest, so deletions would never be applied");
+        assertNotEquals(base, ContentHash.coverageDigest(List.of("aa", "bc")),
+                "substituting content did not change the digest");
+    }
+
+    @Test
+    @DisplayName("covering nothing is distinguishable from never having been recorded")
+    void emptyCoverageHasItsOwnDigest() {
+        String empty = ContentHash.coverageDigest(List.of());
+
+        assertTrue(empty != null && !empty.isBlank(), "an empty scope produced no digest");
+        assertEquals(empty, ContentHash.coverageDigest(null),
+                "null and empty must agree; they are the same statement about coverage");
+        assertNotEquals(empty, ContentHash.coverageDigest(List.of("")),
+                "a scope covering one empty-string hash is not a scope covering nothing");
+    }
 }

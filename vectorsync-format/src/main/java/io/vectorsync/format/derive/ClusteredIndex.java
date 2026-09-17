@@ -22,11 +22,15 @@ import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.types.Types;
 
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * A serving table partitioned by cluster id, so that an ordinary query engine performs the candidate
@@ -54,8 +58,11 @@ public final class ClusteredIndex {
 
     public static final String TABLE_NAME_PREFIX = "clustered_";
     public static final String CENTROIDS_TABLE_NAME = "vector_centroids";
+    public static final String COVERAGE_TABLE_NAME = "vector_index_coverage";
     public static final String CLUSTER_ID_COLUMN = "cluster_id";
     public static final String CENTROID_COLUMN = "centroid";
+    public static final String COVERAGE_DIGEST_COLUMN = "coverage_digest";
+    public static final String COVERAGE_COUNT_COLUMN = "content_count";
 
     private ClusteredIndex() {
     }
@@ -133,6 +140,45 @@ public final class ClusteredIndex {
                 .build();
     }
 
+    /**
+     * What content a scope's index was built over, as a digest rather than a data version.
+     *
+     * <p>This is the table that makes the index's identity a function of <em>content</em> instead of
+     * a function of a source snapshot, and the distinction is the point rather than a refinement.
+     * An index keyed by snapshot id must be rebuilt on every new snapshot, because the key changed
+     * -- which is what the legacy HNSW path does, and it is why compaction costs it a full rebuild
+     * even though not one embedding changed. Keyed by a digest over the live content hashes, a
+     * snapshot that only moved bytes -- a data-file rewrite, a compaction, a sort reorganisation, a
+     * partition rewrite -- produces the same digest, and the existing index is provably still
+     * correct for it.
+     *
+     * <p>Held in its own table rather than in the clustered table's snapshot summary, and that is
+     * deliberate. Iceberg rebuilds the summary on each commit and does not carry forward custom
+     * keys, so a summary map keyed by scope would lose scope A's digest the moment scope B
+     * committed -- the same cross-scope interference that made the per-table {@code
+     * dropTable(purge=true)} destroy peer scopes. Here each scope is its own partition and its own
+     * scoped overwrite, so scopes cannot affect one another.
+     */
+    public static Schema coverageSchema() {
+        return new Schema(
+                Types.NestedField.required(1, Constants.MODEL_VERSION_COLUMN, Types.StringType.get()),
+                Types.NestedField.required(2, Constants.CONFIG_ID_COLUMN, Types.StringType.get()),
+                // SHA-256 over the sorted distinct content hashes this index covers.
+                Types.NestedField.required(3, COVERAGE_DIGEST_COLUMN, Types.StringType.get()),
+                // Kept alongside the digest for operators: a digest mismatch says "different", the
+                // count says "how different", which is the first thing anyone asks.
+                Types.NestedField.required(4, COVERAGE_COUNT_COLUMN, Types.LongType.get()),
+                Types.NestedField.required(5, Constants.CREATED_AT_COLUMN,
+                        Types.TimestampType.withZone()));
+    }
+
+    public static PartitionSpec coveragePartitionSpec(Schema schema) {
+        return PartitionSpec.builderFor(schema)
+                .identity(Constants.MODEL_VERSION_COLUMN)
+                .identity(Constants.CONFIG_ID_COLUMN)
+                .build();
+    }
+
     // ---------------------------------------------------------------- tables
 
     public static String tableName(String sourceTable) {
@@ -152,6 +198,12 @@ public final class ClusteredIndex {
         return loadOrCreate(catalog,
                 TableIdentifier.of(Namespace.of(namespace), CENTROIDS_TABLE_NAME),
                 centroidsSchema(), ClusteredIndex::centroidsPartitionSpec);
+    }
+
+    public static Table loadCoverageOrCreate(Catalog catalog, String namespace) {
+        return loadOrCreate(catalog,
+                TableIdentifier.of(Namespace.of(namespace), COVERAGE_TABLE_NAME),
+                coverageSchema(), ClusteredIndex::coveragePartitionSpec);
     }
 
     private static Table loadOrCreate(Catalog catalog,
@@ -287,6 +339,68 @@ public final class ClusteredIndex {
         List<DataFile> dataFiles = IcebergAppender.writeFiles(table, records);
         commitScopeReplacement(table, modelVersion, configId, dataFiles, base);
         log.info("Replaced {} centroids for {} / {}", centroids.size(), modelVersion, configId);
+    }
+
+    /** What a scope's index covers, as recorded at build time. */
+    public record Coverage(String digest, long contentCount) {
+    }
+
+    /**
+     * The coverage recorded for a scope, or empty when the index has never been built for it.
+     *
+     * <p>Empty and "digest does not match" are deliberately different answers: the first means
+     * there is no index, the second means there is one and it is stale. A caller that conflated them
+     * would rebuild from scratch in a case where it could have refused, or serve nothing in a case
+     * where it should have built.
+     */
+    public static Optional<Coverage> readCoverage(Table table, String modelVersion, String configId) {
+        if (table == null) {
+            return Optional.empty();
+        }
+        try (CloseableIterable<Record> rows = IcebergGenerics.read(table)
+                .where(scopeFilter(modelVersion, configId))
+                .build()) {
+            for (Record row : rows) {
+                String digest = String.valueOf(row.getField(COVERAGE_DIGEST_COLUMN));
+                Object count = row.getField(COVERAGE_COUNT_COLUMN);
+                return Optional.of(new Coverage(digest,
+                        count instanceof Number number ? number.longValue() : 0L));
+            }
+        } catch (Exception e) {
+            // Unreadable coverage must not be read as "matches". Reporting empty makes the caller
+            // rebuild, which is wasteful but correct; the opposite would serve a stale index.
+            log.warn("Could not read index coverage for {} / {}, treating it as absent: {}",
+                    modelVersion, configId, e.getMessage());
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Records what a scope's index now covers, replacing any earlier record for that scope.
+     *
+     * <p>Committed <em>after</em> the rows and centroids it describes, never before. A coverage row
+     * that ran ahead of the data would make the next build a no-op against an index that was never
+     * finished -- the same ordering rule the derive path follows in appending vectors before the
+     * pointers that reference them.
+     */
+    public static void replaceCoverage(Table table,
+                                       String modelVersion,
+                                       String configId,
+                                       String digest,
+                                       long contentCount) {
+        Snapshot base = table.currentSnapshot();
+        GenericRecord record = GenericRecord.create(table.schema());
+        record.setField(Constants.MODEL_VERSION_COLUMN, modelVersion);
+        record.setField(Constants.CONFIG_ID_COLUMN, configId);
+        record.setField(COVERAGE_DIGEST_COLUMN, digest);
+        record.setField(COVERAGE_COUNT_COLUMN, contentCount);
+        record.setField(Constants.CREATED_AT_COLUMN,
+                OffsetDateTime.ofInstant(Instant.now(), ZoneOffset.UTC));
+
+        List<DataFile> dataFiles = IcebergAppender.writeFiles(table, List.of(record));
+        commitScopeReplacement(table, modelVersion, configId, dataFiles, base);
+        log.info("Recorded index coverage {} ({} contents) for {} / {}",
+                digest, contentCount, modelVersion, configId);
     }
 
     /**
