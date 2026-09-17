@@ -28,9 +28,11 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * A serving table partitioned by cluster id, so that an ordinary query engine performs the candidate
@@ -339,6 +341,42 @@ public final class ClusteredIndex {
         List<DataFile> dataFiles = IcebergAppender.writeFiles(table, records);
         commitScopeReplacement(table, modelVersion, configId, dataFiles, base);
         log.info("Replaced {} centroids for {} / {}", centroids.size(), modelVersion, configId);
+    }
+
+    /**
+     * Content hashes a scope's index currently holds.
+     *
+     * <p>Projects one column, and unlike the equivalent read against the embedding store it does not
+     * have to project the filter columns as well: {@code model_version} and {@code config_id} are
+     * both identity partition fields here, so partition pruning satisfies them before any file is
+     * opened and leaves no residual to evaluate. On the embedding store {@code config_id} is a plain
+     * column, which is why its probe projection has to carry it or the scan fails with "Cannot find
+     * field".
+     *
+     * <p>A build-path read, not a serving one. It exists so a build can tell what it would be adding
+     * from what is already indexed, which is the difference between appending a delta and refitting
+     * the scope.
+     */
+    public static Set<String> scopeContentHashes(Table table, String modelVersion, String configId) {
+        Set<String> hashes = new LinkedHashSet<>();
+        if (table == null) {
+            return hashes;
+        }
+        try (CloseableIterable<Record> rows = IcebergGenerics.read(table)
+                .where(scopeFilter(modelVersion, configId))
+                .select(Constants.CONTENT_HASH_COLUMN)
+                .build()) {
+            for (Record row : rows) {
+                Object hash = row.getField(Constants.CONTENT_HASH_COLUMN);
+                if (hash != null) {
+                    hashes.add(String.valueOf(hash));
+                }
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException(String.format(
+                    "Could not read indexed content for %s / %s", modelVersion, configId), e);
+        }
+        return hashes;
     }
 
     /** What a scope's index covers, as recorded at build time. */

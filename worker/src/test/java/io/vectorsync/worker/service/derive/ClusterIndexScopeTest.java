@@ -420,4 +420,95 @@ class ClusterIndexScopeTest {
         assertFalse(other.reused(),
                 "an unbuilt scope reported as already covered, so coverage is not scope-isolated");
     }
+
+    // ------------------------------------------------------- incremental maintenance
+    //
+    // Coverage invariance makes layout churn free. These make real change cheap: new content is
+    // assigned against the centroids already on disk and appended, so nothing is relabelled and no
+    // refit runs. The bound on when that is allowed is the interesting part -- append against stale
+    // centroids drifts from what a fresh fit would give, which costs recall rather than correctness.
+
+    @Test
+    @DisplayName("added content is appended against existing centroids, without a refit")
+    void addedContentIsAppendedNotRefitted() {
+        seed(0, 1, 2, 3, 4, 5, 6, 7);
+        ClusterIndexService.BuildReport first =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+        assertFalse(first.incremental(), "the first build has nothing to append to");
+
+        // One new content over eight indexed: comfortably inside the incremental fraction.
+        seed(8);
+        ClusterIndexService.BuildReport second =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+
+        assertTrue(second.incremental(), "a small addition triggered a full refit");
+        assertFalse(second.reused(), "new content must not be reported as already covered");
+        assertEquals(0, second.iterations(), "k-means ran during an incremental append");
+        assertEquals(9, indexedRows(), "the appended vector is missing, or was double-written");
+        assertEquals(ClusterIndexService.Freshness.FRESH, status().freshness());
+        assertEquals(CLUSTERS, status().centroids(),
+                "an incremental append rewrote the centroids; they must keep describing the "
+                        + "assignment the appended rows were actually given");
+    }
+
+    @Test
+    @DisplayName("an incremental append leaves exactly one row per content, not two")
+    void incrementalAppendDoesNotDuplicate() {
+        seed(0, 1, 2, 3, 4, 5, 6, 7);
+        clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+        seed(8);
+        clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+
+        // The failure this guards is the one ClusteredIndex.append's javadoc warns about: appending
+        // after a refit leaves each vector under both its old and its new cluster id, and the probe
+        // then scores a mixture of two assignments. Assigning against existing centroids relabels
+        // nothing, so it cannot happen -- but only as long as the append path never refits.
+        Table clustered = ClusteredIndex.loadOrCreate(
+                catalogService.getCatalog(), NAMESPACE, SOURCE_TABLE);
+        java.util.Set<String> distinct =
+                ClusteredIndex.scopeContentHashes(clustered, MODEL_VERSION, CONFIG_ID);
+        assertEquals(9, distinct.size(), "distinct content in the index is wrong");
+        assertEquals(distinct.size(), indexedRows(),
+                "there are more rows than distinct contents, so a vector is present twice under "
+                        + "two cluster ids");
+    }
+
+    @Test
+    @DisplayName("growth beyond the incremental fraction refits instead of appending")
+    void largeGrowthRefits() {
+        seed(0, 1, 2, 3);
+        clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+
+        // Doubling the scope is far past the 0.25 default. Appending that much against centroids
+        // fitted over the original quarter would drift badly, so a refit is the better trade.
+        seed(4, 5, 6, 7);
+        ClusterIndexService.BuildReport grown =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+
+        assertFalse(grown.incremental(), "a doubling of the scope was appended rather than refitted");
+        assertTrue(grown.iterations() > 0, "a refit that ran no k-means iterations is not a refit");
+        assertEquals(8, indexedRows());
+    }
+
+    @Test
+    @DisplayName("removed content forces a refit, because a subset delete is not expressible")
+    void removalForcesRefit() {
+        seed(0, 1, 2, 3, 4, 5);
+        clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, CLUSTERS);
+        assertEquals(6, indexedRows());
+
+        // Drop Tier 1 and reseed a strict subset. content_hash is not a partition field of the
+        // clustered table, so Iceberg cannot delete a subset of a scope's rows by row filter --
+        // it refuses a filter it cannot prove covers whole files. So a removal must refit.
+        EmbeddingStore.drop(catalogService.getCatalog(), NAMESPACE);
+        seed(0, 1, 2);
+
+        ClusterIndexService.BuildReport shrunk =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, 2);
+
+        assertFalse(shrunk.incremental(), "a removal was treated as an append");
+        assertFalse(shrunk.reused());
+        assertEquals(3, indexedRows(),
+                "the removed content is still in the index, so the refit did not replace the scope");
+    }
 }

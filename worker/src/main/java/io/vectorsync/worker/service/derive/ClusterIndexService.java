@@ -56,6 +56,18 @@ public class ClusterIndexService {
      */
     private static final int MAX_COUNTED_HASHES = 2_000_000;
 
+    /**
+     * How much a scope may grow, as a fraction of what it already holds, before a refit is preferred
+     * to appending against the existing centroids.
+     *
+     * <p>The one judgement call in the incremental path. Each append assigns against centroids
+     * fitted over older content, so the assignment drifts from what a fresh fit would give; that
+     * costs recall rather than correctness, because whatever is read is still scored exactly, but it
+     * compounds. 0.25 keeps a scope within one refit of its data while making ordinary appends free.
+     */
+    @Value("${vectorsync.cluster.max-incremental-fraction:0.25}")
+    private double maxIncrementalFraction;
+
     private final IcebergCatalogService catalogService;
 
     /**
@@ -81,6 +93,8 @@ public class ClusterIndexService {
      *               identity: after a compaction or any other layout-only rewrite it is true, and
      *               the rebuild cost is zero.
      * @param coverageDigest the digest this scope's index covers, whether just written or matched
+     * @param incremental true when only the new content was appended, assigned against the centroids
+     *                    already on disk, with nothing relabelled and no refit
      */
     public record BuildReport(String sourceTable,
                               String modelVersion,
@@ -91,7 +105,8 @@ public class ClusterIndexService {
                               long canonicalRowsRead,
                               List<Integer> clusterSizes,
                               boolean reused,
-                              String coverageDigest) {
+                              String coverageDigest,
+                              boolean incremental) {
     }
 
     /** How the clustered index stands against the canonical vectors it was built from. */
@@ -124,9 +139,28 @@ public class ClusterIndexService {
      * Fits centroids over a scope's canonical vectors and replaces the clustered table's slice for
      * that scope.
      *
-     * <p>Rebuilds from scratch rather than updating in place. Reassignment after a centroid moves is
-     * a full relabel, and a prototype that pretended otherwise would hide the real cost of keeping
-     * this layer fresh -- which is the honest weakness of the approach and belongs in the open.
+     * <p>Three outcomes, cheapest first, and which one applies is decided from the content rather
+     * than from the caller's intent:
+     *
+     * <ol>
+     *   <li><b>Reuse.</b> The recorded coverage digest matches, so the content this scope holds is
+     *       unchanged and the index on disk is provably still correct. Nothing is fitted and nothing
+     *       is committed. This is the case a compaction, a data-file rewrite or a sort
+     *       reorganisation produces -- all of them make a new Iceberg snapshot and change no
+     *       content.
+     *   <li><b>Incremental append.</b> Content was added and none removed, within a bounded fraction
+     *       of the scope. The new content is assigned against the centroids already on disk and
+     *       appended; nothing is relabelled. See {@link #tryIncrement} for why appending is sound
+     *       here and not for a refit.
+     *   <li><b>Refit.</b> Everything else -- a removal, a scope with no centroids, or growth past
+     *       the incremental fraction. Refitting relabels every vector, so the scope is replaced
+     *       rather than appended to.
+     * </ol>
+     *
+     * <p>The refit path is the honest cost of this layer and is not hidden: an incremental append
+     * assigns against centroids fitted over older content, so its assignment drifts from what a
+     * fresh fit would give. That costs recall and not correctness, because whatever the probe reads
+     * is still scored exactly.
      *
      * <p>Two commits land, the data and then the centroids, and there is no atomicity across them:
      * Iceberg commits one table at a time. Data first is the better of the two orders, because it
@@ -183,12 +217,21 @@ public class ClusterIndexService {
                     modelVersion, configId, coverageDigest, recorded.get().contentCount());
             return new BuildReport(sourceTable, modelVersion, configId, 0, 0,
                     (int) recorded.get().contentCount(), canonical.rowsRead(), List.of(), true,
-                    coverageDigest);
+                    coverageDigest, false);
         }
 
         List<float[]> ordered = new ArrayList<>(hashes.size());
         for (String hash : hashes) {
             ordered.add(canonical.vectors().get(hash));
+        }
+
+        Table clusteredTable = ClusteredIndex.loadOrCreate(
+                catalogService.getCatalog(), vectorNamespace, sourceTable);
+
+        BuildReport incremental = tryIncrement(clusteredTable, coverageTable, sourceTable,
+                modelVersion, configId, canonical, hashes, coverageDigest);
+        if (incremental != null) {
+            return incremental;
         }
 
         VectorClustering.Model model = VectorClustering.fit(ordered, clusters, MAX_FIT_ROUNDS);
@@ -204,9 +247,7 @@ public class ClusterIndexService {
                     canonical.dimension(), embedding, canonical.texts().get(hash)));
         }
 
-        Table clustered = ClusteredIndex.loadOrCreate(
-                catalogService.getCatalog(), vectorNamespace, sourceTable);
-        ClusteredIndex.replaceScope(clustered, modelVersion, configId, entries);
+        ClusteredIndex.replaceScope(clusteredTable, modelVersion, configId, entries);
 
         Table centroidTable = ClusteredIndex.loadCentroidsOrCreate(
                 catalogService.getCatalog(), vectorNamespace);
@@ -232,7 +273,128 @@ public class ClusterIndexService {
                 model.clusterCount(), model.iterations());
         return new BuildReport(sourceTable, modelVersion, configId, model.clusterCount(),
                 model.iterations(), entries.size(), canonical.rowsRead(), clusterSizes, false,
-                coverageDigest);
+                coverageDigest, false);
+    }
+
+    /**
+     * Appends only the content the index does not yet hold, assigning it to the existing centroids.
+     *
+     * @return a report when the delta was applied incrementally, or {@code null} when the caller
+     *         must refit the scope
+     *
+     * <p>This is the step that makes content-addressed index identity useful for real change rather
+     * than only for layout churn. The coverage digest already makes a compaction free; without this,
+     * one genuinely new row still costs a full refit of the scope, because refitting is the only
+     * write path there is.
+     *
+     * <p>Appending is sound here for the specific reason that {@code ClusteredIndex.append}'s
+     * javadoc rules it out for a rebuild: a rebuild refits, and refitting relabels every existing
+     * vector, so appending a second generation would leave each vector present under two cluster
+     * ids. Assigning against the <em>existing</em> centroids relabels nothing, so append is exactly
+     * the right primitive and no vector can appear twice.
+     *
+     * <p>Three conditions, each of which is a correctness or quality bound rather than a tuning
+     * preference:
+     *
+     * <ul>
+     *   <li><b>Nothing may have been removed.</b> Deleting a subset of a scope's rows would need a
+     *       predicate on {@code content_hash}, which is not a partition field of the clustered
+     *       table, and Iceberg refuses a row filter it cannot prove covers whole files. Row-level
+     *       deletes would do it, but equality deletes are being retired from the spec, so a removal
+     *       falls back to a refit -- which is correct, just not cheap.
+     *   <li><b>Centroids must already exist</b> for this scope. With none there is nothing to assign
+     *       against.
+     *   <li><b>The delta must be small relative to the index.</b> Every increment assigns against
+     *       centroids fitted over older content, so the assignment drifts from what a fresh fit
+     *       would produce. That costs recall, not correctness -- candidates read are still scored
+     *       exactly -- but the drift is unbounded over many increments, so past a fraction of the
+     *       scope a refit is the better trade. This is the one number here that is a judgement
+     *       rather than a constraint.
+     * </ul>
+     */
+    private BuildReport tryIncrement(Table clusteredTable,
+                                     Table coverageTable,
+                                     String sourceTable,
+                                     String modelVersion,
+                                     String configId,
+                                     Canonical canonical,
+                                     List<String> hashes,
+                                     String coverageDigest) {
+        List<float[]> centroids = ClusteredIndex.readCentroids(clusteredTable == null
+                ? null : ClusteredIndex.loadCentroidsOrCreate(
+                        catalogService.getCatalog(), vectorNamespace), modelVersion, configId);
+        if (centroids.isEmpty()) {
+            return null;
+        }
+
+        Set<String> indexed =
+                ClusteredIndex.scopeContentHashes(clusteredTable, modelVersion, configId);
+        if (indexed.isEmpty()) {
+            return null;
+        }
+
+        Set<String> current = new LinkedHashSet<>(hashes);
+        List<String> added = new ArrayList<>();
+        for (String hash : hashes) {
+            if (!indexed.contains(hash)) {
+                added.add(hash);
+            }
+        }
+        boolean removals = false;
+        for (String hash : indexed) {
+            if (!current.contains(hash)) {
+                removals = true;
+                break;
+            }
+        }
+
+        if (removals) {
+            log.info("Scope {} / {} has removed content; refitting rather than appending",
+                    modelVersion, configId);
+            return null;
+        }
+        if (added.isEmpty()) {
+            // The digest differed but the content set does not, which means the digest was recorded
+            // against something else -- a different clustering, or a coverage row from an older
+            // build. Refit rather than silently accept it.
+            return null;
+        }
+        if (added.size() > Math.max(1, (long) (indexed.size() * maxIncrementalFraction))) {
+            log.info("Scope {} / {} grew by {} over {} indexed, beyond the incremental fraction {}; refitting",
+                    modelVersion, configId, added.size(), indexed.size(), maxIncrementalFraction);
+            return null;
+        }
+
+        VectorClustering.Model existing = new VectorClustering.Model(centroids, 0);
+        int[] sizes = new int[centroids.size()];
+        List<ClusteredIndex.Entry> newEntries = new ArrayList<>(added.size());
+        for (String hash : added) {
+            float[] embedding = canonical.vectors().get(hash);
+            int cluster = existing.assign(embedding);
+            sizes[cluster]++;
+            newEntries.add(new ClusteredIndex.Entry(hash, cluster, modelVersion, configId,
+                    canonical.dimension(), embedding, canonical.texts().get(hash)));
+        }
+
+        ClusteredIndex.append(clusteredTable, newEntries);
+        // Centroids are deliberately left alone: they are what the appended rows were assigned
+        // against, and rewriting them here would describe an assignment that is not on disk.
+        ClusteredIndex.replaceCoverage(
+                coverageTable, modelVersion, configId, coverageDigest, hashes.size());
+
+        String scope = scopeKey(modelVersion, configId);
+        centroidCache.remove(scope);
+        scopeSizeCache.remove(scope);
+
+        List<Integer> clusterSizes = new ArrayList<>(sizes.length);
+        for (int size : sizes) {
+            clusterSizes.add(size);
+        }
+
+        log.info("Appended {} new vectors to {} already indexed for {} / {} against existing centroids",
+                added.size(), indexed.size(), modelVersion, configId);
+        return new BuildReport(sourceTable, modelVersion, configId, centroids.size(), 0,
+                hashes.size(), canonical.rowsRead(), clusterSizes, false, coverageDigest, true);
     }
 
     /**
