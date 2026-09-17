@@ -85,7 +85,7 @@ class ProjectionPublishSkipTest {
         }
     }
 
-    /** Real SHA-256 hex, so the embedding store's {@code hash_prefix} partition is a real bucket. */
+    /** Real SHA-256 hex, so the store's content-hash bounds and range pruning behave realistically. */
     private static String hash(String text) {
         return ContentHash.of(text);
     }

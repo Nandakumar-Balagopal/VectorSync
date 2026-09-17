@@ -61,7 +61,7 @@ class ContentIdentityTest {
         String hash = ContentHash.of("anything");
         assertEquals(64, hash.length(), "truncating a dedup key across billions invites collisions");
         assertEquals(hash.substring(0, 2), ContentHash.prefix(hash));
-        assertEquals("00", ContentHash.prefix(null), "a missing hash must not throw in a partition path");
+        assertEquals("00", ContentHash.prefix(null), "a missing hash must not throw on the write path");
     }
 
     @Test

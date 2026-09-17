@@ -329,10 +329,13 @@ public final class ProjectionBuilder {
                 ContentMap.liveEntriesAsOf(contentMap, spec.getSourceTable(), configId, asOfSourceSequenceNumber));
 
         // Sorted by content hash, which does two things at once: identical content lands in one
-        // block so its vector is fetched once, and a block's hashes cluster into few hash_prefix
-        // partitions of the embedding store, so each batched load prunes hard instead of touching
-        // all 256 buckets. Row id and ordinal only make the order total, and therefore the file
-        // layout deterministic across rebuilds.
+        // block so its vector is fetched once, and a block's hashes form a narrow contiguous range,
+        // which is what EmbeddingStore.load's range predicate prunes on. That second reason used to
+        // be about clustering into few hash_prefix partitions; hash_prefix has since been retired
+        // from the store's spec because it pruned nothing and fragmented writes 256 ways, but the
+        // sort is if anything more load-bearing now -- a range predicate over a scattered batch
+        // prunes far less than over a sorted one. Row id and ordinal only make the order total, and
+        // therefore the file layout deterministic across rebuilds.
         live.sort(Comparator.comparing(ContentMapEntry::getContentHash)
                 .thenComparing(ContentMapEntry::getSourceRowId)
                 .thenComparingInt(ContentMapEntry::getChunkOrdinal));
