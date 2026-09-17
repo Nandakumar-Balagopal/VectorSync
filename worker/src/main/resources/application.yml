@@ -1,6 +1,19 @@
 spring:
   application:
     name: ${APP_NAME:vectorsync-worker}
+  task:
+    scheduling:
+      pool:
+        # Spring Boot's default is 1, so every @Scheduled method in the worker shares one thread and
+        # a long derivation cycle delays whatever is behind it. Only DerivationScheduler is live
+        # today -- SyncScheduler is @ConditionalOnProperty with no matchIfMissing and nothing sets
+        # it -- so this is headroom rather than a fix for an observed stall, and it is what stops
+        # the legacy scheduler from starving derivation the moment someone enables it.
+        #
+        # This is NOT the derivation concurrency knob. Cycle parallelism is
+        # vectorsync.runner.parallelism, which fans out inside one cycle rather than running cycles
+        # concurrently; @Scheduled(fixedDelay) never overlaps a method with itself.
+        size: ${SPRING_TASK_SCHEDULING_POOL_SIZE:2}
 
 server:
   port: ${SERVER_PORT:8081}

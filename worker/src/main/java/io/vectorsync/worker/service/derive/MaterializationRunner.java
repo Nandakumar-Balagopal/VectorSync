@@ -16,8 +16,15 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * Closes the loop: plans work for each materialization, drains it through the queue, publishes the
@@ -60,21 +67,78 @@ public class MaterializationRunner {
 
     private String owner;
 
+    /**
+     * Configuration groups derived concurrently within one cycle.
+     *
+     * <p>Defaults to 1, so the shipped behaviour is exactly the sequential cycle this replaced. The
+     * deliverable here is that the knob exists and that raising it is checked, not that the default
+     * changed -- raising it is a deployment decision with a hard prerequisite, below.
+     */
+    @Value("${vectorsync.runner.parallelism:1}")
+    private int parallelism;
+
+    private ExecutorService executor;
+
+    /**
+     * Resolves the lease owner and builds the cycle pool.
+     *
+     * <p>Both belong here rather than in the constructor because {@link #parallelism} and
+     * {@link #configuredOwner} are field injected: in the constructor the int is still 0, and a pool
+     * sized from it would either be rejected outright or -- worse, if it were a semaphore -- block
+     * on the first acquire forever, behind the scheduler's re-entrancy skip, stopping derivation
+     * permanently with nothing logged above DEBUG.
+     */
     @jakarta.annotation.PostConstruct
-    void resolveOwner() {
+    void startUp() {
         if (configuredOwner != null && !configuredOwner.isBlank()) {
             owner = configuredOwner;
-            return;
+        } else {
+            String host;
+            try {
+                host = java.net.InetAddress.getLocalHost().getHostName();
+            } catch (Exception e) {
+                host = "unknown-host";
+            }
+            owner = host + ":" + ProcessHandle.current().pid();
         }
-        String host;
-        try {
-            host = java.net.InetAddress.getLocalHost().getHostName();
-        } catch (Exception e) {
-            host = "unknown-host";
-        }
-        owner = host + ":" + ProcessHandle.current().pid();
         log.info("Derivation runner lease owner: {}", owner);
+
+        int threads = Math.max(1, parallelism);
+        if (threads > 1) {
+            // Refusing to start, rather than warning. HadoopCatalog has no atomic commit: two
+            // writers can both succeed and one silently wins, which is data loss with no exception
+            // and no way to notice after the fact. IcebergCatalogConfig already refuses Hadoop on
+            // object storage for the same reason; this is the second half of that check, because
+            // parallelism is what turns a single-writer deployment into a multi-writer one.
+            String catalogType = catalogService.config().type();
+            if ("hadoop".equals(catalogType)) {
+                throw new IllegalStateException(String.format(
+                        "vectorsync.runner.parallelism is %d but the catalog type is hadoop, which "
+                                + "has no atomic commit: two concurrent commits can both succeed and "
+                                + "one is silently lost. Either set parallelism to 1, or move to a "
+                                + "catalog with real commit semantics (jdbc, rest, hive, glue, "
+                                + "nessie).", parallelism));
+            }
+            log.info("Derivation runner parallelism {} on a {} catalog", threads, catalogType);
+        }
+
+        executor = Executors.newFixedThreadPool(threads, runnable -> {
+            Thread thread = new Thread(runnable, "derive-cycle-" + POOL_THREADS.incrementAndGet());
+            // Daemon so a hung derive cannot keep a shutting-down worker alive.
+            thread.setDaemon(true);
+            return thread;
+        });
     }
+
+    @jakarta.annotation.PreDestroy
+    void shutDown() {
+        if (executor != null) {
+            executor.shutdownNow();
+        }
+    }
+
+    private static final java.util.concurrent.atomic.AtomicInteger POOL_THREADS =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     /** Files leased per cycle. Bounds heap and keeps a crash cheap; it is not a throughput knob. */
     @Value("${vectorsync.runner.lease-batch:8}")
@@ -127,43 +191,118 @@ public class MaterializationRunner {
             return new CycleReport(0, 0, 0, 0, 0, 0);
         }
 
-        int enqueued = 0;
-        int processed = 0;
-        int failed = 0;
-        int projected = 0;
-        int advanced = 0;
-
+        // Grouped by configuration id, and the group -- not the materialization -- is the unit of
+        // concurrency. Two materializations that share a configId address the same Tier-1 content
+        // space, so deriving them at once means both probe the dedup record before either has
+        // written, both miss, and both pay for the same inference. That breaks the one-row-per-
+        // content invariant Tier 1 exists to hold and falsifies the equal-inference claim
+        // ReproducibilityTest asserts. Groups run in parallel; members of a group run in sequence.
+        //
+        // Note configId deliberately excludes the source table, so a group is frequently more than
+        // one materialization rather than rarely.
+        Map<String, List<Materialization>> byConfig = new LinkedHashMap<>();
         for (Materialization materialization : runnable) {
-            try {
-                enqueued += plan(materialization);
-                int[] result = drain(materialization);
-                processed += result[0];
-                failed += result[1];
-
-                if (publish(materialization, result[0])) {
-                    projected++;
-                    advanced++;
-                }
-            } catch (IncrementalChangeDetector.ReanchorRequiredException e) {
-                // Never resolves by retrying: the anchor snapshot has been expired or the source
-                // table was replaced. Parked with the reason so it stops consuming a cycle and an
-                // operator can re-admit it, rather than throwing every interval forever.
-                log.warn("Materialization {} ({}) needs re-anchoring: {}",
-                        materialization.getId(), materialization.getSourceTable(), e.getMessage());
-                control.markDegraded(materialization.getId(), e.getMessage());
-            } catch (org.apache.iceberg.exceptions.NoSuchTableException e) {
-                // The source table is gone. Also terminal without intervention.
-                log.warn("Materialization {} ({}) has no source table; parking it",
-                        materialization.getId(), materialization.getSourceTable());
-                control.markDegraded(materialization.getId(),
-                        "source table no longer exists: " + e.getMessage());
-            } catch (Exception e) {
-                log.error("Materialization {} ({}) failed this cycle: {}",
-                        materialization.getId(), materialization.getSourceTable(), e.getMessage(), e);
-            }
+            byConfig.computeIfAbsent(configIdOf(materialization), key -> new ArrayList<>())
+                    .add(materialization);
         }
 
-        return new CycleReport(runnable.size(), enqueued, processed, failed, projected, advanced);
+        List<Callable<CycleReport>> tasks = new ArrayList<>(byConfig.size());
+        for (List<Materialization> group : byConfig.values()) {
+            tasks.add(() -> {
+                CycleReport groupReport = new CycleReport(0, 0, 0, 0, 0, 0);
+                for (Materialization materialization : group) {
+                    groupReport = add(groupReport, runOne(materialization));
+                }
+                return groupReport;
+            });
+        }
+
+        CycleReport total = new CycleReport(0, 0, 0, 0, 0, 0);
+        try {
+            // invokeAll rather than a semaphore or a stream: it bounds concurrency at the pool size,
+            // joins before returning so no work outlives the cycle, cannot leak a permit on an
+            // exception, and cannot be rejected. It also makes two concurrent drains of one
+            // materialization impossible by construction, which is what lets the lease owner stay
+            // per-process instead of becoming per-thread churn in a VARCHAR(128).
+            for (Future<CycleReport> future : executor.invokeAll(tasks)) {
+                try {
+                    total = add(total, future.get());
+                } catch (ExecutionException e) {
+                    // runOne catches everything, so reaching here means the group wrapper itself
+                    // broke. Logged rather than rethrown: one group must not void the cycle's report.
+                    log.error("A materialization group failed outside its own handler: {}",
+                            e.getCause() == null ? e.toString() : e.getCause().toString(), e);
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Derivation cycle interrupted; {} groups were in flight", tasks.size());
+        }
+
+        return new CycleReport(runnable.size(), total.filesEnqueued(), total.filesProcessed(),
+                total.filesFailed(), total.projectionsPublished(), total.watermarksAdvanced());
+    }
+
+    /**
+     * One materialization's plan, drain and publish, with every failure contained.
+     *
+     * <p>Extracted from the cycle loop unchanged. Failures are isolated per materialization for the
+     * same reason the table loop is: a stable iteration order means one broken entry would otherwise
+     * starve every entry behind it forever. Containing them here rather than at the group level also
+     * keeps a thrown exception from cancelling the peers in its own group.
+     */
+    private CycleReport runOne(Materialization materialization) {
+        try {
+            int enqueued = plan(materialization);
+            int[] result = drain(materialization);
+            int projected = publish(materialization, result[0]) ? 1 : 0;
+            return new CycleReport(0, enqueued, result[0], result[1], projected, projected);
+        } catch (IncrementalChangeDetector.ReanchorRequiredException e) {
+            // Never resolves by retrying: the anchor snapshot has been expired or the source
+            // table was replaced. Parked with the reason so it stops consuming a cycle and an
+            // operator can re-admit it, rather than throwing every interval forever.
+            log.warn("Materialization {} ({}) needs re-anchoring: {}",
+                    materialization.getId(), materialization.getSourceTable(), e.getMessage());
+            control.markDegraded(materialization.getId(), e.getMessage());
+        } catch (org.apache.iceberg.exceptions.NoSuchTableException e) {
+            // The source table is gone. Also terminal without intervention.
+            log.warn("Materialization {} ({}) has no source table; parking it",
+                    materialization.getId(), materialization.getSourceTable());
+            control.markDegraded(materialization.getId(),
+                    "source table no longer exists: " + e.getMessage());
+        } catch (Exception e) {
+            log.error("Materialization {} ({}) failed this cycle: {}",
+                    materialization.getId(), materialization.getSourceTable(), e.getMessage(), e);
+        }
+        return new CycleReport(0, 0, 0, 0, 0, 0);
+    }
+
+    private static CycleReport add(CycleReport left, CycleReport right) {
+        return new CycleReport(
+                left.materializationsSeen() + right.materializationsSeen(),
+                left.filesEnqueued() + right.filesEnqueued(),
+                left.filesProcessed() + right.filesProcessed(),
+                left.filesFailed() + right.filesFailed(),
+                left.projectionsPublished() + right.projectionsPublished(),
+                left.watermarksAdvanced() + right.watermarksAdvanced());
+    }
+
+    /**
+     * Grouping key. Falls back to the materialization id when the spec cannot produce a
+     * configuration id, which keeps an unreadable entry in its own group rather than silently
+     * sharing one with every other broken entry.
+     */
+    private static String configIdOf(Materialization materialization) {
+        try {
+            MaterializationSpec spec = materialization.getSpec();
+            if (spec != null && spec.configId() != null) {
+                return spec.configId();
+            }
+        } catch (Exception e) {
+            log.warn("Could not derive a config id for materialization {}; isolating it: {}",
+                    materialization.getId(), e.getMessage());
+        }
+        return "unkeyed:" + materialization.getId();
     }
 
     /**
