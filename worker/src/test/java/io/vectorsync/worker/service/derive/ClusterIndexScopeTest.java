@@ -2,6 +2,8 @@ package io.vectorsync.worker.service.derive;
 
 import io.vectorsync.common.Constants;
 import io.vectorsync.format.derive.ClusteredIndex;
+import io.vectorsync.format.derive.ContentMap;
+import io.vectorsync.format.derive.ContentMapEntry;
 import io.vectorsync.format.derive.EmbeddingEntry;
 import io.vectorsync.format.derive.EmbeddingStore;
 import io.vectorsync.worker.client.DerivationControlClient;
@@ -96,6 +98,7 @@ class ClusterIndexScopeTest {
     void dropDerivedTables() {
         Catalog catalog = catalogService.getCatalog();
         EmbeddingStore.drop(catalog, NAMESPACE);
+        ContentMap.drop(catalog, NAMESPACE);
         ClusteredIndex.drop(catalog, NAMESPACE, SOURCE_TABLE);
         catalog.dropTable(
                 TableIdentifier.of(Namespace.of(NAMESPACE), ClusteredIndex.CENTROIDS_TABLE_NAME),
@@ -138,14 +141,40 @@ class ClusterIndexScopeTest {
                 .build();
     }
 
-    /** Appends one commit per call, so duplicates land in separate data files as they really would. */
+    /**
+     * Appends one commit per call, so duplicates land in separate data files as they really would.
+     *
+     * <p>Writes BOTH Tier-1 tables, because the clustered index is built from the content the
+     * content map currently resolves to -- not from everything the embedding store has ever held.
+     * The store is append-only and keeps superseded and deleted content forever, so indexing it
+     * wholesale puts stale vectors into serving; a probe was observed returning a document and its
+     * revised replacement. Seeding only the store left this fixture describing a state the pipeline
+     * never produces, and the filter that fixed the real bug then found nothing live here.
+     */
     private void seed(int... ordinals) {
         Table store = EmbeddingStore.loadOrCreate(catalogService.getCatalog(), NAMESPACE);
+        Table contentMap = ContentMap.loadOrCreate(catalogService.getCatalog(), NAMESPACE);
+
         List<EmbeddingEntry> entries = new ArrayList<>(ordinals.length);
+        List<ContentMapEntry> mappings = new ArrayList<>(ordinals.length);
         for (int ordinal : ordinals) {
             entries.add(entry(ordinal));
+            mappings.add(ContentMapEntry.builder()
+                    .sourceTable(SOURCE_TABLE)
+                    .sourceRowId("r-" + ordinal)
+                    .chunkOrdinal(0)
+                    .contentHash(hash(ordinal))
+                    .configId(CONFIG_ID)
+                    .modelVersion(MODEL_VERSION)
+                    .sourceSnapshotId(100L + ordinal)
+                    .sourceSequenceNumber(1L + ordinal)
+                    .sourceCommittedAtMillis(1_700_000_000_000L + ordinal)
+                    .deleted(false)
+                    .createdAt(Instant.ofEpochSecond(1_700_000_000L + ordinal))
+                    .build());
         }
         EmbeddingStore.append(store, entries);
+        ContentMap.append(contentMap, mappings);
     }
 
     /** Rows the clustered table holds for the scope, counted from the rows themselves. */
@@ -586,5 +615,57 @@ class ClusterIndexScopeTest {
         assertEquals(60, ClusterIndexService.suggestedClusters(3_593));
         // Capped, so a very large corpus cannot mint more partitions than a catalog wants to track.
         assertEquals(4096, ClusterIndexService.suggestedClusters(1_000_000_000L));
+    }
+
+    @Test
+    @DisplayName("superseded content is not indexed, so a probe cannot return a stale version")
+    void supersededContentIsNotIndexed() {
+        seed(0, 1, 2, 3);
+        clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, 2);
+        assertEquals(4, indexedRows());
+
+        // r-0's content is replaced: a new hash for the same row at a higher sequence number, which
+        // is what an UPDATE produces. The embedding store keeps BOTH -- it is append-only and never
+        // forgets -- so an index built from the store alone would hold five vectors and a probe
+        // could return the version no query should see. This was observed live before the fix: a
+        // probe returned a document and its revised replacement side by side.
+        Table store = EmbeddingStore.loadOrCreate(catalogService.getCatalog(), NAMESPACE);
+        EmbeddingStore.append(store, List.of(EmbeddingEntry.builder()
+                .contentHash(hash(99))
+                .modelVersion(MODEL_VERSION)
+                .configId(CONFIG_ID)
+                .embeddingDim(4)
+                .embedding(new float[]{9f, 1f, 1f, 0.5f})
+                .text("content 0, revised")
+                .createdAt(Instant.ofEpochSecond(1_700_000_999L))
+                .build()));
+        Table contentMap = ContentMap.loadOrCreate(catalogService.getCatalog(), NAMESPACE);
+        ContentMap.append(contentMap, List.of(ContentMapEntry.builder()
+                .sourceTable(SOURCE_TABLE)
+                .sourceRowId("r-0")
+                .chunkOrdinal(0)
+                .contentHash(hash(99))
+                .configId(CONFIG_ID)
+                .modelVersion(MODEL_VERSION)
+                .sourceSnapshotId(500L)
+                .sourceSequenceNumber(500L)
+                .sourceCommittedAtMillis(1_700_000_999_000L)
+                .deleted(false)
+                .createdAt(Instant.ofEpochSecond(1_700_000_999L))
+                .build()));
+
+        ClusterIndexService.BuildReport rebuilt =
+                clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, 2);
+
+        assertFalse(rebuilt.reused(), "the content set changed, so this must not be a reuse");
+        assertEquals(4, indexedRows(),
+                "the index holds five vectors, so the superseded version of r-0 is still being "
+                        + "served and Tier 3 disagrees with Tier 2 for the same query");
+
+        java.util.Set<String> indexed = ClusteredIndex.scopeContentHashes(
+                ClusteredIndex.loadOrCreate(catalogService.getCatalog(), NAMESPACE, SOURCE_TABLE),
+                MODEL_VERSION, CONFIG_ID);
+        assertTrue(indexed.contains(hash(99)), "the current version of r-0 is missing");
+        assertFalse(indexed.contains(hash(0)), "the superseded version of r-0 is still indexed");
     }
 }

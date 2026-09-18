@@ -2,6 +2,8 @@ package io.vectorsync.worker.service.derive;
 
 import io.vectorsync.common.Constants;
 import io.vectorsync.format.derive.ClusteredIndex;
+import io.vectorsync.format.derive.ContentMap;
+import io.vectorsync.format.derive.ContentMapEntry;
 import io.vectorsync.format.derive.ContentHash;
 import io.vectorsync.format.derive.EmbeddingStore;
 import io.vectorsync.format.derive.VectorClustering;
@@ -213,7 +215,7 @@ public class ClusterIndexService {
             throw new IllegalStateException("No embedding store; nothing has been derived yet");
         }
 
-        Canonical canonical = readCanonical(store, modelVersion, configId);
+        Canonical canonical = readCanonical(store, sourceTable, modelVersion, configId);
         if (canonical.vectors().isEmpty()) {
             // Refusing beats committing: replaceScope with no entries would delete a scope that is
             // serving, and an empty read here means Tier 1 has not caught up or the scope is
@@ -492,7 +494,50 @@ public class ClusterIndexService {
      * embedding is a pure function of the key the duplicates are byte-identical, so keeping the first
      * loses nothing.
      */
-    private Canonical readCanonical(Table store, String modelVersion, String configId) {
+    /**
+     * Content hashes the content map currently resolves to for a scope.
+     *
+     * <p>The embedding store is append-only and keeps every version of every piece of content ever
+     * embedded, including content whose source row was later edited or deleted. Indexing it
+     * wholesale therefore puts superseded vectors into serving: a probe was observed returning both
+     * a document and its revised replacement, and would equally return a deleted row's content. Tier
+     * 2 does not have this problem because it is projected from the content map's live entries; Tier
+     * 3 has to apply the same filter or the two tiers answer differently for the same query.
+     */
+    private Set<String> liveContentHashes(String sourceTable, String configId) {
+        Table contentMap = ContentMap.loadIfExists(catalogService.getCatalog(), vectorNamespace);
+        if (contentMap == null) {
+            return Set.of();
+        }
+        Set<String> live = new LinkedHashSet<>();
+        for (ContentMapEntry entry : ContentMap.liveEntries(contentMap, sourceTable, configId)) {
+            if (entry.getContentHash() != null) {
+                live.add(entry.getContentHash());
+            }
+        }
+        return live;
+    }
+
+    private Canonical readCanonical(Table store,
+                                    String sourceTable,
+                                    String modelVersion,
+                                    String configId) {
+        Set<String> live = liveContentHashes(sourceTable, configId);
+        if (live.isEmpty()) {
+            // No live mapping means nothing is being served for this scope, so there is nothing to
+            // index. Returning empty lets build() take its existing refusal path rather than
+            // committing an index over content no query can reach.
+            log.warn("No live content map entries for {} / {}; nothing to cluster",
+                    sourceTable, configId);
+            return new Canonical(new LinkedHashMap<>(), new LinkedHashMap<>(), 0, 0);
+        }
+        return readCanonicalFiltered(store, modelVersion, configId, live);
+    }
+
+    private Canonical readCanonicalFiltered(Table store,
+                                            String modelVersion,
+                                            String configId,
+                                            Set<String> live) {
         Map<String, float[]> vectors = new LinkedHashMap<>();
         Map<String, String> texts = new LinkedHashMap<>();
         int dimension = 0;
@@ -524,6 +569,12 @@ public class ClusterIndexService {
                 }
 
                 String hash = String.valueOf(row.getField(Constants.CONTENT_HASH_COLUMN));
+                if (!live.contains(hash)) {
+                    // Embedded once and no longer referenced by any live mapping: an edited or
+                    // deleted row's content. Skipped rather than indexed, or the probe returns
+                    // results Tier 2 would not.
+                    continue;
+                }
                 if (vectors.putIfAbsent(hash, embedding) == null) {
                     Object text = row.getField(Constants.TEXT_COLUMN);
                     texts.put(hash, text == null ? null : String.valueOf(text));
