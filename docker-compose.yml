@@ -10,7 +10,6 @@ services:
       - "${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./deployment/config/init.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
       - vectorsync-network
     healthcheck:

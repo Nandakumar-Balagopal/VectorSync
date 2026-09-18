@@ -5,7 +5,6 @@ COPY common/pom.xml common/pom.xml
 COPY vectorsync-format/pom.xml vectorsync-format/pom.xml
 COPY control-plane/pom.xml control-plane/pom.xml
 COPY worker/pom.xml worker/pom.xml
-COPY search-service/pom.xml search-service/pom.xml
 RUN mvn -q -B -Dmaven.wagon.http.retryHandler.count=5 -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dmaven.wagon.rto=60000 -DskipTests -pl control-plane -am dependency:go-offline
 COPY . .
 RUN mvn -q -B -Dmaven.wagon.http.retryHandler.count=5 -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dmaven.wagon.rto=60000 -DskipTests -pl control-plane -am package

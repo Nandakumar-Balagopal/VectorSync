@@ -291,10 +291,23 @@ def main():
     judged = {doc_id for relevant in qrels.values() for doc_id in relevant}
     ordered = [d for d in docs if d in judged] + [d for d in docs if d not in judged]
     docs = {doc_id: docs[doc_id] for doc_id in ordered[: args.rows]}
-    covered = len([d for d in docs if d in judged])
-    print("judged documents in the subset: %d of %d" % (covered, len(docs)))
-    if covered == 0:
-        print("  !! no judged documents -- nDCG will be 0.0000 and means nothing")
+
+    # Selecting judged DOCUMENTS is not enough, which a run proved: 300 of 300 documents were
+    # judged by some query and nDCG was still 0.0000 for every round. The metric needs queries
+    # whose OWN relevant documents are in the subset, so the queries are filtered too, and the
+    # count is printed rather than assumed -- a relevance figure that cannot be non-zero reads as a
+    # retrieval failure and is worse than no figure.
+    answerable = {
+        query_id: text for query_id, text in queries.items()
+        if any(doc_id in docs for doc_id in qrels.get(query_id, {}))
+    }
+    print("documents: %d, queries answerable from this subset: %d of %d"
+          % (len(docs), len(answerable), len(queries)))
+    if not answerable:
+        print("  !! no query has a relevant document in this subset -- nDCG will be 0.0000 and "
+              "means nothing. Raise --rows until this is non-zero.")
+    else:
+        queries = answerable
     print("corpus %s: %d documents, %d judged queries"
           % (args.dataset, len(docs), len(queries)))
 
