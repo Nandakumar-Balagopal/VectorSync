@@ -73,6 +73,13 @@ public class MaintenanceService {
     private int minFilesToCompact;
 
     /**
+     * Rows held in heap per rewrite group. The binding limit for vector payloads, since a decoded
+     * embedding is several times its Parquet size; see TableMaintenance for the measured arithmetic.
+     */
+    @Value("${vectorsync.maintenance.max-rows-per-rewrite:50000}")
+    private int maxRowsPerRewrite;
+
+    /**
      * Skip a table a writer has touched this recently.
      *
      * <p>The reason this exists rather than being left to Iceberg's commit retry: both sides
@@ -193,7 +200,7 @@ public class MaintenanceService {
         CompactionResult compaction = CompactionResult.nothingToDo("compaction not requested");
         if (compact) {
             compaction = TableMaintenance.compactDataFiles(
-                    table, targetFileBytes, minFilesToCompact);
+                    table, targetFileBytes, minFilesToCompact, maxRowsPerRewrite);
             if (compaction.didWork()) {
                 table.refresh();
             }

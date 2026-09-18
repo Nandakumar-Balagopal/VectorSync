@@ -80,13 +80,21 @@ public final class TableMaintenance {
     /**
      * Heap bound on one rewrite group, in rows.
      *
-     * <p>A group is materialised as {@link Record} objects before being written back, and these
-     * tables hold embeddings: a 384-dimension vector is roughly 1.5 KiB in Parquet but closer to
-     * 8 KiB as a boxed {@code List<Double>} on heap. Sizing groups by bytes alone would therefore
-     * let a 128 MiB group become hundreds of megabytes of objects, so the row count is the binding
-     * limit and the byte target is the secondary one.
+     * <p>This is the binding limit, not the byte target, and the reason is the payload. A group is
+     * materialised as {@link Record} objects before being written back, and a 384-dimension
+     * embedding is about 1.5 KiB in Parquet but roughly 9 KiB on heap as a boxed
+     * {@code List<Double>} -- a Double per component, plus the reference to it. So Parquet size
+     * understates heap by close to six times, and sizing purely by the byte target would be sizing
+     * by the wrong number.
+     *
+     * <p>Measured against a real warehouse: an embedding store held 908,006 records in 534 files
+     * averaging 2.4 MiB, so a 128 MiB group would have taken about 53 files and 90,000 records --
+     * roughly 830 MB of live objects, against a JVM whose default maximum heap is a quarter of the
+     * container's memory. 50,000 rows caps a group near 460 MB and still consolidates that store
+     * from 1,700 records per file to 50,000, which is the entire point. Raise it when the payload
+     * is text rather than vectors, or when the heap is known to be large.
      */
-    public static final int MAX_ROWS_PER_REWRITE = 200_000;
+    public static final int DEFAULT_MAX_ROWS_PER_REWRITE = 50_000;
 
     /**
      * How recently a table must have been committed to for maintenance to leave it alone.
@@ -195,7 +203,15 @@ public final class TableMaintenance {
 
     /** Compaction with the default thresholds. */
     public static CompactionResult compactDataFiles(Table table) {
-        return compactDataFiles(table, DEFAULT_TARGET_FILE_BYTES, DEFAULT_MIN_FILES_TO_COMPACT);
+        return compactDataFiles(table, DEFAULT_TARGET_FILE_BYTES, DEFAULT_MIN_FILES_TO_COMPACT,
+                DEFAULT_MAX_ROWS_PER_REWRITE);
+    }
+
+    public static CompactionResult compactDataFiles(Table table,
+                                                    long targetFileBytes,
+                                                    int minFilesToCompact) {
+        return compactDataFiles(table, targetFileBytes, minFilesToCompact,
+                DEFAULT_MAX_ROWS_PER_REWRITE);
     }
 
     /**
@@ -204,36 +220,54 @@ public final class TableMaintenance {
      * <p>Groups are built per partition, because the rows of one partition share a partition tuple
      * and can therefore be written back as files Iceberg will accept -- a group spanning partitions
      * would have to invent a tuple per output file. Within a partition, files are accumulated into
-     * groups bounded by {@code targetFileBytes} and {@link #MAX_ROWS_PER_REWRITE}, and each group is
+     * groups bounded by {@code targetFileBytes} and {@code maxRowsPerRewrite}, and each group is
      * its own commit, which bounds both the heap a rewrite holds and what one failure costs.
      *
      * <p>Files carrying delete files are skipped. Rewriting a file without re-applying its deletes
      * would resurrect deleted rows, and re-applying them is a merge-on-read concern this
      * append-only schema never creates.
      *
-     * @param targetFileBytes   files at or above this are left alone, and groups stop growing here
-     * @param minFilesToCompact groups with fewer files than this are skipped
+     * @param targetFileBytes    files at or above this are left alone, and groups stop growing here
+     * @param minFilesToCompact  groups with fewer files than this are skipped
+     * @param maxRowsPerRewrite  heap bound; see {@link #DEFAULT_MAX_ROWS_PER_REWRITE} for why this
+     *                           rather than the byte target is usually what binds
      */
     public static CompactionResult compactDataFiles(Table table,
                                                     long targetFileBytes,
-                                                    int minFilesToCompact) {
+                                                    int minFilesToCompact,
+                                                    int maxRowsPerRewrite) {
         if (table.currentSnapshot() == null) {
             return CompactionResult.nothingToDo("table has no snapshot");
         }
+        // The snapshot the file list is planned against. Carried into the commit as the validation
+        // anchor, which is both semantically right -- we are replacing the files that snapshot
+        // described -- and necessary: a rewrite with no anchor tries to walk the whole ancestry to
+        // validate, and on a table whose old snapshots have been expired that walk fails outright.
+        long plannedSnapshotId = table.currentSnapshot().snapshotId();
 
-        Map<StructLike, List<FileScanTask>> smallByPartition = new LinkedHashMap<>();
+        // Keyed by spec id AND partition tuple. The spec id is not decoration: a table whose
+        // partitioning has been changed holds files written under both specs, and their tuples have
+        // different arities, so they are not interchangeable in a rewrite. The embedding store is
+        // exactly such a table -- hash_prefix was retired from its spec once it measured as a net
+        // negative -- and grouping those files together would produce a partition tuple that fits
+        // neither spec.
+        Map<String, List<FileScanTask>> smallByPartition = new LinkedHashMap<>();
         int withDeletes = 0;
+        int largeEnough = 0;
+        int smallFiles = 0;
         try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
             for (FileScanTask task : tasks) {
                 if (task.file().fileSizeInBytes() >= targetFileBytes) {
+                    largeEnough++;
                     continue;
                 }
                 if (!task.deletes().isEmpty()) {
                     withDeletes++;
                     continue;
                 }
+                smallFiles++;
                 smallByPartition
-                        .computeIfAbsent(task.file().partition(), key -> new ArrayList<>())
+                        .computeIfAbsent(groupKey(task), key -> new ArrayList<>())
                         .add(task);
             }
         } catch (Exception e) {
@@ -244,14 +278,19 @@ public final class TableMaintenance {
         int removed = 0;
         int added = 0;
         long bytes = 0L;
+        int eligible = 0;
+        int failed = 0;
+        String firstFailure = null;
 
         for (List<FileScanTask> partitionFiles : smallByPartition.values()) {
-            for (List<FileScanTask> group : groupFiles(partitionFiles, targetFileBytes)) {
+            for (List<FileScanTask> group :
+                    groupFiles(partitionFiles, targetFileBytes, maxRowsPerRewrite)) {
                 if (group.size() < minFilesToCompact) {
                     continue;
                 }
+                eligible++;
                 try {
-                    CompactionResult one = rewriteGroup(table, group);
+                    CompactionResult one = rewriteGroup(table, group, plannedSnapshotId);
                     groups += one.groupsCompacted();
                     removed += one.filesRemoved();
                     added += one.filesAdded();
@@ -259,16 +298,33 @@ public final class TableMaintenance {
                 } catch (Exception e) {
                     // Per group, so one unreadable group does not abandon the rest. A failed
                     // rewrite commits nothing, so its files are simply left fragmented.
+                    failed++;
+                    if (firstFailure == null) {
+                        firstFailure = String.valueOf(e.getMessage());
+                    }
                     log.warn("Could not compact a group of {}: {}", table.name(), e.getMessage());
                 }
             }
         }
 
         if (groups == 0) {
-            return CompactionResult.nothingToDo(
-                    "no group reached " + minFilesToCompact + " files below " + targetFileBytes
-                            + " bytes" + (withDeletes > 0
-                            ? " (" + withDeletes + " skipped for delete files)" : ""));
+            // Two very different outcomes used to report the same sentence, and the sentence
+            // asserted a reason it had not checked. A table with hundreds of small files whose
+            // every rewrite failed is not a table with nothing to do, and reading it as one is how
+            // a broken compactor looks healthy.
+            if (failed > 0) {
+                return CompactionResult.nothingToDo(String.format(
+                        "%d eligible group(s), all %d failed to rewrite; first failure: %s",
+                        eligible, failed, firstFailure));
+            }
+            int biggest = smallByPartition.values().stream()
+                    .mapToInt(List::size).max().orElse(0);
+            return CompactionResult.nothingToDo(String.format(
+                    "nothing eligible: %d small file(s) across %d partition-spec group(s), "
+                            + "largest holding %d, none reaching the %d-file minimum after "
+                            + "grouping; %d already at target size%s",
+                    smallFiles, smallByPartition.size(), biggest, minFilesToCompact, largeEnough,
+                    withDeletes > 0 ? "; " + withDeletes + " carry delete files" : ""));
         }
 
         log.info("Compacted {}: {} groups, {} files replaced by {}, {} MiB rewritten",
@@ -282,7 +338,8 @@ public final class TableMaintenance {
      * and the row cap so that a group is writable as roughly one file and holdable in heap.
      */
     private static List<List<FileScanTask>> groupFiles(List<FileScanTask> files,
-                                                       long targetFileBytes) {
+                                                       long targetFileBytes,
+                                                       int maxRowsPerRewrite) {
         List<List<FileScanTask>> groups = new ArrayList<>();
         List<FileScanTask> current = new ArrayList<>();
         long currentBytes = 0L;
@@ -294,7 +351,7 @@ public final class TableMaintenance {
 
             boolean full = !current.isEmpty()
                     && (currentBytes + fileBytes > targetFileBytes
-                    || currentRows + fileRows > MAX_ROWS_PER_REWRITE);
+                    || currentRows + fileRows > maxRowsPerRewrite);
             if (full) {
                 groups.add(current);
                 current = new ArrayList<>();
@@ -313,8 +370,8 @@ public final class TableMaintenance {
         return groups;
     }
 
-    private static CompactionResult rewriteGroup(Table table, List<FileScanTask> group)
-            throws Exception {
+    private static CompactionResult rewriteGroup(Table table, List<FileScanTask> group,
+                                                long plannedSnapshotId) throws Exception {
         Set<DataFile> replacing = new HashSet<>();
         List<Record> rows = new ArrayList<>();
         long bytes = 0L;
@@ -338,6 +395,12 @@ public final class TableMaintenance {
         // replacing has already gone. An overwrite by row filter would instead delete whatever
         // matched at commit time, silently discarding a concurrent append into the same partition.
         table.newRewrite()
+                // Without this the commit validates against the entire ancestry, and a table whose
+                // older snapshots have been expired -- which is what the expiry above does on every
+                // pass -- cannot produce that ancestry at all. It fails with "cannot determine
+                // history between starting snapshot null and the last known ancestor", so
+                // compaction silently never worked on any table maintenance had already touched.
+                .validateFromSnapshot(plannedSnapshotId)
                 .rewriteFiles(replacing, new HashSet<>(written))
                 .commit();
 
@@ -376,6 +439,24 @@ public final class TableMaintenance {
             }
         }
         return rows;
+    }
+
+    /**
+     * Identity of a rewrite group: the partition spec the file was written under, plus its partition
+     * tuple.
+     *
+     * <p>Rendered as a string rather than using {@code StructLike} as a map key. Partition tuples
+     * from different specs are different types and comparing them is not meaningful, and the
+     * rendered form is also what makes the diagnostic note readable when nothing turns out to be
+     * eligible.
+     */
+    private static String groupKey(FileScanTask task) {
+        StructLike partition = task.file().partition();
+        StringBuilder key = new StringBuilder().append(task.spec().specId()).append(':');
+        for (int field = 0; field < partition.size(); field++) {
+            key.append(partition.get(field, Object.class)).append('/');
+        }
+        return key.toString();
     }
 
     private static int countSnapshots(Table table) {

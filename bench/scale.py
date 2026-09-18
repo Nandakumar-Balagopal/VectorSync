@@ -83,6 +83,21 @@ SPEC = {
 }
 
 
+def free_disk_gb(path="/"):
+    """
+    Free space on the host, in GiB.
+
+    <p>Checked every poll because a scale run is a disk-consumption test whether or not it was
+    meant to be: a million rows of 384-dimension vectors is several gigabytes in the embedding
+    store, again in the projection, and again in the clustered index. A previous attempt filled the
+    host, which segfaulted Postgres and corrupted the container runtime's filesystem -- the run was
+    lost and so was an hour of recovering the environment. Stopping early with partial data is
+    strictly better than that.
+    """
+    stats = os.statvfs(path)
+    return (stats.f_bavail * stats.f_frsize) / (1024.0 ** 3)
+
+
 def admit(table):
     """
     Registers the table, or finds the existing materialization for it.
@@ -192,7 +207,7 @@ FIELDS = [
     "store_records", "store_files",
     "cluster_vectors", "cluster_centroids", "cluster_freshness",
     "query_p50_ms", "query_ok",
-    "seed_rate_rows_per_s", "derive_rate_rows_per_s",
+    "seed_rate_rows_per_s", "derive_rate_rows_per_s", "free_disk_gb",
 ]
 
 
@@ -206,6 +221,9 @@ def main():
                              "fragmentation the run starts from")
     parser.add_argument("--poll-seconds", type=float, default=60.0)
     parser.add_argument("--out", default="/tmp/vectorsync-scale")
+    parser.add_argument("--min-free-gb", type=float, default=8.0,
+                        help="abort when host free space falls below this; a full disk corrupts "
+                             "the container runtime and costs far more than a shorter run")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -238,6 +256,12 @@ def main():
             now = time.time()
             if now >= deadline:
                 print("time budget reached", flush=True)
+                break
+
+            free_gb = free_disk_gb()
+            if free_gb < args.min_free_gb:
+                print("STOPPING: host free space down to %.1f GiB (floor %.1f). "
+                      "Partial data is kept." % (free_gb, args.min_free_gb), flush=True)
                 break
 
             # Keep feeding until the target is met, then stop writing and let the pipeline catch
@@ -305,6 +329,9 @@ def main():
                 "query_ok": len(timings),
                 "seed_rate_rows_per_s": round(seed_rate, 1),
                 "derive_rate_rows_per_s": round(derive_rate, 1),
+                # Recorded per sample so the storage cost of a row is recoverable from the run
+                # rather than estimated afterwards.
+                "free_disk_gb": round(free_disk_gb(), 2),
             }
             samples.append(sample)
             writer.writerow(sample)
@@ -337,6 +364,7 @@ def main():
         "queryP50MsFirstSample": samples[0]["query_p50_ms"] if samples else 0.0,
         "queryP50MsLastSample": samples[-1]["query_p50_ms"] if samples else 0.0,
         "csv": csv_path,
+        "freeDiskGbAtEnd": round(free_disk_gb(), 2),
     }
     summary_path = os.path.join(args.out, "summary.json")
     with open(summary_path, "w") as handle:

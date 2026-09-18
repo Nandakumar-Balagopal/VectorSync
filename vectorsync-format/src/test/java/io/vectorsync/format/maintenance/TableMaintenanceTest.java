@@ -192,6 +192,38 @@ class TableMaintenanceTest {
     }
 
     @Test
+    @DisplayName("compaction still works after snapshots have been expired")
+    void compactsAfterExpiry() throws Exception {
+        Table table = createTable();
+        for (int i = 0; i < 24; i++) {
+            IcebergAppender.append(table, List.of(row("acme", "r" + i, "text " + i)));
+        }
+        table.refresh();
+
+        // Expire first, which is the ordinary steady state rather than a corner case: the
+        // maintenance pass expires snapshots on every tick, so by the time compaction next runs the
+        // ancestry it would need is already gone. A rewrite with no validation anchor then fails
+        // with "cannot determine history between starting snapshot null and the last known
+        // ancestor", and because each group's failure is caught per group, the pass reports doing
+        // nothing rather than failing -- so compaction silently never ran on a maintained table.
+        TableMaintenance.expireSnapshots(table, Duration.ZERO, 2);
+        table.refresh();
+        assertEquals(2, countSnapshots(table), "fixture needs a truncated ancestry");
+
+        Set<String> before = rowsOf(table);
+        int filesBefore = countFiles(table);
+
+        CompactionResult result = TableMaintenance.compactDataFiles(table, ONE_MIB, 5);
+        table.refresh();
+
+        assertTrue(result.didWork(),
+                "compaction must work on a table with expired ancestry: " + result.note());
+        assertTrue(countFiles(table) < filesBefore);
+        assertEquals(before, rowsOf(table));
+        assertEquals(24, countRecords(table));
+    }
+
+    @Test
     @DisplayName("a table a writer just committed to reads as busy")
     void busyTableIsDetected() {
         Table table = createTable();
