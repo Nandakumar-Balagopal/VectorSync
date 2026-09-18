@@ -7,6 +7,7 @@ import io.vectorsync.format.derive.SqlViewGenerator;
 import io.vectorsync.worker.service.derive.DeriveMetricsRegistry;
 import io.vectorsync.worker.service.derive.DeriveOrchestrationService;
 import io.vectorsync.worker.service.derive.ProjectionReader;
+import io.vectorsync.worker.service.derive.ProvenanceService;
 import io.vectorsync.worker.service.embedding.EmbeddingService;
 import io.vectorsync.worker.service.iceberg.IcebergCatalogService;
 import lombok.extern.slf4j.Slf4j;
@@ -40,6 +41,7 @@ public class DeriveController {
     private final ProjectionReader projections;
     private final EmbeddingService embeddings;
     private final IcebergCatalogService catalogService;
+    private final ProvenanceService provenance;
 
     @org.springframework.beans.factory.annotation.Value("${iceberg.vector.namespace:vector}")
     private String vectorNamespace;
@@ -48,12 +50,14 @@ public class DeriveController {
                             DeriveMetricsRegistry metrics,
                             ProjectionReader projections,
                             EmbeddingService embeddings,
-                            IcebergCatalogService catalogService) {
+                            IcebergCatalogService catalogService,
+                            ProvenanceService provenance) {
         this.orchestration = orchestration;
         this.metrics = metrics;
         this.projections = projections;
         this.embeddings = embeddings;
         this.catalogService = catalogService;
+        this.provenance = provenance;
     }
 
     /**
@@ -298,6 +302,28 @@ public class DeriveController {
                     "k", limit,
                     "hits", projections.topK(
                             request.sourceTable(), request.configId(), query, limit)));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(409).body(Map.of("error", String.valueOf(e.getMessage())));
+        }
+    }
+
+    /**
+     * The derivation chain for one chunk: what it resolves to now, and every assertion that got it
+     * there.
+     *
+     * <p>Reconstructed from the content map and the embedding store rather than from an audit log,
+     * so it cannot disagree with what a query returns. A tombstoned chunk is a complete answer --
+     * "retired at source sequence N" -- not a 404, because that is precisely the fact someone
+     * investigating a disappeared result needs.
+     */
+    @GetMapping("/provenance")
+    public ResponseEntity<?> provenance(@RequestParam String sourceTable,
+                                        @RequestParam String configId,
+                                        @RequestParam String sourceRowId,
+                                        @RequestParam(defaultValue = "0") int chunkOrdinal) {
+        try {
+            return ResponseEntity.ok(
+                    provenance.chainFor(sourceTable, configId, sourceRowId, chunkOrdinal));
         } catch (IllegalStateException e) {
             return ResponseEntity.status(409).body(Map.of("error", String.valueOf(e.getMessage())));
         }

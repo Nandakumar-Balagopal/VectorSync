@@ -158,6 +158,15 @@ public class MaterializationEntity {
      * sweeper that this configuration's content-map rows are candidates once no other
      * materialization references the content they point at.
      */
+    /**
+     * True for the one materialization a reader should query for this source table.
+     *
+     * <p>Enforced by a partial unique index rather than here, because promotion is the operation
+     * where two concurrent callers would both otherwise believe they won.
+     */
+    @Column(name = "serving", nullable = false)
+    private boolean serving;
+
     @Column(name = "purge_eligible", nullable = false)
     private boolean purgeEligible;
 

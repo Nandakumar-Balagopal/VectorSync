@@ -184,4 +184,21 @@ public class MaterializationController {
                             "message", String.valueOf(e.getMessage())));
         }
     }
+
+    /**
+     * Makes this materialization the one a reader should query for its source table.
+     *
+     * <p>409 with every blocker listed, rather than the first one: a gate that reports one problem
+     * at a time invites a sequence of retries, each discovering the next.
+     */
+    @PostMapping("/{id}/promote")
+    public ResponseEntity<?> promote(@PathVariable("id") String id) {
+        AdmissionService.PromotionResult result = admissionService.promote(id);
+        if (result.promoted() == null) {
+            return ResponseEntity.status(409).body(Map.of(
+                    "error", "promotion refused",
+                    "blockers", result.blockers()));
+        }
+        return ResponseEntity.ok(result);
+    }
 }

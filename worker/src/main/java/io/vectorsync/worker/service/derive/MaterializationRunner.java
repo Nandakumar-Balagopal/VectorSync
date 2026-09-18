@@ -20,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -267,10 +268,20 @@ public class MaterializationRunner {
      */
     private CycleReport runOne(Materialization materialization) {
         try {
-            int enqueued = plan(materialization);
+            // The reconcile path drains its own queue, so its processed count has to reach publish()
+            // from here. It used to be discarded: plan() returned only an enqueued count, the
+            // drain() below then found an empty queue and returned 0, and publish() early-returns on
+            // processedThisCycle == 0 for a LIVE materialization -- so the watermark never advanced,
+            // the next cycle re-assessed the identical range, and the reconcile repeated every
+            // interval forever. Observed on real data as the same "206 of 495 rows retired" twice.
+            // This is hazard H3 from the architecture review, which named exactly this: plan()
+            // returning an int cannot carry what publish() needs to know.
+            Planned planned = plan(materialization);
             int[] result = drain(materialization);
-            int projected = publish(materialization, result[0]) ? 1 : 0;
-            return new CycleReport(0, enqueued, result[0], result[1], projected, projected);
+            int processed = planned.processed() + result[0];
+            int failed = planned.failed() + result[1];
+            int projected = publish(materialization, processed) ? 1 : 0;
+            return new CycleReport(0, planned.enqueued(), processed, failed, projected, projected);
         } catch (IncrementalChangeDetector.ReanchorRequiredException e) {
             // Never resolves by retrying: the anchor snapshot has been expired or the source
             // table was replaced. Parked with the reason so it stops consuming a cycle and an
@@ -327,7 +338,21 @@ public class MaterializationRunner {
      * is far cheaper than tracking planning progress separately and risking it diverging from the
      * queue.
      */
-    private int plan(Materialization materialization) {
+    /**
+     * What one plan pass queued, and what it already processed itself.
+     *
+     * <p>{@code processed} and {@code failed} are non-zero only on the reconcile path, which drains
+     * its own queue so that the sweep cannot be separated from the derive it depends on. Everything
+     * else leaves them zero and is drained by the caller.
+     */
+    private record Planned(int enqueued, int processed, int failed) {
+
+        static Planned queued(int enqueued) {
+            return new Planned(enqueued, 0, 0);
+        }
+    }
+
+    private Planned plan(Materialization materialization) {
         MaterializationSpec spec = materialization.getSpec();
         TableConfig config = toTableConfig(spec);
 
@@ -342,11 +367,11 @@ public class MaterializationRunner {
             // 10,000 files of work, with the enqueue round trips, not derivation, setting the
             // wall-clock floor.
             if (depth != null && (depth.getPending() > 0 || depth.getLeased() > 0)) {
-                return 0;
+                return Planned.queued(0);
             }
             if (depth != null && depth.getDone() > 0 && depth.getFailed() == 0) {
                 // Everything planned has been derived; publish() advances from here.
-                return 0;
+                return Planned.queued(0);
             }
 
             control.beginBackfill(materialization.getId());
@@ -356,12 +381,12 @@ public class MaterializationRunner {
                 log.info("Materialization {} backfill: {} of {} files newly queued",
                         materialization.getId(), inserted, work.size());
             }
-            return inserted;
+            return Planned.queued(inserted);
         }
 
         IncrementalChangeDetector.SourceVersion current = detector.currentVersion(config);
         if (current.isEmpty() || current.snapshotId() == materialization.getAnchorSnapshotId()) {
-            return 0;
+            return Planned.queued(0);
         }
 
         // An append scan cannot see deletes or overwrites. Advancing anyway would move the watermark
@@ -371,19 +396,19 @@ public class MaterializationRunner {
                 detector.assess(config, materialization.getAnchorSnapshotId(), current.snapshotId());
         if (!assessment.incrementalSafe()) {
             if (assessment.reconcileRequired() && reconcileEnabled) {
-                return reconcile(materialization, spec, config, current);
+                return reconcile(materialization, spec, config, current, assessment);
             }
             log.warn("Materialization {} needs a reconcile: {}", materialization.getId(),
                     assessment.verdict());
             control.markDegraded(materialization.getId(),
                     "incremental scan unsafe: " + assessment.verdict()
                             + " (deletes or overwrites between snapshots require a reconcile)");
-            return 0;
+            return Planned.queued(0);
         }
 
         List<SourceFileWork> work = detector.incrementalWork(
                 config, materialization.getAnchorSnapshotId(), current.snapshotId());
-        return control.enqueue(materialization.getId(), work, "INCREMENTAL");
+        return Planned.queued(control.enqueue(materialization.getId(), work, "INCREMENTAL"));
     }
 
     /**
@@ -411,17 +436,31 @@ public class MaterializationRunner {
      *
      * @return files enqueued, so the caller's accounting is unchanged
      */
-    private int reconcile(Materialization materialization,
-                          MaterializationSpec spec,
-                          TableConfig config,
-                          IncrementalChangeDetector.SourceVersion target) {
+    private Planned reconcile(Materialization materialization,
+                              MaterializationSpec spec,
+                              TableConfig config,
+                              IncrementalChangeDetector.SourceVersion target,
+                              IncrementalChangeDetector.ScanAssessment assessment) {
         log.info("Materialization {} reconciling to snapshot {} (sequence {})",
                 materialization.getId(), target.snapshotId(), target.sequenceNumber());
 
         // Pinned to the target version, not "current". The re-derive and the sweep have to describe
         // the same source version or a commit landing between them tombstones rows the derive never
         // looked at.
-        List<SourceFileWork> work = detector.backfillWork(config, target.snapshotId());
+        // Scoped to the partitions the assessment identified, which is what makes a reconcile
+        // proportional to the change rather than to the table. An empty set means the scope could
+        // not be narrowed -- an unpartitioned source, a spec evolution inside the range, or
+        // unreadable manifests -- and then the whole table is the only correct answer, which is why
+        // wholeTableReconcile() names that case rather than leaving it to be inferred.
+        Set<String> partitions = assessment.affectedPartitions();
+        List<SourceFileWork> work = assessment.wholeTableReconcile()
+                ? detector.backfillWork(config, target.snapshotId())
+                : detector.backfillWork(config, target.snapshotId(), partitions);
+        log.info("Materialization {} reconciling {} ({} files)", materialization.getId(),
+                assessment.wholeTableReconcile()
+                        ? "the whole table"
+                        : partitions.size() + " affected partition(s)",
+                work.size());
         int enqueued = control.enqueue(materialization.getId(), work, "BACKFILL");
 
         int[] drained = drain(materialization);
@@ -430,7 +469,7 @@ public class MaterializationRunner {
                     drained[1] + " files failed during a reconcile; the sweep was not attempted "
                             + "because tombstoning against a partial re-derive would retire rows "
                             + "whose new version had not been written");
-            return enqueued;
+            return new Planned(enqueued, drained[0], drained[1]);
         }
 
         ReconcileService.SweepResult swept = reconcileService.sweep(
@@ -440,12 +479,14 @@ public class MaterializationRunner {
         if (!swept.complete()) {
             log.warn("Materialization {} sweep refused: {}", materialization.getId(), swept.note());
             control.markDegraded(materialization.getId(), "reconcile sweep refused: " + swept.note());
-            return enqueued;
+            return new Planned(enqueued, drained[0], drained[1]);
         }
 
         log.info("Materialization {} reconciled: {} of {} mapped rows retired",
                 materialization.getId(), swept.tombstoned(), swept.liveBefore());
-        return enqueued;
+        // The processed count is what lets publish() run and the watermark advance. Without it the
+        // reconcile repeats on every cycle against the same range.
+        return new Planned(enqueued, Math.max(drained[0], 1), 0);
     }
 
     /** @return {processed, failed} */

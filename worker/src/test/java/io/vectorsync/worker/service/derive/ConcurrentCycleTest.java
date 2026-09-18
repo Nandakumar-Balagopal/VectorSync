@@ -57,6 +57,7 @@ class ConcurrentCycleTest {
     private IcebergCatalogConfig catalogConfig;
     private ContentHashIndex hashIndex;
     private DeriveMetricsRegistry metrics;
+    private ReconcileService reconcileService;
 
     @BeforeEach
     void stubCollaborators() {
@@ -67,6 +68,7 @@ class ConcurrentCycleTest {
         catalogConfig = Mockito.mock(IcebergCatalogConfig.class);
         hashIndex = Mockito.mock(ContentHashIndex.class);
         metrics = Mockito.mock(DeriveMetricsRegistry.class);
+        reconcileService = Mockito.mock(ReconcileService.class);
         when(catalogService.config()).thenReturn(catalogConfig);
     }
 
@@ -74,7 +76,7 @@ class ConcurrentCycleTest {
         when(catalogConfig.type()).thenReturn(catalogType);
         MaterializationRunner runner = new MaterializationRunner(
                 control, detector, deriveService, catalogService, hashIndex, metrics,
-                Mockito.mock(ReconcileService.class));
+                reconcileService);
         ReflectionTestUtils.setField(runner, "parallelism", parallelism);
         ReflectionTestUtils.setField(runner, "configuredOwner", "test-owner");
         ReflectionTestUtils.setField(runner, "leaseBatch", 8);
@@ -230,5 +232,77 @@ class ConcurrentCycleTest {
         // materialization cannot make the cycle look smaller than it was.
         assertEquals(2, report.materializationsSeen(),
                 "a failing materialization was dropped from the cycle report");
+    }
+
+    @Test
+    @DisplayName("a reconcile reports its processed work, so the watermark can advance")
+    void reconcileReportsItsProcessedWork() {
+        // The bug this guards was silent and observable only in production logs: reconcile() drains
+        // its own queue inside plan(), so the drain() that follows found nothing, publish()
+        // early-returned on processedThisCycle == 0 for a LIVE materialization, the watermark never
+        // moved, and the next cycle re-assessed the identical range. Observed as the same
+        // "206 of 495 rows retired" on consecutive passes, forever.
+        //
+        // The cycle report is the observable proxy: a reconcile that processed files must surface a
+        // non-zero filesProcessed, because that is the value publish() keys on.
+        MaterializationSpec spec = spec("default.reconciled", "description");
+        when(control.runnable()).thenReturn(List.of(live("m-rec", spec)));
+
+        // A source that moved, with an assessment demanding a reconcile over one known partition.
+        when(detector.currentVersion(any(TableConfig.class)))
+                .thenReturn(new IncrementalChangeDetector.SourceVersion(999L, 9L));
+        when(detector.assess(any(TableConfig.class), anyLong(), anyLong()))
+                .thenReturn(new IncrementalChangeDetector.ScanAssessment(
+                        IncrementalChangeDetector.ScanVerdict.RECONCILE_REQUIRED,
+                        "deletes between snapshots", List.of(999L), Set.of("day=2026-09-18")));
+        when(detector.backfillWork(any(TableConfig.class), anyLong(), any()))
+                .thenReturn(List.of());
+        when(control.enqueue(anyString(), any(), anyString())).thenReturn(1);
+        when(control.lease(anyString(), anyInt(), anyLong(), anyString()))
+                .thenReturn(List.of());
+        when(reconcileService.sweep(any(), any(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(new ReconcileService.SweepResult(10, 12, 2, true, "2 rows tombstoned"));
+
+        MaterializationRunner runner = runner(1, "jdbc");
+        ReflectionTestUtils.setField(runner, "reconcileEnabled", true);
+        runner.startUp();
+        MaterializationRunner.CycleReport report = runner.runCycle();
+        runner.shutDown();
+
+        assertTrue(report.filesProcessed() > 0,
+                "the reconcile's work was not reported, so publish() sees zero processed and the "
+                        + "watermark will never advance -- the reconcile then repeats every cycle "
+                        + "against the same range");
+    }
+
+    @Test
+    @DisplayName("a reconcile scopes its re-derive to the affected partitions")
+    void reconcileScopesToAffectedPartitions() {
+        MaterializationSpec spec = spec("default.scoped", "description");
+        when(control.runnable()).thenReturn(List.of(live("m-scope", spec)));
+        when(detector.currentVersion(any(TableConfig.class)))
+                .thenReturn(new IncrementalChangeDetector.SourceVersion(1000L, 10L));
+        when(detector.assess(any(TableConfig.class), anyLong(), anyLong()))
+                .thenReturn(new IncrementalChangeDetector.ScanAssessment(
+                        IncrementalChangeDetector.ScanVerdict.RECONCILE_REQUIRED,
+                        "overwrite", List.of(1000L), Set.of("day=2026-09-18", "day=2026-09-17")));
+        when(detector.backfillWork(any(TableConfig.class), anyLong(), any()))
+                .thenReturn(List.of());
+        when(control.enqueue(anyString(), any(), anyString())).thenReturn(0);
+        when(control.lease(anyString(), anyInt(), anyLong(), anyString())).thenReturn(List.of());
+        when(reconcileService.sweep(any(), any(), anyLong(), anyLong(), anyLong()))
+                .thenReturn(new ReconcileService.SweepResult(5, 5, 0, true, "nothing vanished"));
+
+        MaterializationRunner runner = runner(1, "jdbc");
+        ReflectionTestUtils.setField(runner, "reconcileEnabled", true);
+        runner.startUp();
+        runner.runCycle();
+        runner.shutDown();
+
+        // The scoped overload, not the whole-table one. A reconcile that re-derives the entire
+        // source on every mutation is correct and proportional to the table rather than the change,
+        // which is what makes a rapidly-changing table unaffordable.
+        Mockito.verify(detector).backfillWork(any(TableConfig.class), anyLong(), any());
+        Mockito.verify(detector, Mockito.never()).backfillWork(any(TableConfig.class), anyLong());
     }
 }

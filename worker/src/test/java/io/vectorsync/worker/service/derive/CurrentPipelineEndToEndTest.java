@@ -464,8 +464,8 @@ class CurrentPipelineEndToEndTest {
     }
 
     @Test
-    @DisplayName("a copy-on-write UPDATE is refused by assess, not attempted")
-    void copyOnWriteUpdateIsRefused() {
+    @DisplayName("the direct derive endpoint refuses an overwrite; the scheduler reconciles it")
+    void directDerivePathRefusesOverwrite() {
         appendSource(List.<String[]>of(
                 new String[]{"p-100", "Trail Runner", "Lightweight shoe for rocky mountain trails"},
                 new String[]{"p-200", "Espresso Machine", "Pulls a double shot in twenty seconds"}));
@@ -481,15 +481,18 @@ class CurrentPipelineEndToEndTest {
 
         var pass = orchestration.incremental(spec, config(), anchor, System.currentTimeMillis());
 
-        // This is the finding. assess() allowlists only APPEND and REPLACE, so an overwrite is
-        // refused wholesale -- even though a pure update is the case the content map's row-id
-        // keying and sequence collapse are built to absorb. The refusal is over-broad, not wrong:
-        // it cannot distinguish an overwrite that only rewrote rows from one that removed some,
-        // and guessing the difference would serve deleted rows.
+        // This is about DeriveOrchestrationService, not about the system. assess() allowlists only
+        // APPEND and REPLACE, and this queue-free entry point has no reconcile to fall back to, so
+        // it refuses. MaterializationRunner.plan routes the same verdict to a reconcile instead, so
+        // an overwrite IS handled on the scheduler path -- which is the path a deployment runs.
+        //
+        // The earlier name for this test said "a copy-on-write UPDATE is refused by assess", which
+        // was true of the whole system when written and became true of only this endpoint once the
+        // reconcile was wired. A test name that describes a debug path as if it described the
+        // product is worse than no test.
         assertFalse(pass.complete(),
-                "if this now passes, assess() has been narrowed to admit row-preserving "
-                        + "overwrites and this test should assert the new content is retrievable "
-                        + "instead");
+                "the direct endpoint should still refuse; if it reconciles now, this test should "
+                        + "assert the new content is retrievable instead");
         assertEquals(1, pass.filesFailed(), "the refusal should be reported, not silent");
         assertEquals(0, pass.inferenceCalls(), "a refused pass must not embed anything");
     }

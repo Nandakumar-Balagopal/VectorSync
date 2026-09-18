@@ -391,6 +391,96 @@ public class AdmissionService {
     }
 
     /**
+     * @param promoted   the materialization now serving, when the gate passed
+     * @param demoted    the materialization that was serving and no longer is, or null
+     * @param blockers   why promotion was refused; empty exactly when {@code promoted} is set
+     */
+    public record PromotionResult(String promoted, String demoted, List<String> blockers) {
+    }
+
+    /**
+     * Makes a materialization the one a reader should query for its source table.
+     *
+     * <p>Promotion exists because a model migration has no cutover without it. Two configurations
+     * over one table can both be LIVE, each publishing its own Tier-2 projection, and nothing said
+     * which a reader should use -- so callers had to know a config id out of band and a rollback was
+     * a conversation rather than an operation.
+     *
+     * <p><b>What this gate checks, and what it deliberately does not.</b> It checks that the
+     * candidate is <em>complete</em>: LIVE, with a watermark that has actually advanced, and with
+     * coverage current against the content map. It does <b>not</b> check retrieval quality. A
+     * quality gate needs judged queries and relevance labels, and comparing a candidate's recall
+     * against the incumbent's is a different mechanism from this one -- so this refuses to promote
+     * something unfinished, and says nothing about whether it is any good. Conflating the two would
+     * be worse than having neither, because a green completeness check reads as an endorsement.
+     *
+     * <p>The swap is one transaction. A partial unique index enforces at most one serving
+     * materialization per source table, so two concurrent promotions cannot both succeed -- which is
+     * the failure the old alias log had to assume away by requiring a single promoting writer.
+     */
+    @Transactional
+    public PromotionResult promote(String id) {
+        MaterializationEntity candidate = materializationRepository.findById(id).orElse(null);
+        if (candidate == null) {
+            return new PromotionResult(null, null, List.of("no materialization with id " + id));
+        }
+
+        List<String> blockers = promotionBlockers(candidate);
+        if (!blockers.isEmpty()) {
+            return new PromotionResult(null, null, blockers);
+        }
+
+        String demoted = null;
+        for (MaterializationEntity serving
+                : materializationRepository.findBySourceTableAndServingTrue(
+                        candidate.getSourceTable())) {
+            if (!serving.getId().equals(candidate.getId())) {
+                serving.setServing(false);
+                serving.setUpdatedAt(Instant.now());
+                materializationRepository.save(serving);
+                demoted = serving.getId();
+            }
+        }
+
+        candidate.setServing(true);
+        candidate.setUpdatedAt(Instant.now());
+        materializationRepository.save(candidate);
+
+        log.info("Promoted materialization {} ({} / {}) to serving{}",
+                candidate.getId(), candidate.getSourceTable(), candidate.getConfigId(),
+                demoted == null ? "" : ", demoting " + demoted);
+        return new PromotionResult(candidate.getId(), demoted, List.of());
+    }
+
+    /**
+     * Why this materialization may not serve, or empty when it may.
+     *
+     * <p>Returned as a list rather than a boolean so an operator sees every reason at once. A gate
+     * that reports the first problem invites a sequence of retries, each discovering one more.
+     */
+    public List<String> promotionBlockers(MaterializationEntity candidate) {
+        List<String> blockers = new ArrayList<>();
+
+        if (candidate.getState() != State.LIVE) {
+            blockers.add(String.format(
+                    "state is %s, not LIVE: only a materialization that has finished its backfill "
+                            + "and is keeping up may serve", candidate.getState()));
+        }
+        if (candidate.getIncrementalWatermark() <= 0) {
+            blockers.add("the watermark has never advanced, so nothing has been materialized and "
+                    + "published for this configuration");
+        }
+        if (candidate.getLastError() != null && !candidate.getLastError().isBlank()) {
+            // Preserved on a re-anchor precisely so it can block here: a materialization recovered
+            // by skipping a range has coverage gaps it cannot know about, and promoting it silently
+            // would serve them.
+            blockers.add("an unresolved error is recorded and must be acknowledged first: "
+                    + candidate.getLastError());
+        }
+        return blockers;
+    }
+
+    /**
      * Retires a materialization without deleting a single vector.
      *
      * <p>This is the important part. The embedding store is keyed by {@code (content_hash,

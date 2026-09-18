@@ -298,6 +298,49 @@ public final class ContentMap {
      * because both filter columns are identity partitions: partition pruning satisfies them before
      * any file is opened, leaving no residual predicate that would need them in the projection.
      */
+    /**
+     * Every assertion ever recorded for one chunk, oldest first, tombstones included.
+     *
+     * <p>Distinct from {@link #liveEntries}, which collapses history to the current answer. This
+     * returns the history itself, because the question provenance answers is not "what is served"
+     * but "how did it come to be served" -- which version superseded which, when, and at what source
+     * sequence number. A collapsed view cannot answer that, and the append-only content map is the
+     * only place the answer exists.
+     *
+     * <p>Ordered by the same comparator resolution uses, so reading the last live element of this
+     * list gives exactly what {@link #liveEntries} would return for the chunk. If those two ever
+     * disagree, the ordering is wrong and both are suspect.
+     */
+    public static List<ContentMapEntry> historyOf(Table table,
+                                                  String sourceTable,
+                                                  String configId,
+                                                  String sourceRowId,
+                                                  int chunkOrdinal) {
+        if (table == null) {
+            return List.of();
+        }
+
+        List<ContentMapEntry> history = new ArrayList<>();
+        try (CloseableIterable<Record> rows = IcebergGenerics.read(table)
+                .where(Expressions.equal(Constants.SOURCE_TABLE_COLUMN, sourceTable))
+                .where(Expressions.equal(Constants.CONFIG_ID_COLUMN, configId))
+                .where(Expressions.equal(Constants.SOURCE_ROW_ID_COLUMN, sourceRowId))
+                .where(Expressions.equal(Constants.CHUNK_ORDINAL_COLUMN, chunkOrdinal))
+                .build()) {
+
+            for (Record row : rows) {
+                history.add(fromRecord(row));
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException(String.format(
+                    "Failed to read content map history for %s / %s row %s chunk %d",
+                    sourceTable, configId, sourceRowId, chunkOrdinal), e);
+        }
+
+        history.sort(OLDEST_FIRST);
+        return history;
+    }
+
     public static long latestSequenceNumber(Table table, String sourceTable, String configId) {
         if (table == null) {
             return 0L;
