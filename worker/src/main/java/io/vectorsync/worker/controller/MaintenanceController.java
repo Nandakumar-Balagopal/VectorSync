@@ -1,5 +1,6 @@
 package io.vectorsync.worker.controller;
 
+import io.vectorsync.worker.service.iceberg.JdbcCatalogHealthCheck;
 import io.vectorsync.worker.service.maintenance.MaintenanceService;
 import io.vectorsync.worker.service.maintenance.MaintenanceService.MaintenanceReport;
 import lombok.extern.slf4j.Slf4j;
@@ -26,9 +27,25 @@ import java.util.Map;
 public class MaintenanceController {
 
     private final MaintenanceService maintenance;
+    private final JdbcCatalogHealthCheck catalogHealth;
 
-    public MaintenanceController(MaintenanceService maintenance) {
+    public MaintenanceController(MaintenanceService maintenance,
+                                 JdbcCatalogHealthCheck catalogHealth) {
         this.maintenance = maintenance;
+        this.catalogHealth = catalogHealth;
+    }
+
+    /**
+     * Whether the catalog can be committed to at all.
+     *
+     * <p>Separate from the derived-table status because it answers a question that makes every
+     * other number meaningless when the answer is no: a half-migrated JDBC catalog fails every
+     * commit to the affected tables while reads keep working, which surfaces as DEGRADED
+     * materializations with no cause that any log makes visible.
+     */
+    @GetMapping("/catalog-health")
+    public ResponseEntity<Map<String, Object>> catalogHealth() {
+        return ResponseEntity.ok(catalogHealth.asMap());
     }
 
     /**

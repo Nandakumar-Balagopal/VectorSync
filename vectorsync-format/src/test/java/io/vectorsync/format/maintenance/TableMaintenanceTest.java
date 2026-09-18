@@ -192,6 +192,26 @@ class TableMaintenanceTest {
     }
 
     @Test
+    @DisplayName("a table a writer just committed to reads as busy")
+    void busyTableIsDetected() {
+        Table table = createTable();
+        // An empty table has no writer to yield to, so it is never busy -- otherwise a warehouse
+        // that has just been created could never be maintained.
+        assertFalse(TableMaintenance.isBusy(table, Duration.ofSeconds(30)),
+                "a table with no snapshot has no writer to yield to");
+
+        IcebergAppender.append(table, List.of(row("acme", "r0", "t0")));
+        table.refresh();
+
+        // This is the guard that stops housekeeping from taking a commit away from the derive path,
+        // which is what put a materialization into DEGRADED on a measured run.
+        assertTrue(TableMaintenance.isBusy(table, Duration.ofSeconds(30)),
+                "a table committed to a moment ago must be left to its writer");
+        assertFalse(TableMaintenance.isBusy(table, Duration.ZERO),
+                "a zero quiet period disables the guard");
+    }
+
+    @Test
     @DisplayName("an empty table is a no-op, not a failure")
     void emptyTableIsSafe() {
         Table table = createTable();

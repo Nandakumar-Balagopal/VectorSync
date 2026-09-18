@@ -72,6 +72,17 @@ public class MaintenanceService {
     @Value("${vectorsync.maintenance.min-files-to-compact:5}")
     private int minFilesToCompact;
 
+    /**
+     * Skip a table a writer has touched this recently.
+     *
+     * <p>The reason this exists rather than being left to Iceberg's commit retry: both sides
+     * compare-and-set, and only one loses well. Maintenance losing costs a tick; the derive path
+     * losing costs one of a work item's three attempts, and three losses in a row is a DEGRADED
+     * materialization. Housekeeping must never be able to do that, so it yields unconditionally.
+     */
+    @Value("${vectorsync.maintenance.quiet-period-seconds:30}")
+    private long quietPeriodSeconds;
+
     public MaintenanceService(IcebergCatalogService catalogService, MeterRegistry meters) {
         this.catalogService = catalogService;
         this.meters = meters;
@@ -169,6 +180,15 @@ public class MaintenanceService {
 
         int snapshotsBefore = countSnapshots(table);
         int filesBefore = countDataFiles(table);
+
+        // Before anything commits. A busy table is reported rather than silently skipped, so the
+        // status output explains why a fragmented table was left alone.
+        if (TableMaintenance.isBusy(table, Duration.ofSeconds(quietPeriodSeconds))) {
+            return new TableReport(identifier.name(), snapshotsBefore, snapshotsBefore, 0, false,
+                    filesBefore, filesBefore, 0, 0L,
+                    "skipped: committed to within the last " + quietPeriodSeconds
+                            + "s, so a writer is active");
+        }
 
         CompactionResult compaction = CompactionResult.nothingToDo("compaction not requested");
         if (compact) {

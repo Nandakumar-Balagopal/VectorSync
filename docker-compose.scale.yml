@@ -1,0 +1,57 @@
+# Configuration for the scale run: everything on at once, on tight cadences.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.engine.yml -f docker-compose.scale.yml up -d
+#
+# Layered on the engine overlay because scale testing on HadoopCatalog would measure the wrong
+# thing: its commit is non-atomic, so the runner refuses parallelism above 1 there and the test
+# could never exercise concurrent derivation. The JDBC catalog commits with a real compare-and-set.
+#
+# Three deliberate differences from a production configuration, all so that two hours is long enough
+# to observe behaviour that normally takes days:
+#
+#   * The mock embedding provider. The real provider measured about 10 rows/sec end to end, which
+#     puts ten million rows at roughly 278 hours -- the model is the bottleneck and it hides
+#     everything else. The inference-avoidance claim is already measured separately against real
+#     embeddings; what is unmeasured is what happens to Iceberg metadata, projection rebuilds and
+#     compaction at volume, and those are only visible once the model stops dominating.
+#   * Maintenance and Tier 3 cadences in minutes rather than hours, so a run sees many cycles.
+#   * A one-hour snapshot retention, so expiry actually fires inside the window.
+services:
+  worker:
+    environment:
+      EMBEDDING_PROVIDER: mock
+
+      # Tier 3 on a timer. This is the run that tests whether the coverage digest really makes an
+      # unchanged scope cheap, because the scheduler ticks against a table that is growing the
+      # whole time and every tick has to decide between reuse, append and refit.
+      VECTORSYNC_CLUSTER_SCHEDULER_ENABLED: "true"
+      VECTORSYNC_CLUSTER_SCHEDULER_INTERVAL_MS: "120000"
+      VECTORSYNC_CLUSTER_SCHEDULER_MAX_SCOPES_PER_TICK: "8"
+
+      # Maintenance every two minutes, compaction every fifth tick, so roughly every ten minutes.
+      VECTORSYNC_MAINTENANCE_INTERVAL_MS: "120000"
+      VECTORSYNC_MAINTENANCE_INITIAL_DELAY_MS: "60000"
+      VECTORSYNC_MAINTENANCE_COMPACT_EVERY_N_TICKS: "5"
+      VECTORSYNC_MAINTENANCE_SNAPSHOT_RETAIN_HOURS: "1"
+      VECTORSYNC_MAINTENANCE_MIN_SNAPSHOTS: "5"
+
+      # Deny-by-default HTTP Basic on both services. The worker's control-plane client picks the
+      # worker credential up from the same property, so enabling this also exercises the
+      # service-to-service path rather than only the inbound one.
+      VECTORSYNC_AUTH_ENABLED: "true"
+      VECTORSYNC_AUTH_ADMIN_USERNAME: vectorsync-admin
+      VECTORSYNC_AUTH_ADMIN_PASSWORD: ${VECTORSYNC_ADMIN_PASSWORD:?set VECTORSYNC_ADMIN_PASSWORD}
+      VECTORSYNC_AUTH_WORKER_USERNAME: vectorsync-worker
+      VECTORSYNC_AUTH_WORKER_PASSWORD: ${VECTORSYNC_WORKER_PASSWORD:?set VECTORSYNC_WORKER_PASSWORD}
+
+      # The JDBC catalog commits with a compare-and-set, so cycles may fan out. Config-id keyed
+      # groups mean this is concurrency across materializations, not within one.
+      VECTORSYNC_RUNNER_PARALLELISM: "4"
+
+  control-plane:
+    environment:
+      VECTORSYNC_AUTH_ENABLED: "true"
+      VECTORSYNC_AUTH_ADMIN_USERNAME: vectorsync-admin
+      VECTORSYNC_AUTH_ADMIN_PASSWORD: ${VECTORSYNC_ADMIN_PASSWORD:?set VECTORSYNC_ADMIN_PASSWORD}
+      VECTORSYNC_AUTH_WORKER_USERNAME: vectorsync-worker
+      VECTORSYNC_AUTH_WORKER_PASSWORD: ${VECTORSYNC_WORKER_PASSWORD:?set VECTORSYNC_WORKER_PASSWORD}

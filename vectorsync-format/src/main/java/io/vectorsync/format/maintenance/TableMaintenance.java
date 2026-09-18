@@ -28,12 +28,14 @@ import java.util.Set;
 /**
  * Keeps the derived tables readable as they age.
  *
- * <p>Nothing did this, and the cost is not theoretical. The derived tables commit once per derive
- * pass, so a table that has been running for a while holds thousands of tiny data files -- one
- * measured warehouse reached 189,862 records across 675 files, about 281 records and 13 KiB per
- * file, at which point planning a scan costs more than reading the data. It is the same
- * fragmentation that made {@code hash_prefix} a measured net negative, arriving this time from
- * commit frequency rather than from partitioning.
+ * <p>Nothing did this, and the mechanism is structural rather than speculative. The derived tables
+ * commit once per derive pass and each commit writes at least one file per partition it touches, so
+ * fragmentation grows in proportion to how incrementally a table is maintained: the tables that get
+ * the most benefit from incremental derivation are the ones that end up with the most tiny files,
+ * until planning a scan costs more than reading the data. It is the same fragmentation that made
+ * {@code hash_prefix} a measured net negative, arriving here from commit frequency rather than from
+ * partitioning. {@code avgRecordsPerFile} on the maintenance status endpoint is where it shows up
+ * first, well before query latency moves.
  *
  * <p>Three operations, cheapest first, all from {@code iceberg-core} and {@code iceberg-parquet},
  * so none of this needs Spark:
@@ -86,7 +88,38 @@ public final class TableMaintenance {
      */
     public static final int MAX_ROWS_PER_REWRITE = 200_000;
 
+    /**
+     * How recently a table must have been committed to for maintenance to leave it alone.
+     *
+     * <p>Maintenance and the derive path both commit to the same tables, and Iceberg resolves that
+     * with a compare-and-set that one of them loses. Losing is cheap for maintenance -- it does
+     * nothing and tries again next tick -- and expensive for the derive path, which reports the
+     * batch as unmaterialised and spends one of a work item's three attempts. On a measured run
+     * that asymmetry put a materialization into DEGRADED, from housekeeping.
+     *
+     * <p>So maintenance yields. A table committed to within this window is skipped entirely, which
+     * makes the operation opportunistic rather than adversarial: fragmentation is a slow problem and
+     * there is no version of it that is worth interrupting a writer for. Thirty seconds is longer
+     * than the derive cycle's fifteen, so a continuously active table is simply never compacted by
+     * this worker -- correctly, because a table being written every fifteen seconds has a writer
+     * whose commits matter more than its file count.
+     */
+    public static final Duration DEFAULT_QUIET_PERIOD = Duration.ofSeconds(30);
+
     private TableMaintenance() {
+    }
+
+    /**
+     * @return true when the table has been committed to recently enough that maintenance should
+     *         leave it to its writer
+     */
+    public static boolean isBusy(Table table, Duration quietPeriod) {
+        Snapshot current = table.currentSnapshot();
+        if (current == null || quietPeriod == null || quietPeriod.isZero()) {
+            return false;
+        }
+        long sinceMillis = System.currentTimeMillis() - current.timestampMillis();
+        return sinceMillis >= 0 && sinceMillis < quietPeriod.toMillis();
     }
 
     /**

@@ -123,6 +123,10 @@ public final class ContentMap {
         if (tableExists) {
             Table existing = catalog.loadTable(identifier);
             requireCurrentFormat(existing);
+            // The existing-table branch is the one that matters: a warehouse created before the
+            // retry budget was raised is precisely the one whose appends are losing the
+            // compare-and-set. Commits only when the setting is absent.
+            SharedTableProperties.ensureTuned(existing);
             return existing;
         }
 
@@ -136,8 +140,7 @@ public final class ContentMap {
                     identifier,
                     schema,
                     partitionSpec(schema),
-                    Map.of(Constants.FORMAT_VERSION_PROPERTY,
-                            String.valueOf(Constants.VECTOR_FORMAT_VERSION)));
+                    SharedTableProperties.forCreate());
         } catch (Exception e) {
             // Two workers can start a sync at once and race here; the loser just reloads.
             log.warn("Content map creation raced or failed, reloading: {}", e.getMessage());
@@ -145,6 +148,9 @@ public final class ContentMap {
 
         Table created = catalog.loadTable(identifier);
         requireCurrentFormat(created);
+        // Warehouses created before the retry budget was raised are exactly the ones that hit the
+        // contention, so the settings are applied here too. Commits only when absent.
+        SharedTableProperties.ensureTuned(created);
         return created;
     }
 
