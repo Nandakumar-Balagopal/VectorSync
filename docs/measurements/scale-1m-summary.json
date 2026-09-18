@@ -1,0 +1,47 @@
+{
+  "complete": false,
+  "stopReason": "received signal 15",
+  "table": "default.m3",
+  "targetRows": 1000000,
+  "rowsSeeded": 1000000,
+  "elapsedSeconds": 1137.2,
+  "samples": 10,
+  "derivedRecords": 5000,
+  "derivedFraction": 0.005,
+  "caughtUp": false,
+  "watermark": 40,
+  "state": "LIVE",
+  "deriveRateRowsPerSecond": {
+    "mean": 40.4,
+    "max": 40.4,
+    "min": 40.4,
+    "first": 40.4,
+    "last": 40.4
+  },
+  "projectionFiles": 1,
+  "projectionAvgRecordsPerFile": 5000,
+  "contentMapFiles": 424,
+  "embeddingStoreFiles": 1220,
+  "chunksProcessed": 1000000,
+  "inferenceCalls": 1000000,
+  "inferenceAvoidedRate": 0.0,
+  "clusterVectors": 0,
+  "clusterCentroids": 953,
+  "clusterFreshness": "BEHIND",
+  "queryP50Ms": {
+    "first": 73.2,
+    "last": 319.9,
+    "max": 319.9
+  },
+  "resources": {
+    "loadAvg1mMax": 13.2,
+    "loadAvg1mLast": 6.5,
+    "workerCpuPctMax": 316.78,
+    "workerCpuPctLast": 316.78,
+    "workerMemLast": "5.091GiB",
+    "postgresCpuPctMax": 27.46,
+    "minioCpuPctMax": 15.96
+  },
+  "freeDiskGb": 33.47,
+  "csv": "/tmp/vectorsync-1m/samples.csv"
+}

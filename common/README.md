@@ -13,10 +13,9 @@ This module intentionally contains only cross-service types and pure utilities:
 
 Business logic belongs in the service modules:
 
-- `control-plane/` owns metadata and sync state.
-- `worker/` owns CDC detection, embedding generation, and vector writes.
-- `search-service/` owns query embedding and retrieval.
+- `control-plane/` owns admission, the materialization state machine and the dedup record.
+- `worker/` owns change detection, derivation, the serving projection, clustering, retrieval and
+  derived-table maintenance.
 
-Future coordinator/worker phases can add new shared DTOs here, but this module
-should stay free of orchestration, Iceberg I/O, embedding-provider, and search
-indexing logic.
+New shared DTOs may be added here, but this module stays free of orchestration, Iceberg I/O and
+embedding-provider logic.

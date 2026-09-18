@@ -18,6 +18,17 @@
 #   * A one-hour snapshot retention, so expiry actually fires inside the window.
 services:
   worker:
+    # Without a limit, -XX:MaxRAMPercentage=75 in the worker image computes 75% of the whole VM
+    # (about 5.8 GB of heap) and nothing bounds the rest -- metaspace, thread stacks and the S3A
+    # client's direct buffers sit on top. Total RSS then exceeds the VM's memory and the kernel
+    # SIGKILLs the process: exit 137, no OutOfMemoryError, and no heap dump despite the image
+    # asking for one. That is the least diagnosable way for a JVM to die, and it is exactly how the
+    # first 1M-row attempt ended.
+    #
+    # With a limit the flag does what its comment claims: heap caps near 4.5 GB, RSS stays inside
+    # 6 GB, and running out of memory becomes an OutOfMemoryError with a dump in /tmp instead of a
+    # silent kill. It does not make the pipeline need less memory -- it makes the need observable.
+    mem_limit: 6g
     environment:
       EMBEDDING_PROVIDER: mock
 

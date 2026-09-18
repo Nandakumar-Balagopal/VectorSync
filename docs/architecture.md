@@ -136,6 +136,12 @@ HadoopCatalog is refused on object storage: its commit is a filename rename with
 writers can both succeed with one silently lost. Raising `vectorsync.runner.parallelism` above 1 on a
 hadoop catalog refuses to start for the same reason.
 
+A JDBC catalog commits by compare-and-set against `iceberg_tables`, and the schema revision that
+added view support made `iceberg_type` part of that predicate. Rows left NULL by an in-place upgrade
+can never satisfy it, so commits to those tables fail permanently while reads succeed —
+`JdbcCatalogHealthCheck` reports this at startup and on `/api/maintenance/catalog-health`, because
+the symptom (a `DEGRADED` materialization blaming a lost commit race) points nowhere near the cause.
+
 ## Concurrency
 
 The derivation cycle fans out over **configuration groups**, not materializations. `config_id`
@@ -143,3 +149,36 @@ excludes the source table, so several materializations routinely share one, and 
 address the same Tier-1 content space — derived at once, both would probe the deduplication record
 before either had written and both would pay for the same inference. Groups run in parallel; members
 of a group run in sequence.
+
+That same sharing is why Tier-1 writes carry a raised commit-retry budget. One content map and one
+embedding store serve the whole warehouse, so they are the most contended tables in the system by
+construction, and Iceberg's default of four retries is calibrated for occasional conflict rather
+than for a table designed to be shared. Retrying a compare-and-set is safe in a way retrying most
+things is not: the loser re-reads the current metadata and re-applies its own appended files, so the
+files land once however many attempts it took.
+
+The same sharing also makes scoping load-bearing anywhere a count is taken. A question about one
+scope must filter by source table as well as by `(model, config)`, because the store deliberately
+holds every table derived under that configuration — an unscoped count answers for the warehouse.
+Getting that wrong in Tier-3 freshness produced a scope that could never read `FRESH`, a scheduler
+that refit it forever, and a cluster count sized from the wrong corpus.
+
+## Maintenance
+
+Append-only tables plus a commit per derive pass means fragmentation grows with incrementality.
+`TableMaintenance` expires snapshots, coalesces manifests and rewrites small data files, entirely
+from `iceberg-core` and `iceberg-parquet`.
+
+Two invariants make it safe here. Nothing derived orders by Iceberg sequence numbers — the content
+map collapses on its own `source_sequence_number` column — so a rewrite changes file metadata and no
+column. And a rewrite commits a `replace` snapshot, which an incremental append scan skips, so
+compacted files are never mistaken for new rows.
+
+A rewrite must anchor its validation with `validateFromSnapshot`. Without one, the commit validates
+against the whole ancestry, and snapshot expiry — which the same maintenance pass performs — has
+already truncated it; the rewrite then fails outright, which means compaction silently never runs on
+any table the system has already maintained.
+
+Maintenance yields to writers rather than competing with them: a table committed to inside the quiet
+period is skipped, because a lost commit costs housekeeping one tick and costs the derive path one
+of a work item's three attempts.

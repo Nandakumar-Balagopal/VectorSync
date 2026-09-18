@@ -41,12 +41,13 @@ means.
 
 ```
 io.vectorsync.format
-├── catalog/   IcebergCatalogConfig, IcebergCatalogFactory, Namespaces
-├── io/        IcebergAppender          partitioned Parquet append, one commit
-├── vector/    VectorTableSchema, VectorRecordCodec, VectorResolution, VectorIds
-├── derive/    MaterializationSpec (config_id), ContentHash, ContentMap, EmbeddingStore,
-│              ProjectionBuilder, SqlViewGenerator, VectorClustering, ClusteredIndex
-└── index/     IndexManifestStore, IndexAliasStore, IndexArtifactStore, IndexManifestEntry
+├── catalog/     IcebergCatalogConfig, IcebergCatalogFactory, Namespaces
+├── io/          IcebergAppender        partitioned Parquet write; append or hand files to a caller
+├── vector/      VectorIds
+├── derive/      MaterializationSpec (config_id), ContentHash, ContentMap, ContentMapEntry,
+│                EmbeddingStore, EmbeddingEntry, SharedTableProperties, ProjectionBuilder,
+│                SqlViewGenerator, VectorClustering, ClusteredIndex
+└── maintenance/ TableMaintenance       expire snapshots, rewrite manifests, compact data files
 ```
 
 **Hard constraint: no Spring, no framework.** Its consumers include the Spring services, Spark

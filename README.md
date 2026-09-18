@@ -139,6 +139,49 @@ Deletes and updates resolve through a key-set sweep: VectorSync asks which keys 
 holds and tombstones the difference. That reads only current state, so it does not depend on delete
 files or on snapshot retention.
 
+## Maintenance
+
+The derived tables commit once per derive pass and each commit writes at least one file per
+partition it touches, so they fragment in proportion to how incrementally they are maintained — the
+tables that benefit most from incremental derivation are the ones that end up with the most tiny
+files, until planning a scan costs more than reading the data.
+
+`TableMaintenance` does three things, cheapest first, all from `iceberg-core` and `iceberg-parquet`
+so none of it needs Spark: expire snapshots (bounds `metadata.json`, re-parsed on every catalog load
+because caching is deliberately off), rewrite manifests, and rewrite small data files.
+
+Measured on a 900k-row warehouse, one pass of 119 seconds:
+
+| table | data files | records per file | records |
+|---|---|---|---|
+| `content_map` | 184 → **22** | 5,038 → **42,136** | 927,006 → 927,006 |
+| `embedding_store` | 534 → **19** | 1,700 → **47,789** | 908,006 → 908,006 |
+
+677 files eliminated and 1,310 MiB rewritten, with both record counts identical to the byte.
+Provenance still resolves a row through the compacted content map to a live vector in the compacted
+store.
+
+Compaction is safe for this schema because **nothing derived orders by Iceberg sequence numbers** —
+the content map collapses on its own `source_sequence_number` column, and every reader of an Iceberg
+sequence number reads it from the source table. A rewrite changes file metadata and no column, and
+commits a `replace` snapshot, so an incremental append scan does not see compacted files as new rows
+either.
+
+Maintenance **yields to writers**. A table committed to within the last 30 seconds is skipped
+entirely: both sides compare-and-set, and only one loses well — maintenance losing costs a tick,
+while the derive path losing costs one of a work item's three attempts. Fragmentation is a slow
+problem and no amount of it is worth interrupting a writer for.
+
+```
+GET  /api/maintenance/status          fragmentation per derived table
+POST /api/maintenance/run?compact=    expire + manifests, optionally rewrite data
+GET  /api/maintenance/catalog-health  whether the catalog can be committed to at all
+```
+
+Rewrite groups are bounded by **rows** as well as bytes, because the payload is vectors: a
+384-dimension embedding is about 1.5 KiB in Parquet and roughly 9 KiB on heap as a boxed
+`List<Double>`, so Parquet size understates heap by nearly six times.
+
 ## Reproducibility
 
 Given a source snapshot and a `config_id`, the vector set is reproducible — and an incremental
@@ -200,6 +243,38 @@ export TESTCONTAINERS_RYUK_DISABLED=true
 See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions, and [docs/](docs/) for the architecture,
 the demo walkthrough and the repository map.
 
+### If derivation runs but nothing is ever materialised
+
+Check the catalog first:
+
+```
+GET /api/maintenance/catalog-health
+```
+
+Iceberg's JDBC catalog commits by compare-and-set against `iceberg_tables`, and the schema that
+added view support made `iceberg_type` part of that predicate. A catalog created under the older
+schema and later upgraded leaves its existing rows with `iceberg_type` NULL — and those rows can
+then **never** satisfy the predicate, so every commit to those specific tables fails forever while
+creates, loads and reads all keep working perfectly.
+
+From the inside this is close to undiagnosable: derivation runs, the model is called, vectors are
+written, the append raises `CommitFailedException`, the derive path correctly reports that nothing
+landed, the control plane correctly spends one of three attempts, and three deterministic failures
+later the materialization is `DEGRADED` with "rows did not materialize". Every layer behaves
+correctly and the apparent cause — a lost commit race — is the one thing that is not happening.
+Newer tables in the same catalog commit fine, which makes it look like contention.
+
+The worker now reports this at startup and on the endpoint above, with the repair:
+
+```sql
+UPDATE iceberg_tables SET iceberg_type = 'TABLE' WHERE iceberg_type IS NULL;
+```
+
+Relatedly, `content_map` and `embedding_store` are shared by every materialization, which makes them
+the most contended tables in the system by construction. They are created with a raised
+commit-retry budget (20 retries backing off to 5s, against Iceberg's default of 4), applied to
+existing warehouses on load as well as at creation.
+
 ## Current limits
 
 Stated plainly, because they shape where this fits:
@@ -213,9 +288,27 @@ Stated plainly, because they shape where this fits:
   matters: NFCorpus needed 53% of the table at 16 clusters for the quality it reached at 3.8% with
   64.
 - **Authentication** ships behind `vectorsync.auth.enabled`. See [SECURITY.md](SECURITY.md).
-- **Derived-table compaction** is not yet automatic; long-running deployments accumulate small files.
-- **Scale.** Measured on a single laptop with one worker. Multi-worker leasing is tested; throughput
-  at warehouse scale is not yet characterised.
+- **Tier-2 projection rebuild is the scaling limit, and it is a hard one.** Every publish rebuilds
+  the whole projection, so it is O(rows) in both time and memory rather than O(change) — Tier 1 is
+  genuinely incremental, Tier 2 is not. Measured at one million rows: Tier 1 absorbed all 1,000,000
+  chunks and the derive queue reached the last of 200 files, while the projection never published
+  past its first 5,000-row block. It does not fail cleanly. With no container memory limit the
+  kernel SIGKILLs the worker; with a 6 GB limit the heap instead sits at 5.09 GiB of 6 with the CPU
+  pegged at 235–275% — parallel GC burning two and a half cores while the application advances
+  nothing, indefinitely. Roughly 4.5 GB of heap is not enough to publish a million rows, and adding
+  RAM only moves the number. The fix is to make the publish streaming or partition-incremental.
+  Until then, size Tier-2 scopes to what a publish can hold.
+- **Give the worker a container memory limit.** The image sets `-XX:MaxRAMPercentage=75`, which
+  computes from the container limit — with no limit set it sizes the heap from the whole host and
+  total RSS can exceed it, at which point the kernel sends `SIGKILL` and you get no
+  `OutOfMemoryError` and no heap dump. `docker-compose.scale.yml` sets `mem_limit: 6g`.
+- **Scale.** Characterised to one million rows on a single laptop with one worker: source seeding at
+  ~8,000 rows/s and derivation at ~3,800 rows/s with the mock provider. With the real embedding
+  service the model dominates at ~10 rows/s, which puts ten million rows near 278 hours — the
+  inference-avoidance numbers above are the reason that matters less than it looks, but it is the
+  honest single-node rate. Multi-worker leasing is tested; multi-worker throughput is not.
+- **An index does not re-size itself.** If a scope's cluster count stops suiting its corpus, nothing
+  re-fits it while the index reads `FRESH`.
 
 ## Licence
 

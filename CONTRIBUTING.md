@@ -15,14 +15,13 @@ patch — a stale contributor guide costs more than no guide.
 | `common` | DTOs, constants, cosine similarity. Pure Java, no framework. |
 | `vectorsync-format` | The on-disk contract: Iceberg catalog construction, Tier-1 schemas and codecs, content hashing, spec identity (`config_id`), the serving projection, SQL view generation. |
 | `control-plane` | Spring Boot + Postgres. Validated admission, cost estimation, the materialization state machine, the leased work queue, the durable dedup record. |
-| `worker` | Spring Boot. Change detection over Iceberg snapshots, chunking, dedup-aware derivation, Tier-1 writes. |
-| `search-service` | Spring Boot + Lucene. Index build, evaluation, promotion, provenance. Not the serving tier. |
+| `worker` | Spring Boot. Change detection over Iceberg snapshots, chunking, dedup-aware derivation, Tier-1 writes, the serving projection, the clustered index, provenance, and derived-table maintenance. |
 | `embedding-service` | Python FastAPI + sentence-transformers. Stateless, resident models. |
 | `dashboard` | React + Carbon. Demo and ops only; nothing depends on it. |
 | `bench` | Python measurement harness. Every performance claim in the README comes from here. |
 | `deployment` | Dockerfiles, compose overlays, E2E scripts. |
 
-Layering: `common` <- `vectorsync-format` <- `control-plane` / `worker` / `search-service`. Format
+Layering: `common` <- `vectorsync-format` <- `control-plane` / `worker`. Format
 semantics — a schema, an id derivation, a resolution rule — belong in `vectorsync-format`. Three
 services previously carried their own copy of the version-resolution rule and they had drifted,
 which for a project whose claim is "an open, engine-neutral format" is the one bug that cannot be

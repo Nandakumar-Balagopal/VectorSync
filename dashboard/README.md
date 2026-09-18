@@ -50,7 +50,6 @@ Vite proxies dashboard API calls to the local services:
 | --- | --- | --- |
 | `/api/*` | control-plane | `8080` |
 | `/worker-api/*` | worker, rewritten to `/api/*` | `8081` |
-| `/search-api/*` | search-service, rewritten to `/api/*` | `8083` |
 
 ## Important routes
 

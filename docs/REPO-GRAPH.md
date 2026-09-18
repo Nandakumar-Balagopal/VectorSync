@@ -44,6 +44,15 @@ Not Maven modules: `embedding-service` (Python/FastAPI, `:8000`), `dashboard` (V
 `hash_prefix` is **still a column** on `embedding_store` at field id 4 and is no longer a partition
 field. Removing the column would brick the table: historical specs source its field id.
 
+Every table above is also written by `MaintenanceService`, which enumerates the vector namespace and
+runs `TableMaintenance` over whatever it finds — snapshot expiry, manifest coalescing and data-file
+compaction. It is the only writer that touches all of them, and the only one that may write a
+`replace` snapshot rather than an append. **Source tables are never written by anything here.**
+
+Because it shares those tables with the derive path, it yields: a table committed to inside the
+quiet period is skipped, since a lost compare-and-set costs maintenance one tick and costs
+derivation one of a work item's three attempts.
+
 ## 3. Control-plane state machine
 
 ```mermaid
