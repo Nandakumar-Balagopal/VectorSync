@@ -70,7 +70,7 @@ class HttpAuthTest {
             // Adding spring-boot-starter-security to the classpath secures everything by default,
             // so without the explicit permitAll chain this returns 401 and every script in the
             // repository breaks on upgrade. That is the regression this asserts against.
-            mvc.perform(get("/api/vectors/health")).andExpect(status().isOk());
+            mvc.perform(get("/api/derive/metrics/all")).andExpect(status().isOk());
         }
 
         @Test
@@ -109,13 +109,13 @@ class HttpAuthTest {
         @Test
         @DisplayName("an unauthenticated API call is refused")
         void apiIsDenied() throws Exception {
-            mvc.perform(get("/api/vectors/health")).andExpect(status().isUnauthorized());
+            mvc.perform(get("/api/derive/metrics/all")).andExpect(status().isUnauthorized());
         }
 
         @Test
         @DisplayName("a valid credential is accepted")
         void credentialWorks() throws Exception {
-            mvc.perform(get("/api/vectors/health")
+            mvc.perform(get("/api/derive/metrics/all")
                             .with(request -> {
                                 request.addHeader("Authorization", "Basic " + java.util.Base64
                                         .getEncoder()

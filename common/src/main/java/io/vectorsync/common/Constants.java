@@ -8,9 +8,6 @@ public class Constants {
     /** Table property recording the format version a vector table was created with. */
     public static final String FORMAT_VERSION_PROPERTY = "vectorsync.format-version";
 
-    public static final String VECTOR_TABLE_NAME = "vector_embeddings";
-    public static final String INDEX_MANIFEST_TABLE_NAME = "vector_index_manifest";
-    public static final String INDEX_ALIAS_TABLE_NAME = "vector_index_alias";
 
     /** Tier 1: deduplicated vectors keyed by content, not by row. */
     public static final String EMBEDDING_STORE_TABLE_NAME = "embedding_store";

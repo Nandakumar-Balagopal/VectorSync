@@ -67,7 +67,6 @@ public class DemoSeedService {
                 log.warn("Failed to drop existing demo table: {}", e.getMessage());
             }
         }
-        boolean vectorsReset = icebergTableService.dropVectorTable();
 
         Schema schema = new Schema(
                 Types.NestedField.required(1, "id", Types.StringType.get()),
@@ -89,7 +88,7 @@ public class DemoSeedService {
 
         appendRecords(table, records);
 
-        return new DemoSeedResult(identifier.toString(), records.size(), !existed, vectorsReset);
+        return new DemoSeedResult(identifier.toString(), records.size(), !existed);
     }
 
     /**
@@ -212,7 +211,7 @@ public class DemoSeedService {
         appendRecords(table, records);
         log.info("Seeded {} with {} rows", identifier, records.size());
 
-        return new DemoSeedResult(identifier.toString(), records.size(), !existed, false);
+        return new DemoSeedResult(identifier.toString(), records.size(), !existed);
     }
 
     public record SeedRow(String id, String name, String description, String category, Double price) {
@@ -379,7 +378,7 @@ public class DemoSeedService {
         return records;
     }
 
-    public record DemoSeedResult(String tableName, int recordsWritten, boolean created, boolean vectorsReset) {
+    public record DemoSeedResult(String tableName, int recordsWritten, boolean created) {
     }
 
     /**

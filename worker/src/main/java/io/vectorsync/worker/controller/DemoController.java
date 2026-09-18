@@ -3,8 +3,6 @@ package io.vectorsync.worker.controller;
 import io.vectorsync.common.dto.TableConfig;
 import io.vectorsync.worker.client.ControlApiClient;
 import io.vectorsync.worker.service.DemoSeedService;
-import io.vectorsync.worker.service.SyncOrchestrationService;
-import io.vectorsync.worker.service.VectorStoreService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -25,17 +23,11 @@ public class DemoController {
 
     private final DemoSeedService demoSeedService;
     private final ControlApiClient controlApiClient;
-    private final SyncOrchestrationService syncOrchestrationService;
-    private final VectorStoreService vectorStoreService;
 
     public DemoController(DemoSeedService demoSeedService,
-                          ControlApiClient controlApiClient,
-                          SyncOrchestrationService syncOrchestrationService,
-                          VectorStoreService vectorStoreService) {
+                          ControlApiClient controlApiClient) {
         this.demoSeedService = demoSeedService;
         this.controlApiClient = controlApiClient;
-        this.syncOrchestrationService = syncOrchestrationService;
-        this.vectorStoreService = vectorStoreService;
     }
 
     @PostMapping("/seed")
@@ -103,25 +95,6 @@ public class DemoController {
     @DeleteMapping("/products/{id}")
     public ResponseEntity<DemoSeedService.DemoMutationResult> deleteProduct(@PathVariable("id") String id) {
         return ResponseEntity.ok(demoSeedService.deleteProduct(id));
-    }
-
-    @PostMapping("/sync")
-    public ResponseEntity<Map<String, Object>> sync() {
-        List<TableConfig> tableConfigs = controlApiClient.getTableConfigs();
-        int synced = 0;
-
-        for (TableConfig config : tableConfigs) {
-            if (config.isEnabled()) {
-                syncOrchestrationService.syncTable(config);
-                synced++;
-            }
-        }
-
-        long vectorCount = vectorStoreService.getVectorCount();
-        Map<String, Object> response = new HashMap<>();
-        response.put("tablesSynced", synced);
-        response.put("vectorCount", vectorCount);
-        return ResponseEntity.ok(response);
     }
 
     public record DemoProductRequest(String id,

@@ -31,7 +31,6 @@
         <module>vectorsync-format</module>
         <module>control-plane</module>
         <module>worker</module>
-        <module>search-service</module>
     </modules>
 
     <dependencyManagement>

@@ -1,7 +1,6 @@
 package io.vectorsync.worker.service.iceberg;
 
 import io.vectorsync.common.dto.TableConfig;
-import io.vectorsync.format.vector.VectorTableSchema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
@@ -24,14 +23,6 @@ public class IcebergTableService {
     public Table loadTable(TableConfig tableConfig) {
         Catalog catalog = catalogService.getCatalog();
         return catalog.loadTable(toTableIdentifier(tableConfig));
-    }
-
-    public Table loadOrCreateVectorTable() {
-        return VectorTableSchema.loadOrCreate(catalogService.getCatalog(), vectorNamespace);
-    }
-
-    public boolean dropVectorTable() {
-        return VectorTableSchema.drop(catalogService.getCatalog(), vectorNamespace);
     }
 
     private TableIdentifier toTableIdentifier(TableConfig config) {

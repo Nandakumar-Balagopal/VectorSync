@@ -7,7 +7,6 @@ control-plane/       Validated admission with cost estimates, materialization st
                      leased work queue, durable dedup record (PostgreSQL) :8080
 worker/              Embedding materializer: snapshot diff -> chunk -> dedup-aware embed ->
                      Tier-1 write :8081
-search-service/      Index build, evaluation, gated promotion, provenance :8083
                      (not the serving tier; engines read Tier 2 directly)
 embedding-service/   Python FastAPI: sentence-transformers or a managed API :8000
 dashboard/           React UI :3000
@@ -36,7 +35,6 @@ pom.xml              Reactor root: <modules>, <dependencyManagement>, <build> pl
 ## Why `vectorsync-format` exists
 
 The vector table's schema, record codec, and version-resolution rule were previously duplicated
-across worker, search-service, and control-plane, and had drifted apart. Under a design whose
 claim is "an open, engine-neutral format", that is fatal: the resolution semantics *are* the
 product, so two components carrying their own copy means they can disagree about what the format
 means.
@@ -66,7 +64,6 @@ ban Spring does not inherit the rule.
 ## Layering
 
 ```
-common  <-  vectorsync-format  <-  control-plane / worker / search-service
 ```
 
 Nothing above `vectorsync-format` may define format semantics. If you find yourself writing a

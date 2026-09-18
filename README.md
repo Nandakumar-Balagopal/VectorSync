@@ -2,323 +2,221 @@
 
 **Incremental, content-addressed embedding derivation over Apache Iceberg.**
 
-Keeps derived embeddings correct and cheap as your Iceberg tables change. Vectors are an open
-table, not a service — query them with Trino, Spark, or anything else that reads Iceberg.
+Your vectors live in Iceberg tables you already own, queried by Spark or Trino with no VectorSync
+process in the query path. As the source table changes, VectorSync keeps the derived embeddings
+correct — and re-embeds only content it has never seen.
 
 ---
 
-## The thesis
+## The idea
 
 An embedding is a pure function of `(content, model, configuration)`.
 
-So a vector should be keyed by **content**, not by the row it arrived on. That one decision is what
+So a vector is keyed by **content**, not by the row it arrived on. That single decision is what
 separates this from a sync pipeline:
 
 - A row whose `price` changed but whose description did not costs **nothing** to re-embed.
-- The same text appearing in 500 rows, or in 50 different tables, is **one** inference call.
-- A model migration re-embeds **novel content**, not your corpus.
+- The same text in 500 rows, or across 50 tables, is **one** inference call.
+- A data-file rewrite or compaction changes no content, so it costs **nothing** — no re-embedding
+  and no index rebuild.
+- A model migration re-embeds novel content, not your corpus.
 
-Everything else in this repo exists to avoid calling the model.
-
-## What it is not
-
-Not a vector database. It does not answer `top-k` and does not compete on ANN latency — purpose-built
-vector databases will win there, and this feeds them rather than replacing them.
-
-Not an ML lifecycle tool. It does not track experiments or serve models.
-
-It occupies the gap both leave: **an open, engine-neutral, reproducible derivation layer** that knows
-which source snapshot and which model revision produced every vector it holds.
-
----
+Everything else here exists to avoid calling the model.
 
 ## Storage model
 
-Three tiers, and the separation is the design.
+Three Iceberg tables, and the separation is the design.
 
 ```
-TIER 1  canonical, deduplicated, never recomputed
-  embedding_store   (content_hash, model_version, config_id) -> vector
-                    immutable; partitioned by (model_version, hash_prefix)
-  content_map       (source_table, source_row_id, chunk_ordinal, config_id) @ sequence -> content_hash
-                    append-only history with tombstones; partitioned by (source_table, config_id)
-
-TIER 2  serving projection — derived, disposable, rebuildable
-  vectors_<table>_<config>   flat denormalized join, one row per live chunk, vector inlined
-                             this is what a query engine brute-force scans
-
-TIER 3  optional acceleration
-  exported vector DB collection  |  mmap-able index artifact
+TIER 1   embedding_store    one row per distinct content, never recomputed
+         content_map        append-only row → content history, with tombstones
+            ↓
+TIER 2   vectors_<table>_<configId>    flat serving projection, vector inlined
+            ↓
+TIER 3   clustered_<table>  IVF index as Iceberg partitions
+         vector_centroids   centroids per scope
+         vector_index_coverage   what content each index covers
 ```
 
-`embedding_store` is normalized for dedup; `content_map` carries lineage. Tier 2 is the materialized
-join, because a similarity scan should not pay for a join. Tier 2 can always be dropped and rebuilt
-from Tier 1, which is precisely why it is safe to drop.
+Tier 1 is normalised because deduplication and lineage demand it. Tier 2 is that join already done,
+because a similarity scan cannot afford a join per candidate row. Tier 3 partitions by nearest
+centroid so an ordinary query engine performs the candidate reduction an ANN index would.
 
-**`config_id` deliberately excludes the source table and key columns.** It identifies the derivation
-*function* — embedded columns, separator, chunker, model, revision, version, normalization. Folding
-the table name in would give every table a private key space and destroy cross-table dedup. (An early
-version did exactly that; a 2-table corpus with 5 distinct texts cost 10 inference calls instead of 5.)
+`config_id` is a 16-hex SHA-256 over the embedding columns, separator, chunker, chunk size and
+overlap, model name, model revision, embedding version and normalisation. It deliberately
+**excludes** the source table and key columns, so deduplication crosses tables.
 
-## Reproducibility
+## Serving
 
-Every vector answers: *which exact source data and configuration produced this?*
+Vectors are a table. Query them with the engine you already run.
 
-| Recorded | Where |
-|---|---|
-| source table, row id, chunk ordinal | `content_map` |
-| source snapshot id **and sequence number** | `content_map` |
-| content hash of the exact embedded text | both tiers |
-| model, revision, embedding version | `model_version` + `config_id` |
-| embedded columns, separator, chunker, normalization | `config_id` |
-| evaluation metrics and the fixture behind them | index manifest |
+```
+GET /api/derive/view?sourceTable=default.products&configId=<cfg>&engine=trino
+```
 
-Ordering is always by **sequence number**, never snapshot id — Iceberg snapshot ids are random longs.
-Sorting history by them shuffles it, and this bug has been fixed three times in this repo.
+returns the view DDL, and the generated Trino view uses the built-in `cosine_similarity` with a
+`cardinality` guard on the query vector:
 
----
+```sql
+SELECT source_row_id, text,
+       cosine_similarity(CAST(embedding AS array(double)), q.qv) AS similarity
+FROM iceberg.vector.vectors_default_products_a1b2c3d4 v
+CROSS JOIN query q
+WHERE cardinality(q.qv) = 384
+ORDER BY similarity DESC LIMIT 10
+```
 
-## Change detection
+For cluster-pruned search, rank centroids first and pass the nearest few as **literal** cluster
+ids — partition pruning happens at plan time, so a subquery does not prune:
 
-Uses Iceberg's incremental append scan to enumerate *added data files*, then makes each file a unit
-of work. Cost tracks change, not table size.
+```sql
+WHERE cluster_id IN (3, 7)   -- literals, verified: 135 of 2,000 rows read
+```
 
-The honest limitation: **an append scan sees added files only.** Deletes and row-level updates
-expressed as Iceberg delete files are invisible to it. `IncrementalChangeDetector.assess()` detects
-that case and refuses the pass rather than advancing the watermark past changes it never
-materialized — a silent, permanent failure mode. A reconcile or re-anchor is required, and the
-system says so instead of pretending.
-
-A watermark advances only when **every** file in a pass succeeded.
-
----
-
-## Benchmark
-
-100 Iceberg tables x 100 rows = 10,000 rows per corpus, four corpora, on a single laptop with real
-`all-MiniLM-L6-v2` embeddings. Duplication is an explicit parameter, so the result is a sweep rather
-than one flattering number — and the 0% point is where the honesty lives, because there dedup can
-win nothing and only its overhead shows.
-
-Ground-truth content hashes are computed independently in `bench/corpus.py`, so agreement between
-the expected and measured rates is evidence rather than self-report.
-
-### Dedup sweep — 100 tables, 10,000 rows per corpus
+## Measured
 
 `all-MiniLM-L6-v2`, MinIO-backed Iceberg warehouse, single laptop. Distinct content is computed
 independently in `bench/corpus.py`; inference calls are the service's own counter.
 
-| corpus | rows | distinct content | inference calls | avoided | derive time |
-|---|---|---|---|---|---|
-| dup00 | 10,000 | 10,000 | **10,000** | 0.0% | 502.6s |
-| dup50 | 10,000 | 4,335 | **4,335** | 56.6% | 56.0s |
-| dup80 | 10,000 | 1,979 | **1,979** | 80.2% | 39.4s |
-| dup95 | 10,000 | 500 | **500** | 95.0% | 22.7s |
+### Cost tracks content, not rows
 
-Inference calls equal distinct content **exactly** in all four runs. Cost tracks content, not rows.
-At 95% duplication the same 10,000 rows derive 22x faster than at 0%.
+| corpus | rows | distinct content | inference calls | avoided |
+|---|---|---|---|---|
+| dup00 | 10,000 | 10,000 | **10,000** | 0.0% |
+| dup50 | 10,000 | 4,335 | **4,335** | 56.6% |
+| dup80 | 10,000 | 1,979 | **1,979** | 80.2% |
+| dup95 | 10,000 | 500 | **500** | 95.0% |
 
-In `dup95`, inference plateaus at exactly 500 by table 50 — tables 51 through 100 cost **zero**
-inference, because their content was already embedded by earlier tables. Cross-table dedup is the
-property a row-keyed design and a vector database both lack.
+Inference calls equal distinct content **exactly** in all four runs. In `dup95`, inference plateaus
+at 500 by table 50 — tables 51 through 100 cost zero, because their content was already embedded by
+earlier tables. Cross-table deduplication is the property a row-keyed design lacks.
 
 The `dup00` row is the control: every row distinct, nothing to reuse, so the design wins nothing and
-pays full price. Reporting only `dup95` would be advocacy.
+pays full price.
 
-### The same measurement on real corpora
+**Savings are a property of your workload.** On real IR corpora, where documents are unique by
+construction, deduplication is near zero: NFCorpus deduplicated 1.1% (3,633 documents to 3,593
+vectors) and FiQA 0.00%. The cost argument applies to catalogs, logs, support macros and document
+revisions — not to search corpora. On those, the value is the incremental and reproducibility
+machinery rather than deduplication.
 
-The sweep above sets duplication as a parameter. These two corpora came as they are — BEIR
-documents, unedited, measured by `bench/real.py` (full numbers in `docs/DEMO.md`):
+### Cluster-pruned search on real data
 
-| corpus | documents | distinct content | dedup savings |
+FiQA, 20,000 financial forum posts, 256 clusters, 40 judged queries:
+
+| probes | fraction of table read | recall@10 | nDCG@10 |
 |---|---|---|---|
-| NFCorpus | 3,633 | 3,593 | **1.1%** |
-| FiQA (20,000-post sample) | 20,000 | 20,000 | **0.00%** |
+| 1 | 0.5% | 0.412 | 0.121 |
+| 8 | **3.3%** | 0.847 | **0.135** |
+| 256 (full scan) | 100% | 1.000 | 0.135 |
 
-**Dedup savings are a property of the workload, not of the system.** A warehouse table with
-repeated product descriptions, shared boilerplate, revisions of the same document, or the same
-content registered from several tables gets the sweep's numbers. A curated IR corpus is near-unique
-by construction and gets nothing — NFCorpus's 1.1% is 40 documents out of 3,633 whose text was
-already embedded, and FiQA had not one. On such a corpus the value here is the incremental and
-reproducibility machinery: knowing which source snapshot and model revision produced each vector,
-and re-deriving only what changed.
+**8 of 256 clusters gives full-scan retrieval quality while reading 3.3% of the table.**
 
-The Tier-1 embedding store is partitioned by `model_version`, which is the dimension a reader
-actually prunes on — a model migration reads only its own partition. A dedup probe is not served by
-partition pruning at all but by `ContentHashIndex`, for the reason measured below: content hashes are
-uniformly distributed, so no hash-derived partitioning prunes a multi-hundred-hash batch.
+Verified against real Trino: a full scan read 2,000 rows across 32 partitions; `cluster_id IN (3,7)`
+read 82 rows across 2. End to end, the two-step query read 135 of 2,000 rows (6.75%) and returned an
+identical top-5.
 
-### Incremental passes
+### Mutation, on real data through the live stack
 
-One table, appends only, measured by `bench/incremental.py`:
+Visible lag from source commit to queryable: **15.4s p50 / 15.9s p95** — bounded by the scheduler
+interval rather than by derivation work. Query latency **77ms p50 / 97ms p95** on the exact
+reference scan.
 
-| case | rows in pass | inference | result |
-|---|---|---|---|
-| backfill, 500 rows over 50 distinct texts | 500 | 50 | baseline |
-| append 300 rows, 50 novel texts | 300 | 50 | the 500 existing rows are not revisited |
-| append 300 rows, content already embedded | 300 | **0** | 300 cache hits, 0.2s |
-| append nothing | 0 | 0 | no work, watermark holds |
+## Change detection
 
-The third row is the decisive one. Three hundred brand-new rows cost zero inference because their
-*content* was already known. A design keyed by row identity re-embeds all 300.
+Built on Iceberg's own metadata, ordered by **sequence number** and never by snapshot id (snapshot
+ids are random longs).
 
-### What the benchmark does not show
+| Source operation | Behaviour |
+|---|---|
+| `INSERT` / append | Incremental append scan; only new files are read |
+| Compaction, `rewrite_data_files`, sort reorganisation | No re-embedding, and no index rebuild — the content digest is unchanged |
+| `DELETE` | Reconciled: the partition is re-derived and vanished keys are tombstoned |
+| `UPDATE` / `MERGE` | Reconciled the same way; row-id keying and sequence collapse pick the new version |
+| Schema change on an embedded column | New `config_id`, materialised side by side |
 
-- **A fixed per-materialization cost of roughly 2s** dominates small tables, spent on Iceberg
-  commits to object storage rather than on inference. At 100K tables this matters more than the
-  dedup win and argues for a batching committer.
-- Every table here holds **one data file**, so multi-file parallelism and the O(N^2) metadata cost
-  in `readFile` (which re-plans the snapshot per file) are untested.
-- Deletes and updates are untested because the incremental path **refuses** them by design.
-- Wall-clock timings are noisy on a loaded laptop; a sustained 40-minute run drove the embedding
-  service from 62ms to 4,900ms per 64-text batch through thermal and memory pressure, which is why
-  the claim rests on **inference call counts** (exact and reproducible) rather than on seconds.
+Deletes and updates resolve through a key-set sweep: VectorSync asks which keys the source still
+holds and tombstones the difference. That reads only current state, so it does not depend on delete
+files or on snapshot retention.
 
-### The bug this benchmark caught
+## Reproducibility
 
-The first implementation partitioned the embedding store by a 2-character `hash_prefix` to prune the
-dedup probe. Content hashes are uniformly distributed, so a batch of 500 hashes touches essentially
-all 256 buckets: pruning did nothing and every probe scanned the whole store. Backfill cost went
-quadratic in store size — 9.3s of Iceberg time per table at 5,000 stored vectors, 28.2s at 20,000,
-with inference flat at 2s. A 500-row file whose content was **entirely cached** still cost 28.5s.
+Given a source snapshot and a `config_id`, the vector set is reproducible — and an incremental
+rebuild is checkable against a full one.
 
-`ContentHashIndex` replaces the per-batch scan with one seed scan per process and an exact in-memory
-set. The same measurement afterwards: flat at ~7.6s per table across 70 tables, and a fully-cached
-500-row file drops from 28.5s to **0.2s**. The ceiling is memory, is enforced, and is documented —
-past it the index falls back to probing Iceberg, which is slow but correct.
+`ReproducibilityTest` asserts that a single full pass and five incremental batches produce
+**identical committed state** and **identical inference counts**. Not equal outputs reached by
+embedding the same content repeatedly: the same answer for the same price.
 
-Reproduce:
+## Control plane
 
-```bash
-python3 bench/corpus.py --tables 100 --rows 100 --out /tmp/vsbench
-python3 bench/run.py --corpus /tmp/vsbench --tables 100 --version run1
-python3 bench/incremental.py run1
-```
+Postgres-backed. Materializations move through
+`REGISTERED → VALIDATED → BACKFILLING → LIVE`, with `PAUSED`, `DEGRADED`, `MIGRATING` and
+`RETIRING → RETIRED` as needed. Work is leased with `SELECT … FOR UPDATE SKIP LOCKED`, scoped per
+materialization, with capped retries and expiry reclaim.
 
-`--version` scopes a run to its own `(model_version, config_id)`, so a rerun starts from an empty
-store instead of inheriting the previous run's cache and reporting a win it did not earn.
+The deduplication record is written in the same transaction that completes the work which produced
+it, so "this content has a vector" cannot outlive the commit that wrote it.
 
----
-
-## Serving
-
-There is no VectorSync process in the query path. Three modes, chosen by latency class:
-
-| Latency class | Mode | Holds state |
-|---|---|---|
-| Analytical / batch | brute-force scan over a pruned Tier-2 partition — exact, zero install | nobody |
-| Interactive, <100ms | export to a vector DB built for it | that system |
-| Embedded | mmap a Tier-3 artifact as a library | the app |
-
-A single query embedding measures **20ms** (MiniLM) / **68ms** (mpnet) warm, HTTP included — fine at
-query time, fatal if the model is loaded per call. So the embedding service stays resident and
-stateless, and `SqlViewGenerator` emits a view per dialect that wraps the cosine arithmetic, so an
-analyst installs nothing and never writes `zip_with`/`reduce` by hand.
-
-**An engine user never names a model.** The query API takes a *materialization*, and the active model
-revision is resolved from it. Naming a model per query is how you embed a query in one space and
-score it against another.
-
----
+Retirement never deletes a vector. The embedding store is shared by every materialization whose text
+hashed identically, so per-table deletion is refused; a purge marks rows for the reclaim sweeper,
+the only component with the global view to decide that content is referenced by nothing.
 
 ## Modules
 
 | Module | Role |
 |---|---|
-| `common` | DTOs, constants, cosine similarity. No Spring. |
-| `vectorsync-format` | Iceberg format layer: Tier-1 stores, content hashing, spec identity, projection, SQL views. No Spring. |
-| `control-plane` | Postgres. Validated admission with cost estimates, materialization state machine, leased work queue. |
-| `worker` | Change detection, chunking, dedup-aware derivation, Tier-1 writes. |
-| `search-service` | Evaluation, provenance, index manifest. **Not** the serving tier. |
-| `embedding-service` | FastAPI + sentence-transformers. Stateless, resident models. |
-| `dashboard` | React + Carbon. Demo and ops only. |
+| `common` | DTOs and constants. No Spring. |
+| `vectorsync-format` | The Iceberg format layer: content identity, the three tiers, SQL generation. No Spring. |
+| `control-plane` | :8080 — admission, state machine, leased work queue, dedup record |
+| `worker` | :8081 — change detection, derivation, projection, clustering |
+| `embedding-service` | :8000 — FastAPI + sentence-transformers |
+| `dashboard` | :3000 — React UI |
 
-## Admission
-
-Registration validates instead of accepting. It checks that the table resolves, that every key and
-embedded column exists and is the right type, that the chunker and model are known — accumulating
-*all* problems rather than failing on the first — and returns a **cost estimate** computed from
-Iceberg manifest metadata without scanning the table:
-
-```bash
-POST /api/materializations   {"dryRun": true, ...}
-  -> estimatedRows, estimatedChunks, estimatedFiles, validation problems
-```
-
-The predecessor validated nothing: it generated a UUID and saved, so a nonexistent table with
-nonexistent columns returned 200 and then failed forever in the scheduler.
-
-## Retirement
-
-Retiring a materialization **never** deletes from `embedding_store`. Those vectors are shared by
-construction with every materialization that deduplicated against them, so deleting by source table
-would silently corrupt other datasets. Retire removes the active tag, drops the Tier-2 projection,
-and tombstones `content_map` rows. Reclaim is a separate reference-aware sweep with a grace period.
-
-Because inference is already paid for and content-addressed, **retire and re-register is nearly free.**
-
----
-
-## Promotion
-
-Gated. An index cannot serve unless it was evaluated, clears a configurable index-recall floor
-(default 0.95), and covers the newest source sequence number. Overridable with `force`, which
-requires a note and writes the override plus the blockers it bypassed into the alias log — a gate
-with no escape hatch gets bypassed by editing the alias table, which destroys the audit trail
-instead of recording the decision.
-
-Two metrics, kept apart because they have different authority:
-
-- **`index_recall@k`** — HNSW versus an exhaustive scan. Ground truth is the exact scan, so it needs
-  no labels and gates promotion.
-- **`precision@k`** — against a judged fixture. Measures the *model*, not the index. Recorded only
-  when a `fixtureRef` names its ground truth; a score whose ground truth cannot be identified is not
-  evidence.
-
-Consumers are query engines, so there is no click-through to fall back on: whatever is checked
-before promotion is the only check that ever happens.
-
----
+`common` and `vectorsync-format` are framework-free, enforced by `maven-enforcer-plugin` rather than
+by convention.
 
 ## Quick start
 
 ```bash
-docker compose up -d --build
-python3 bench/corpus.py --tables 5 --rows 100 --out /tmp/demo
-python3 bench/run.py --corpus /tmp/demo --tables 5 --modes dup80
+cp .env.example .env
+docker compose up -d
+./deployment/demo-run.sh
 ```
 
-Dashboard at http://localhost:3000.
+Build and test:
 
-## Status and known gaps
+```bash
+mvn -o clean test-compile && mvn -o clean test
+```
 
-Stated plainly rather than implied:
+On macOS with Colima, the Testcontainers tests need:
 
-- **Delete/update detection is incomplete.** Append scans see added files. Delete-file handling is
-  detected and refused, not implemented.
-- **Content-hash lookup needs a real index.** `ContentHashIndex` holds an exact in-memory set,
-  seeded once per process per scope. Memory is the ceiling: ~120 bytes per hash, so 10M vectors is
-  around 1.2GB and the billions this architecture talks about need a shared KV store or a Bloom
-  filter in front of one. Going straight to Iceberg does not work — measured, not assumed: prefix
-  partitioning does not prune a multi-hundred-hash batch, so the probe degrades to a full store scan
-  and backfill becomes quadratic.
-- **Commit contention** on shared Tier-1 tables under many concurrent writers needs a batching
-  committer. Not hit at benchmark scale.
-- **Compaction and `expireSnapshots`** are obligations, not yet scheduled. Vector ids exclude data
-  file paths, so compaction is safe when it arrives.
-- **Branch/tag publish** is designed but not built; promotion still uses the alias table.
-- **No exporter yet.** The highest-value next integration.
-- **No authentication on any HTTP endpoint.** The deployment posture is trusted-network-only; see
-  [SECURITY.md](SECURITY.md).
+```bash
+export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
+export TESTCONTAINERS_RYUK_DISABLED=true
+```
 
----
+See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions, and [docs/](docs/) for the architecture,
+the demo walkthrough and the repository map.
 
-## License and contributing
+## Current limits
 
-Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The patent grant in section 3 is the
-reason: the stated ambition includes proposing a vector index specification to the Apache Iceberg
-community, and that contribution path is effectively closed under anything else.
+Stated plainly, because they shape where this fits:
 
-Build and test commands, the Docker/Colima setup the Testcontainers tests need, and the comment
-convention this codebase is strict about are in [CONTRIBUTING.md](CONTRIBUTING.md). Vulnerability
-reports go through [SECURITY.md](SECURITY.md).
+- **Latency.** Purpose-built vector databases answer in single-digit milliseconds. This reads a
+  table: 77–97ms exact, 83–150ms cluster-pruned. It is built for analytical and batch retrieval, and
+  it feeds a vector database rather than replacing one.
+- **Mutation cost.** A reconcile re-derives the affected source partitions and rebuilds the Tier-2
+  projection. Appends are incremental; heavy mutation is proportionally more expensive.
+- **Cluster count** is sized `sqrt(n)` from the corpus. There is no adaptive tuning, and the choice
+  matters: NFCorpus needed 53% of the table at 16 clusters for the quality it reached at 3.8% with
+  64.
+- **Authentication** ships behind `vectorsync.auth.enabled`. See [SECURITY.md](SECURITY.md).
+- **Derived-table compaction** is not yet automatic; long-running deployments accumulate small files.
+- **Scale.** Measured on a single laptop with one worker. Multi-worker leasing is tested; throughput
+  at warehouse scale is not yet characterised.
+
+## Licence
+
+Apache-2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE) and [CONTRIBUTING.md](CONTRIBUTING.md).

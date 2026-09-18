@@ -1,163 +1,145 @@
 # Architecture
 
-VectorSync treats embeddings and vector indexes as **versioned data products bound to Iceberg
-snapshots**, with Iceberg as the system of record for the whole lifecycle:
+VectorSync treats embeddings as a **derived data product keyed by content**, with Iceberg as the
+system of record for every tier. Nothing about a vector depends on where its row happens to live.
 
 ```
-generate -> version -> index -> evaluate -> promote -> query -> evolve -> rollback
+source Iceberg table
+        |
+        |  change detection (incremental append scan, sequence-ordered)
+        v
+TIER 1  embedding_store     one row per (content_hash, model_version, config_id)
+        content_map         append-only row -> content history, with tombstones
+        |
+        |  projection
+        v
+TIER 2  vectors_<table>_<configId>    one row per live chunk, vector inlined
+        |
+        |  spherical k-means, partitioned by nearest centroid
+        v
+TIER 3  clustered_<table>   IVF index expressed as Iceberg partitions
+        vector_centroids    centroids per scope
+        vector_index_coverage   content digest per scope
+        |
+        v
+Spark / Trino read Tier 2 or Tier 3 directly. No VectorSync process in the query path.
 ```
 
-It is deliberately not a vector database that happens to store in Iceberg. The value is
-reproducibility, auditability, and interoperability — not ANN latency.
+## Content identity
 
-## Components
+The hinge of the design.
 
-```
-              Iceberg source table -- snapshot N
-                         |
-                         v
-        +--------------------------------+
-        |  Embedding Materializer        |  worker :8081
-        |  diff(N-1, N) -> batch embed   |
-        +----------------+---------------+
-                         v
-   === ICEBERG (system of record) =======================
-     vector_embeddings      vectors x (row, chunk, model version)
-     vector_index_manifest  index artifacts + full lineage
-     vector_index_alias     append-only log of what serves production
-   ======================+===============================
-                         v
-        +--------------------------------+
-        |  Index Builder (Lucene HNSW)   |  search-service :8083
-        +----------------+---------------+
-                         |  artifact files -> object storage
-        +----------------+----------------+-----------------+
-        v                v                v                 v
-    Serving          Evaluation       Provenance        Exact search
-  alias -> manifest  recall vs        result -> index   exhaustive cosine,
-  -> artifact        exact KNN        -> model -> row    the ground truth
+`content_hash` is a full-width SHA-256 over the canonical text: the embedding columns in spec order,
+joined by the configured separator. The separator is a real ASCII unit separator, so column
+boundaries cannot be forged by moving text across them — `("ab","c")` and `("a","bc")` are different
+content.
 
-   control-plane :8080  table + version registry, sync watermark (PostgreSQL)
-   embedding-service :8000  FastAPI, sentence-transformers or a managed API
-```
+`config_id` is 16 hex of SHA-256 over everything that changes the output: embedding columns, join
+separator, chunker, chunk size, chunk overlap, model name, model revision, embedding version,
+normalisation. It **excludes** the source table and the key columns, which is what lets deduplication
+cross tables. Including the table name would give every table a private key space and embed identical
+text twice.
 
-## What lives where
+`storeKey` is `(content_hash, model_version, config_id)`. The same text under a different model or a
+different configuration is a different vector, and both coexist.
 
-| Store | Holds | Why |
-|---|---|---|
-| Iceberg | embeddings, index manifest, alias log | Must be versioned, auditable, and readable by any engine |
-| Object storage | index artifact binaries | Opaque blobs; referenced by path from the manifest |
-| PostgreSQL | table config, embedding version, sync watermark | Operational state only; nothing that needs auditing |
+## Tier 1 — canonical
 
-## The vector table
+`embedding_store` holds one row per distinct content, partitioned by `identity(model_version)`. It is
+append-only and never recomputed: it is the artifact that costs money.
 
-`vector.vector_embeddings`, format version 3, partitioned by `(source_table, model_version)` so
-reading one embedding version prunes partitions instead of scanning every version ever built.
+It once also partitioned by `hash_prefix`, a two-character bucket of the content hash. That was
+measured a net negative on both sides — a realistic probe's prefix set covered all 256 buckets, so
+reads degraded to full scans, and writes fragmented into tens of thousands of tiny files — and was
+retired from the spec. The column remains in the schema at field id 4 because Iceberg resolves
+columns by field id and historical partition specs still source it; removing it would make the table
+unreadable.
 
-| Column | Type | Notes |
-|---|---|---|
-| `vector_id` | string | SHA-256 of the lineage below; deterministic, so retries are idempotent |
-| `source_table`, `source_row_id` | string | Source identity |
-| `source_snapshot_id` | long | Which source snapshot this derives from. **Identity only — Iceberg snapshot ids are random longs, never an order** |
-| `source_sequence_number` | long | Iceberg's per-table monotonic snapshot sequence. **This is the ordering key** |
-| `source_committed_at` | long | Commit time of the source snapshot, from table metadata. Tiebreak only |
-| `chunk_ordinal` | int | Position in the row's chunk sequence; 0 when the row is one chunk |
-| `embedding_model`, `embedding_version` | string | Model identity; versions coexist |
-| `model_version` | string | Synthetic `model:version` partition value |
-| `embedding_dim` | int | |
-| `preprocessing_id` | string | Hash of the text-construction config |
-| `embedding` | `list<float>` | float32: models emit float32, so float64 doubled cost for nothing |
-| `text` | string, optional | Absent on a tombstone |
-| `deleted` | boolean | Typed, not a metadata string |
-| `metadata` | `map<string,string>`, optional | User passthrough only; lineage is typed |
-| `created_at` | timestamptz | Operational; never decides which version is live |
+`content_map` is the row-to-content history, partitioned by `identity(source_table, config_id)`. It
+is append-only with tombstones, so it is a history rather than a cache: resolution collapses to the
+newest entry per chunk by sequence number, and tombstones are filtered only *after* resolution so an
+older live entry cannot resurrect a deleted row.
 
-Field IDs are part of the on-disk contract and must never be renumbered — Iceberg resolves columns
-by ID, not name.
+## Tier 2 — serving projection
 
-### Resolution
+`vectors_<table>_<configId>` is the Tier-1 join already performed: one row per live row/chunk with
+the vector inlined. Derived and disposable — every column is reproducible from Tier 1, which is what
+makes a rebuild an ordinary operation.
 
-The table is append-only, so readers collapse history to a current view. The rule lives in exactly
-one place, `VectorResolution`, because every reader must agree on it:
+Published as a single snapshot: a scoped `overwriteByRowFilter` deletes the previous contents and the
+new files land in the same commit, so a reader sees the old projection or the new one and never a
+mixture. The filter names only identity-partition columns, because Iceberg deletes whole files by row
+filter and refuses one it cannot prove covers a file entirely.
 
-- key: `(source_table, source_row_id, chunk_ordinal, model_version)`
-- order: `source_sequence_number`, then `source_committed_at`, then `created_at`
-- a `deleted` winner hides the row
+A publish is skipped when nothing changed: if the snapshot summary's config id matches, its
+unresolved-row count is zero, and the content map's latest sequence number equals the summary's, the
+projection on disk is already correct and no snapshot is written.
 
-**Do not order by `source_snapshot_id`.** Iceberg snapshot ids are random longs, so comparing them
-numerically reverses history roughly half the time: a real run produced snapshot
-`7139976223410259010` followed by `2135807640327332542`, and a delete tombstone lost to the row it
-was meant to remove. The sequence number is the only field the Iceberg spec guarantees to be
-ordered.
+## Tier 3 — IVF as partitions
 
-Nor wall clock. `created_at` is metadata about the pipeline run, is non-deterministic across
-machines, and cannot answer "what was live at source version N?". It survives only as a final
-tiebreak.
+An Iceberg-native ANN index is not readable by any engine today. Partitioning is implemented
+everywhere. So each vector is assigned to its nearest centroid and the table is partitioned by
+`identity(model_version, config_id, cluster_id)`; a query that probes the nearest few clusters reads
+only those partitions.
 
-`liveVectorsAsOf(sequenceNumber)` therefore always returns the same set for the same inputs, which
-is what makes a materialization reproducible rather than merely current.
+The approximation lives entirely in the partition predicate. Scoring inside a probed partition is
+exact, so a missed neighbour is explainable: it sat in a cluster that was not probed.
 
-### Deletes span every version
+**Index identity is content, not a snapshot.** `vector_index_coverage` records a digest over the
+sorted distinct content hashes a scope was built from. A build recomputes it and, when it matches,
+returns without refitting and without committing. Compaction, a data-file rewrite, a sort
+reorganisation and a partition rewrite all produce a new Iceberg snapshot and change no content, so
+they leave the digest identical and the existing index provably correct.
 
-A deleted source row is tombstoned under **every** materialized embedding version, not just the
-configured one. Resolution is keyed by model version, so tombstoning only the current version would
-leave the row live — and discoverable — through every older version and its index.
+When content is added and none removed, within a bounded fraction of the scope, the new content is
+assigned against the centroids already on disk and appended — nothing is relabelled. Growth past that
+fraction, measured against the size at the last refit, triggers a full refit instead, which bounds
+centroid drift.
 
-## Index artifacts
+## Change detection
 
-An index covers exactly one `(source_table, model_version)`. That makes the artifact its own
-filter, so search needs no post-filtering, and it makes builds parallel and incremental
-maintenance mean "rebuild the affected partitions".
+Ordered by Iceberg **sequence number**, never by snapshot id: snapshot ids are random longs, so
+ordering by one shuffles history and lets a tombstone lose to the row it was meant to retire.
 
-Artifacts are Lucene HNSW directories uploaded through Iceberg's `FileIO`, so the same code path
-serves an `s3a://` warehouse and a local filesystem. They are immutable and content-addressed by
-index id, which makes caching trivially safe and means a promotion needs no cache invalidation —
-the next query simply resolves a different id.
+An incremental append scan reads only files added since the anchor. A range containing deletes or
+overwrites cannot be described that way, so it is routed to a reconcile: the affected source is
+re-derived at a pinned snapshot, and then a key-set sweep tombstones every mapped row the source no
+longer holds.
 
-**Not Puffin.** Puffin has no standardized ANN blob type and no engine reads one, so it would buy
-zero interoperability today while coupling index lifecycle to table-metadata commits. A plain
-manifest table is queryable from any Iceberg engine now, and remains the migration path if the
-spec later standardizes a vector index blob.
+The sweep asks which keys the source still holds rather than trying to read what was deleted.
+Positional deletes and deletion vectors carry `(file_path, position)` and no key values, so a delete
+file yields an offset rather than a row id — and the data file it references may already have been
+removed by `expire_snapshots`. Asking about current state avoids both problems.
 
-## Promotion
+## Control plane
 
-`vector_index_alias` is an append-only log of `(alias, source_table) -> index_id`. Promotion is one
-Iceberg commit; rollback is another append naming the earlier index. Nothing is mutated, so the
-promotion history doubles as an audit trail and `previous()` gives the rollback target directly.
+Postgres, with Flyway migrations. `materializations` carries the state machine; `work_items` is a
+leased queue using `SELECT … FOR UPDATE SKIP LOCKED`, scoped per materialization with capped retries
+and expiry reclaim; `embedded_content` is the durable deduplication record.
 
-Alias ordering *is* by wall clock, which is correct here in a way it is not for vectors: a
-promotion genuinely is an operational event in time. This assumes a single promoting writer.
+Two properties make the deduplication record trustworthy. It is written in the same transaction that
+completes the work which produced the vector, so "this content has a vector" cannot outlive the
+commit that wrote it. And it is shared, so the measured deduplication holds across workers rather
+than for one process.
 
-## Evaluation
+The worker's in-memory hash index is a read-through cache over that record, and caches **positives
+only**: a negative is never cached, because a hash absent now may be present a moment later, and a
+failed probe propagates rather than returning "not found".
 
-Two different measurements, kept separate because conflating them produces misleading promotion
-decisions — a new model can have perfect index recall while retrieving worse documents:
+## Catalog
 
-- **index recall@k** — overlap with an exhaustive cosine scan. No labels needed. Measures the index.
-- **precision@k** — against judged relevance. Measures the embedding model.
+`cache-enabled=false`, deliberately. `CatalogUtil.buildIcebergCatalog` wraps the catalog in a
+`CachingCatalog` whenever the property is absent, and its default is true — precisely wrong for a
+system whose entire job is to notice that a source table has a new snapshot.
 
-The exhaustive scan is scoped to the index's own model version. Scanning every version at once
-mixes embedding spaces — a query embedded with one model scored against vectors from another — and
-returns each row once per version, which understates recall.
+HadoopCatalog is refused on object storage: its commit is a filename rename with no atomicity, so two
+writers can both succeed with one silently lost. Raising `vectorsync.runner.parallelism` above 1 on a
+hadoop catalog refuses to start for the same reason.
 
-Metrics are written back onto the manifest entry, so the numbers a promotion was based on stay
-attached to the artifact.
+## Concurrency
 
-## Interoperability, scoped honestly
-
-- engine-neutral **metadata** — available today; the manifest and alias log are plain Iceberg tables
-- engine-neutral **embeddings** — available today; a fixed-width vector column any engine can read
-- engine-neutral **ANN index** — **not** available; this needs connector-level index pushdown that
-  does not exist in Trino. Exact search from any engine does work, which is sufficient for batch
-  semantic operations.
-
-`vectorsync-format` therefore carries no framework dependencies, so a Spark job or a future Trino
-plugin shares the same format definition as the Spring services.
-
-## Known limitations
-
-- Index build is single-process; a very large corpus needs partition-scoped parallel builds
-- Incremental index maintenance rebuilds a whole `(table, model_version)` rather than a partition
-- No chunking yet: one source row is one chunk (`chunk_ordinal` exists but is always 0)
-- Text is stored per model version, so it is duplicated across versions of the same row
-- Alias promotion assumes a single writer
+The derivation cycle fans out over **configuration groups**, not materializations. `config_id`
+excludes the source table, so several materializations routinely share one, and two that share one
+address the same Tier-1 content space — derived at once, both would probe the deduplication record
+before either had written and both would pay for the same inference. Groups run in parallel; members
+of a group run in sequence.

@@ -204,10 +204,6 @@ export function TableDetails() {
           </StructuredListBody>
         </StructuredListWrapper>
       )}
-
-      <Button kind="tertiary" onClick={() => navigate('/lifecycle')}>
-        Manage lifecycle
-      </Button>
     </div>
   );
 }
