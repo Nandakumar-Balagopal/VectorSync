@@ -40,9 +40,11 @@ export function TableDetails() {
 
   const load = useCallback(async () => {
     if (!tableId) return;
-    setError(null);
     try {
       const configData = await vectorSyncApi.getTable(tableId);
+      // See Overview: cleared after the fetch resolves so no setState runs synchronously in the
+      // effect, and so a real error survives until a reload actually succeeds.
+      setError(null);
       setConfig(configData);
       setStatus(await vectorSyncApi.getSyncStatus(tableId).catch(() => null));
 

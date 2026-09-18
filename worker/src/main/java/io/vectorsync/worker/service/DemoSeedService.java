@@ -3,7 +3,6 @@ package io.vectorsync.worker.service;
 import io.vectorsync.worker.service.iceberg.IcebergCatalogService;
 import io.vectorsync.worker.service.iceberg.IcebergTableService;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.FileFormat;
@@ -353,53 +352,6 @@ public class DemoSeedService {
         overwrite.commit();
     }
 
-    private DataFile writeDataFile(Table table, List<Record> records) {
-        Schema schema = table.schema();
-        PartitionSpec spec = table.spec();
-        OutputFileFactory outputFileFactory = OutputFileFactory.builderFor(table, 1, System.currentTimeMillis())
-                .format(FileFormat.PARQUET)
-                .build();
-
-        PartitionKey partitionKey = new PartitionKey(spec, schema);
-        partitionKey.partition(records.get(0));
-
-        EncryptedOutputFile encryptedOutputFile = outputFileFactory.newOutputFile(partitionKey);
-        OutputFile outputFile = encryptedOutputFile.encryptingOutputFile();
-
-        long recordCount = records.size();
-        long fileSize;
-        org.apache.iceberg.Metrics metrics;
-
-        try (FileAppender<Record> appender = Parquet.write(outputFile)
-                .schema(schema)
-                .createWriterFunc(GenericParquetWriter::buildWriter)
-                .build()) {
-            
-            for (Record record : records) {
-                appender.add(record);
-            }
-            // Must get metrics AFTER closing the appender (done by try-with-resources)
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to write demo records", e);
-        }
-
-        // Get file size and metrics from the output file after appender is closed
-        try {
-            fileSize = outputFile.toInputFile().getLength();
-        } catch (Exception e) {
-            log.warn("Could not get file size, using record count estimate", e);
-            fileSize = recordCount * 100; // Rough estimate
-        }
-
-        DataFile dataFile = DataFiles.builder(spec)
-                .withEncryptedOutputFile(encryptedOutputFile)
-                .withFileSizeInBytes(fileSize)
-                .withRecordCount(recordCount)
-                .withFormat(FileFormat.PARQUET)
-                .build();
-
-        return dataFile;
-    }
 
     private Table loadProductsTable() {
         Catalog catalog = catalogService.getCatalog();
