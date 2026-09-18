@@ -78,6 +78,40 @@ class HttpAuthTest {
         void healthIsOpen() throws Exception {
             mvc.perform(get("/actuator/health")).andExpect(status().isOk());
         }
+
+        @Test
+        @DisplayName("query-parameter endpoints bind their parameters")
+        void queryParametersBind() throws Exception {
+            // Every @RequestParam and @PathVariable in this repository that does not name its
+            // parameter explicitly needs the compiler's -parameters flag, which the build did not
+            // set. The failure is a runtime 500 -- "Name for argument of type [java.lang.String]
+            // not specified" -- and it reached a running container: thirteen parameters across four
+            // controllers were broken, found only by calling an endpoint by hand.
+            //
+            // Nothing caught it because the endpoints' own tests exercised the services behind them
+            // rather than the HTTP surface. ViewEndpointTest even said so: "tested at the generator
+            // rather than over HTTP because the properties worth pinning are properties of the
+            // emitted SQL". That reasoning was wrong -- the binding was the part that broke.
+            //
+            // 409 is the expected answer for a table that has no projection. Anything in the 5xx
+            // range means binding failed again.
+            mvc.perform(get("/api/derive/view")
+                            .param("sourceTable", "default.absent")
+                            .param("configId", "0123456789abcdef")
+                            .param("engine", "trino"))
+                    .andExpect(status().isConflict());
+
+            mvc.perform(get("/api/derive/provenance")
+                            .param("sourceTable", "default.absent")
+                            .param("configId", "0123456789abcdef")
+                            .param("sourceRowId", "r-1"))
+                    .andExpect(status().isOk());
+
+            mvc.perform(get("/api/derive/metrics")
+                            .param("sourceTable", "default.absent")
+                            .param("configId", "0123456789abcdef"))
+                    .andExpect(status().isOk());
+        }
     }
 
     @SpringBootTest(properties = {

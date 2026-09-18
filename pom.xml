@@ -158,6 +158,17 @@
                 <configuration>
                     <source>17</source>
                     <target>17</target>
+                    <compilerArgs>
+                        <!-- Retain parameter names in the class file.
+                             Without this, Spring cannot bind @RequestParam or @PathVariable unless
+                             every one names its parameter explicitly, and the failure is a runtime
+                             500 rather than a compile error: "Name for argument of type
+                             [java.lang.String] not specified, and parameter name information not
+                             available via reflection." Thirteen parameters across four controllers
+                             were broken this way, discovered only by calling an endpoint by hand.
+                             Setting it once removes the whole class of defect. -->
+                        <arg>-parameters</arg>
+                    </compilerArgs>
                 </configuration>
             </plugin>
             <!-- Maven 3.6's default Surefire (2.12.4) cannot detect JUnit 5 tests. -->

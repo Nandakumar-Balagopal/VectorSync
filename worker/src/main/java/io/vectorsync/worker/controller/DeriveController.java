@@ -215,10 +215,10 @@ public class DeriveController {
      *                  {@code iceberg.vectorsync}. Empty leaves it unqualified.
      */
     @GetMapping(value = "/view", produces = MediaType.TEXT_PLAIN_VALUE)
-    public ResponseEntity<String> view(@RequestParam String sourceTable,
-                                       @RequestParam String configId,
-                                       @RequestParam(defaultValue = "trino") String engine,
-                                       @RequestParam(defaultValue = "") String qualifier) {
+    public ResponseEntity<String> view(@RequestParam("sourceTable") String sourceTable,
+                                       @RequestParam("configId") String configId,
+                                       @RequestParam(name = "engine", defaultValue = "trino") String engine,
+                                       @RequestParam(name = "qualifier", defaultValue = "") String qualifier) {
         int width = projections.dimension(sourceTable, configId);
         if (width <= 0) {
             return ResponseEntity.status(409).body(
@@ -317,10 +317,10 @@ public class DeriveController {
      * investigating a disappeared result needs.
      */
     @GetMapping("/provenance")
-    public ResponseEntity<?> provenance(@RequestParam String sourceTable,
-                                        @RequestParam String configId,
-                                        @RequestParam String sourceRowId,
-                                        @RequestParam(defaultValue = "0") int chunkOrdinal) {
+    public ResponseEntity<?> provenance(@RequestParam("sourceTable") String sourceTable,
+                                        @RequestParam("configId") String configId,
+                                        @RequestParam("sourceRowId") String sourceRowId,
+                                        @RequestParam(name = "chunkOrdinal", defaultValue = "0") int chunkOrdinal) {
         try {
             return ResponseEntity.ok(
                     provenance.chainFor(sourceTable, configId, sourceRowId, chunkOrdinal));

@@ -437,14 +437,21 @@ public class AdmissionService {
             if (!serving.getId().equals(candidate.getId())) {
                 serving.setServing(false);
                 serving.setUpdatedAt(Instant.now());
-                materializationRepository.save(serving);
+                // Flushed, not just saved. JPA batches writes to the end of the transaction and
+                // does not guarantee it orders this demotion before the promotion below, so the
+                // candidate's serving=true could reach the database while the incumbent still held
+                // it -- which the partial unique index rejects, failing the whole swap. The
+                // constraint caught exactly that in test. Postgres cannot defer a partial unique
+                // index (only constraints are deferrable, and this is an index), so the ordering
+                // has to be made explicit here rather than relegated to commit time.
+                materializationRepository.saveAndFlush(serving);
                 demoted = serving.getId();
             }
         }
 
         candidate.setServing(true);
         candidate.setUpdatedAt(Instant.now());
-        materializationRepository.save(candidate);
+        materializationRepository.saveAndFlush(candidate);
 
         log.info("Promoted materialization {} ({} / {}) to serving{}",
                 candidate.getId(), candidate.getSourceTable(), candidate.getConfigId(),

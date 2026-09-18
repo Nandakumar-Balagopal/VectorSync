@@ -235,4 +235,94 @@ class DegradedRecoveryTest {
                 "a failed re-anchor moved the state anyway, so the entry is now in a state whose "
                         + "anchor was never updated");
     }
+
+    // ------------------------------------------------------- promotion gate
+    //
+    // Promotion exists because a model migration has no cutover without it: two configurations over
+    // one table can both be LIVE, each publishing its own projection, and nothing said which a
+    // reader should use. The gate is a COMPLETENESS check and not a quality one -- it refuses to
+    // promote something unfinished and says nothing about whether retrieval is good.
+
+    @Test
+    @DisplayName("a complete materialization can be promoted, and becomes the serving one")
+    void promoteSetsServing() throws Exception {
+        long anchor = createSource(1);
+        liveAt(anchor, 1L, 5L);
+
+        AdmissionService.PromotionResult result = admission.promote(id);
+
+        assertEquals(id, result.promoted(), "promotion was refused: " + result.blockers());
+        assertTrue(result.blockers().isEmpty());
+        assertTrue(materializationRepository.findById(id).orElseThrow().isServing());
+    }
+
+    @Test
+    @DisplayName("promoting demotes whatever was serving for the same source table")
+    void promoteDemotesThePredecessor() throws Exception {
+        long anchor = createSource(1);
+        MaterializationEntity incumbent = liveAt(anchor, 1L, 5L);
+        admission.promote(incumbent.getId());
+
+        // A second configuration over the same table -- a model migration -- differing only in the
+        // embedding version, so it is a distinct config_id and a distinct materialization.
+        MaterializationEntity candidate = materializationRepository.saveAndFlush(
+                MaterializationEntity.builder()
+                        .id(id + "-v2")
+                        .sourceTable(sourceTable)
+                        .configId("cfg2-" + id)
+                        .keyColumns("id")
+                        .embeddingColumns("description")
+                        .modelName("all-MiniLM-L6-v2")
+                        .embeddingVersion("v2")
+                        .chunker("whole").chunkSize(0).chunkOverlap(0).normalize(false)
+                        .state(State.LIVE)
+                        .anchorSnapshotId(anchor).anchorSequenceNumber(1L)
+                        .incrementalWatermark(5L)
+                        .freshnessSlaSeconds(3600).purgeEligible(false)
+                        .createdAt(Instant.now()).updatedAt(Instant.now())
+                        .build());
+
+        AdmissionService.PromotionResult result = admission.promote(candidate.getId());
+
+        assertEquals(candidate.getId(), result.promoted());
+        assertEquals(incumbent.getId(), result.demoted(),
+                "the previous serving materialization was not demoted, so a partial unique index "
+                        + "would have rejected the swap -- or worse, two would serve at once");
+        assertTrue(materializationRepository.findById(candidate.getId()).orElseThrow().isServing());
+        assertTrue(!materializationRepository.findById(incumbent.getId()).orElseThrow().isServing());
+    }
+
+    @Test
+    @DisplayName("an incomplete materialization is refused, with every blocker at once")
+    void promoteRefusesIncomplete() throws Exception {
+        long anchor = createSource(1);
+        // Never materialized anything and carrying an error: two independent reasons, which must
+        // both be reported. A gate that returns the first invites a sequence of retries, each
+        // discovering the next.
+        MaterializationEntity entity = liveAt(anchor, 1L, 0L);
+        entity.setLastError("incremental scan unsafe: RECONCILE_REQUIRED");
+        materializationRepository.saveAndFlush(entity);
+
+        AdmissionService.PromotionResult result = admission.promote(id);
+
+        assertEquals(null, result.promoted(), "an unfinished materialization was promoted");
+        assertTrue(result.blockers().size() >= 2,
+                "expected both the watermark and the error to be reported, got: "
+                        + result.blockers());
+        assertTrue(!materializationRepository.findById(id).orElseThrow().isServing());
+    }
+
+    @Test
+    @DisplayName("a degraded materialization is refused even with a watermark")
+    void promoteRefusesDegraded() throws Exception {
+        long anchor = createSource(1);
+        liveAt(anchor, 1L, 5L);
+        admission.markDegraded(id, "deletes require a reconcile");
+
+        AdmissionService.PromotionResult result = admission.promote(id);
+
+        assertEquals(null, result.promoted());
+        assertTrue(result.blockers().stream().anyMatch(b -> b.contains("DEGRADED")),
+                "the refusal should name the state: " + result.blockers());
+    }
 }
