@@ -4,16 +4,17 @@ spring:
   task:
     scheduling:
       pool:
-        # Spring Boot's default is 1, so every @Scheduled method in the worker shares one thread and
-        # a long derivation cycle delays whatever is behind it. Only DerivationScheduler is live
-        # today -- SyncScheduler is @ConditionalOnProperty with no matchIfMissing and nothing sets
-        # it -- so this is headroom rather than a fix for an observed stall, and it is what stops
-        # the legacy scheduler from starving derivation the moment someone enables it.
+        # Spring Boot's default is 1, so every @Scheduled method in the worker would share one
+        # thread and a long cycle would delay whatever is behind it. One thread per scheduler:
+        # DerivationScheduler (always on), MaintenanceScheduler (on unless disabled) and
+        # ClusterIndexScheduler (opt-in). Maintenance is the reason this is no longer headroom --
+        # a compaction pass reads and rewrites data files, so it is the one @Scheduled method here
+        # that can occupy its thread for minutes, and sharing would stall derivation behind it.
         #
         # This is NOT the derivation concurrency knob. Cycle parallelism is
         # vectorsync.runner.parallelism, which fans out inside one cycle rather than running cycles
         # concurrently; @Scheduled(fixedDelay) never overlaps a method with itself.
-        size: ${SPRING_TASK_SCHEDULING_POOL_SIZE:2}
+        size: ${SPRING_TASK_SCHEDULING_POOL_SIZE:3}
 
 server:
   port: ${SERVER_PORT:8081}
