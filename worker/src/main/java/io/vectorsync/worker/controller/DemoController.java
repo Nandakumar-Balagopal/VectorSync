@@ -47,16 +47,31 @@ public class DemoController {
         }
     }
 
-    @PostMapping("/tables")
-    public ResponseEntity<?> seedTable(@RequestBody SeedTableRequest request) {
+    public record DeletePartitionRequest(String tableName, String column, String value) {
+    }
+
+    /** Partition-scoped DELETE, so the reconcile's partition scoping can be exercised. */
+    @PostMapping("/tables/delete-partition")
+    public ResponseEntity<?> deletePartition(@RequestBody DeletePartitionRequest request) {
         try {
-            return ResponseEntity.ok(demoSeedService.seedTable(request.tableName(), request.rows()));
+            return ResponseEntity.ok(demoSeedService.deletePartition(
+                    request.tableName(), request.column(), request.value()));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
         }
     }
 
-    public record SeedTableRequest(String tableName, List<DemoSeedService.SeedRow> rows) {
+    @PostMapping("/tables")
+    public ResponseEntity<?> seedTable(@RequestBody SeedTableRequest request) {
+        try {
+            return ResponseEntity.ok(demoSeedService.seedTable(request.tableName(), request.rows(), request.partitionColumn()));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
+        }
+    }
+
+    public record SeedTableRequest(String tableName, List<DemoSeedService.SeedRow> rows,
+                                   String partitionColumn) {
     }
 
     /** Appends to an existing table so its snapshot ancestry survives, unlike a re-seed. */
