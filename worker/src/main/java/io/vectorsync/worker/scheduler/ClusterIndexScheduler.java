@@ -92,7 +92,7 @@ public class ClusterIndexScheduler {
                     // an index over no vectors would commit an empty scope and, worse, record
                     // coverage for it, which a later tick would then treat as up to date.
                     long contents = clusterIndex.canonicalCount(
-                            spec.modelVersion(), spec.configId());
+                            spec.getSourceTable(), spec.modelVersion(), spec.configId());
                     if (contents == 0) {
                         continue;
                     }

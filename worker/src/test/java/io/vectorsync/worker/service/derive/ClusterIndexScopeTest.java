@@ -601,6 +601,69 @@ class ClusterIndexScopeTest {
     }
 
     @Test
+    @DisplayName("a scope's canonical count ignores other tables sharing the store")
+    void canonicalCountIsScopedToSourceTable() {
+        // The configuration id deliberately excludes the source table, so identical content
+        // deduplicates across tables and one embedding store holds every table derived under that
+        // (model, config). A canonical count that did not filter by source table therefore answered
+        // for the warehouse while the caller asked about one scope.
+        //
+        // The blast radius was large and entirely invisible with one table per configuration:
+        // suggestedClusters sized itself from the wrong number and minted far too many partitions,
+        // freshness could never reach FRESH, and the scheduler refits whatever is BEHIND -- so it
+        // refit forever. Observed live at 30,000 scope rows inside a 908,000-row store.
+        seed(0, 1, 2, 3, 4, 5);
+
+        Table store = EmbeddingStore.loadOrCreate(catalogService.getCatalog(), NAMESPACE);
+        Table contentMap = ContentMap.loadOrCreate(catalogService.getCatalog(), NAMESPACE);
+        List<EmbeddingEntry> foreign = new ArrayList<>();
+        List<ContentMapEntry> foreignMappings = new ArrayList<>();
+        for (int ordinal = 100; ordinal < 140; ordinal++) {
+            foreign.add(EmbeddingEntry.builder()
+                    .contentHash(hash(ordinal))
+                    .modelVersion(MODEL_VERSION)
+                    .configId(CONFIG_ID)
+                    .embeddingDim(4)
+                    .embedding(new float[]{ordinal, 1f, 0f, 0f})
+                    .text("other table content " + ordinal)
+                    .createdAt(Instant.ofEpochSecond(1_700_000_000L))
+                    .build());
+            foreignMappings.add(ContentMapEntry.builder()
+                    // Same model and configuration, different source table: exactly what dedup
+                    // across tables produces.
+                    .sourceTable("default.another_table")
+                    .sourceRowId("other-" + ordinal)
+                    .chunkOrdinal(0)
+                    .contentHash(hash(ordinal))
+                    .configId(CONFIG_ID)
+                    .modelVersion(MODEL_VERSION)
+                    .sourceSnapshotId(900L + ordinal)
+                    .sourceSequenceNumber(1L)
+                    .sourceCommittedAtMillis(1_700_000_000_000L)
+                    .deleted(false)
+                    .createdAt(Instant.ofEpochSecond(1_700_000_000L))
+                    .build());
+        }
+        EmbeddingStore.append(store, foreign);
+        ContentMap.append(contentMap, foreignMappings);
+
+        assertEquals(6, clusterIndex.canonicalCount(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID),
+                "the canonical count must describe this scope, not every table in the store");
+        assertEquals(40, clusterIndex.canonicalCount("default.another_table", MODEL_VERSION, CONFIG_ID),
+                "and it must describe the other scope correctly too");
+
+        // The consequence that mattered: a built index over this scope must read FRESH rather than
+        // being measured against the whole store and refit on every scheduler tick.
+        clusterIndex.build(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID, 2);
+        List<ClusterIndexService.ScopeStatus> scopes =
+                clusterIndex.status(SOURCE_TABLE, MODEL_VERSION, CONFIG_ID);
+        assertEquals(1, scopes.size());
+        assertEquals(6, scopes.get(0).canonicalVectors());
+        assertEquals(ClusterIndexService.Freshness.FRESH, scopes.get(0).freshness(),
+                "a fully built scope read as BEHIND, which is what drove the endless refit");
+    }
+
+    @Test
     @DisplayName("cluster count is sized from the corpus, not fixed")
     void clusterCountFollowsCorpusSize() {
         // sqrt(n), the standard IVF sizing heuristic. A fixed count cannot be right across corpus

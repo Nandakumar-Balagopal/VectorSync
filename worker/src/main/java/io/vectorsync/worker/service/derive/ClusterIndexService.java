@@ -194,12 +194,12 @@ public class ClusterIndexService {
      * know whether there is a corpus at all -- building over nothing would commit an empty scope and
      * record coverage for it, which the next tick would read as up to date.
      */
-    public long canonicalCount(String modelVersion, String configId) {
+    public long canonicalCount(String sourceTable, String modelVersion, String configId) {
         Table store = EmbeddingStore.loadIfExists(catalogService.getCatalog(), vectorNamespace);
         if (store == null) {
             return 0;
         }
-        return countCanonical(store, modelVersion, configId).count();
+        return countCanonical(store, sourceTable, modelVersion, configId).count();
     }
 
     public static int suggestedClusters(long contentCount) {
@@ -775,7 +775,7 @@ public class ClusterIndexService {
                     Freshness.UNKNOWN, "Tier 1 has not been initialized");
         }
 
-        CanonicalCount canonical = countCanonical(store, modelVersion, configId);
+        CanonicalCount canonical = countCanonical(store, sourceTable, modelVersion, configId);
         if (!indexExists) {
             return new ScopeStatus(sourceTable, modelVersion, configId, 0, canonical.count(),
                     centroids, Freshness.BEHIND, "the clustered table does not exist yet");
@@ -863,7 +863,28 @@ public class ClusterIndexService {
      * Beyond {@link #MAX_COUNTED_HASHES} distinct hashes this stops accumulating and reports
      * {@code exact=false} rather than holding an unbounded set for an operator's status call.
      */
-    private CanonicalCount countCanonical(Table store, String modelVersion, String configId) {
+    private CanonicalCount countCanonical(Table store, String sourceTable,
+                                          String modelVersion, String configId) {
+        // Scoped by source table, which it was not, and the omission was not benign. A
+        // configuration id deliberately excludes the source table so that identical content
+        // deduplicates across tables -- that is the whole point of Tier 1 -- so the embedding store
+        // for one (model, config) holds the content of every table derived under it. Counting it
+        // unscoped therefore answers a question about the warehouse while the caller asked about
+        // one scope.
+        //
+        // Measured consequence, from a run with 30,000 rows in a store already holding 908,000:
+        // suggestedClusters sized itself from 908,000 and asked for 953 clusters instead of 173,
+        // which wrote 953 data files for 30,000 records; freshness compared 30,000 indexed against
+        // 908,000 canonical and so could never be anything but BEHIND; and the scheduler, which
+        // refits whatever is BEHIND, refit the whole scope every two minutes forever and pegged a
+        // core. One unscoped count produced a pathological index, a permanently false alarm, and an
+        // infinite refit loop -- and none of it is visible with a single table per configuration,
+        // because then the store holds nothing else.
+        Set<String> live = liveContentHashes(sourceTable, configId);
+        if (live.isEmpty()) {
+            return new CanonicalCount(0, true);
+        }
+
         Set<String> hashes = new LinkedHashSet<>();
         boolean exact = true;
         try (CloseableIterable<Record> rows = IcebergGenerics.read(store)
@@ -876,11 +897,16 @@ public class ClusterIndexService {
                     exact = false;
                     break;
                 }
-                hashes.add(String.valueOf(row.getField(Constants.CONTENT_HASH_COLUMN)));
+                String hash = String.valueOf(row.getField(Constants.CONTENT_HASH_COLUMN));
+                // The same intersection readCanonical takes, so freshness is measured against
+                // exactly the set a build would index rather than a superset of it.
+                if (live.contains(hash)) {
+                    hashes.add(hash);
+                }
             }
         } catch (Exception e) {
-            throw new IllegalStateException(
-                    "Could not count Tier 1 content for " + modelVersion + " / " + configId, e);
+            throw new IllegalStateException("Could not count Tier 1 content for "
+                    + sourceTable + " / " + modelVersion + " / " + configId, e);
         }
         return new CanonicalCount(hashes.size(), exact);
     }
