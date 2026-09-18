@@ -2,7 +2,6 @@ package io.vectorsync.format.catalog;
 
 import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.catalog.Catalog;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -16,14 +15,14 @@ import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 
 import java.net.URI;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Single definition of how VectorSync builds an Iceberg catalog.
  *
- * <p>Previously duplicated across worker, search-service, and control-plane, which had drifted:
+ * <p>Previously duplicated across the worker, the control plane and the since-retired
+ * search service, which had drifted:
  * only the worker configured a region or auto-created the warehouse bucket, and the other two set
  * S3FileIO unconditionally even for {@code s3a://} warehouses. That meant the writer and the
  * readers reached the same warehouse through different FileIO implementations.

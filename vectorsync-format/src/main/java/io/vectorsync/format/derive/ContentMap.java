@@ -123,6 +123,10 @@ public final class ContentMap {
         if (tableExists) {
             Table existing = catalog.loadTable(identifier);
             requireCurrentFormat(existing);
+            // The existing-table branch is the one that matters: a warehouse created before the
+            // retry budget was raised is precisely the one whose appends are losing the
+            // compare-and-set. Commits only when the setting is absent.
+            SharedTableProperties.ensureTuned(existing);
             return existing;
         }
 
@@ -136,8 +140,7 @@ public final class ContentMap {
                     identifier,
                     schema,
                     partitionSpec(schema),
-                    Map.of(Constants.FORMAT_VERSION_PROPERTY,
-                            String.valueOf(Constants.VECTOR_FORMAT_VERSION)));
+                    SharedTableProperties.forCreate());
         } catch (Exception e) {
             // Two workers can start a sync at once and race here; the loser just reloads.
             log.warn("Content map creation raced or failed, reloading: {}", e.getMessage());
@@ -145,6 +148,9 @@ public final class ContentMap {
 
         Table created = catalog.loadTable(identifier);
         requireCurrentFormat(created);
+        // Warehouses created before the retry budget was raised are exactly the ones that hit the
+        // contention, so the settings are applied here too. Commits only when absent.
+        SharedTableProperties.ensureTuned(created);
         return created;
     }
 
@@ -208,7 +214,11 @@ public final class ContentMap {
         log.debug("Appended {} content map entries", records.size());
     }
 
-    /** The current mapping: one entry per live chunk, tombstoned chunks removed. */
+    /**
+     * The current mapping: one entry per live chunk, tombstoned chunks removed.
+     *
+     * <p>The returned order is unspecified; see {@link #liveEntriesAsOf}.
+     */
     public static List<ContentMapEntry> liveEntries(Table table, String sourceTable, String configId) {
         return liveEntriesAsOf(table, sourceTable, configId, Long.MAX_VALUE);
     }
@@ -219,6 +229,11 @@ public final class ContentMap {
      * the same target version always resolve to the same content hashes.
      *
      * <p>Takes a sequence number, not a snapshot id, because only sequence numbers are ordered.
+     *
+     * <p>The order of the returned list is unspecified and callers must not depend on it. It
+     * follows whatever order the scan happens to hand rows back in, which Iceberg is free to change
+     * with file layout, split planning, or a compaction. Callers that need an order impose one --
+     * {@link ProjectionBuilder} sorts by content hash for its own reasons.
      */
     public static List<ContentMapEntry> liveEntriesAsOf(Table table,
                                                         String sourceTable,
@@ -240,31 +255,45 @@ public final class ContentMap {
                     Constants.SOURCE_SEQUENCE_NUMBER_COLUMN, asOfSourceSequenceNumber));
         }
 
-        List<ContentMapEntry> history = new ArrayList<>();
+        // History collapses while the scan streams, keeping only the current winner per chunk key.
+        // The predecessor materialized every version of every row into a list and sorted it before
+        // collapsing, which made peak heap proportional to how long the table had existed rather
+        // than to how much of it is live -- the append-only design guarantees the first number grows
+        // without bound. That is the measured OOM in this system: a 100M-row table at three chunks
+        // per row holds on the order of 120 GB of entries before the first one can be discarded.
+        // Peak is now O(live chunks).
+        Map<String, ContentMapEntry> newestByChunk = new LinkedHashMap<>();
         try (CloseableIterable<Record> rows = IcebergGenerics.read(table)
                 .where(filter)
                 .build()) {
 
             for (Record row : rows) {
-                history.add(fromRecord(row));
+                ContentMapEntry candidate = fromRecord(row);
+                // Same winner as sorting OLDEST_FIRST and overwriting into a map: the candidate
+                // replaces the incumbent whenever it is not strictly older. The <= is what keeps
+                // ties resolving as they did -- a stable sort left equal entries in scan order, so
+                // the last one encountered won, and it still does. Comparing on the full
+                // OLDEST_FIRST ordering rather than on the sequence number alone matters for the
+                // same reason: the two tiebreakers decide which of two materializations of one
+                // source version is current.
+                newestByChunk.merge(candidate.chunkKey(), candidate,
+                        (incumbent, next) -> OLDEST_FIRST.compare(incumbent, next) <= 0 ? next : incumbent);
             }
         } catch (Exception e) {
             throw new IllegalStateException(String.format(
                     "Failed to read content map for %s / %s", sourceTable, configId), e);
         }
 
-        // Sorting oldest-first and overwriting into a map is how history collapses: the last write
-        // per chunk key is by definition the newest entry for that chunk.
-        Map<String, ContentMapEntry> newestByChunk = new LinkedHashMap<>();
-        history.stream()
-                .sorted(OLDEST_FIRST)
-                .forEach(entry -> newestByChunk.put(entry.chunkKey(), entry));
-
-        // Tombstones are dropped only after resolution. Filtering them out earlier would let an
+        // Tombstones are dropped only after resolution, which is why they are merge candidates
+        // above instead of being skipped during the scan. Filtering them out earlier would let an
         // older live entry win and resurrect a deleted row.
-        return newestByChunk.values().stream()
-                .filter(ContentMapEntry::isLive)
-                .toList();
+        List<ContentMapEntry> live = new ArrayList<>(newestByChunk.size());
+        for (ContentMapEntry entry : newestByChunk.values()) {
+            if (entry.isLive()) {
+                live.add(entry);
+            }
+        }
+        return List.copyOf(live);
     }
 
     /**
@@ -275,6 +304,49 @@ public final class ContentMap {
      * because both filter columns are identity partitions: partition pruning satisfies them before
      * any file is opened, leaving no residual predicate that would need them in the projection.
      */
+    /**
+     * Every assertion ever recorded for one chunk, oldest first, tombstones included.
+     *
+     * <p>Distinct from {@link #liveEntries}, which collapses history to the current answer. This
+     * returns the history itself, because the question provenance answers is not "what is served"
+     * but "how did it come to be served" -- which version superseded which, when, and at what source
+     * sequence number. A collapsed view cannot answer that, and the append-only content map is the
+     * only place the answer exists.
+     *
+     * <p>Ordered by the same comparator resolution uses, so reading the last live element of this
+     * list gives exactly what {@link #liveEntries} would return for the chunk. If those two ever
+     * disagree, the ordering is wrong and both are suspect.
+     */
+    public static List<ContentMapEntry> historyOf(Table table,
+                                                  String sourceTable,
+                                                  String configId,
+                                                  String sourceRowId,
+                                                  int chunkOrdinal) {
+        if (table == null) {
+            return List.of();
+        }
+
+        List<ContentMapEntry> history = new ArrayList<>();
+        try (CloseableIterable<Record> rows = IcebergGenerics.read(table)
+                .where(Expressions.equal(Constants.SOURCE_TABLE_COLUMN, sourceTable))
+                .where(Expressions.equal(Constants.CONFIG_ID_COLUMN, configId))
+                .where(Expressions.equal(Constants.SOURCE_ROW_ID_COLUMN, sourceRowId))
+                .where(Expressions.equal(Constants.CHUNK_ORDINAL_COLUMN, chunkOrdinal))
+                .build()) {
+
+            for (Record row : rows) {
+                history.add(fromRecord(row));
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException(String.format(
+                    "Failed to read content map history for %s / %s row %s chunk %d",
+                    sourceTable, configId, sourceRowId, chunkOrdinal), e);
+        }
+
+        history.sort(OLDEST_FIRST);
+        return history;
+    }
+
     public static long latestSequenceNumber(Table table, String sourceTable, String configId) {
         if (table == null) {
             return 0L;

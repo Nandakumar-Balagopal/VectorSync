@@ -9,8 +9,6 @@ import io.vectorsync.worker.client.DerivationControlClient;
 import io.vectorsync.worker.service.iceberg.IcebergCatalogService;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.catalog.Namespace;
-import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;

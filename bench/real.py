@@ -23,6 +23,7 @@ overstates the damage; reporting only the second hides it. Both are printed.
 """
 
 import argparse
+import base64
 import csv
 import hashlib
 import json
@@ -34,14 +35,32 @@ import urllib.error
 import urllib.request
 from collections import defaultdict
 
-WORKER = "http://localhost:8081"
-CONTROL = "http://localhost:8080"
+WORKER = os.environ.get("WORKER_URL", "http://localhost:8081")
+CONTROL = os.environ.get("CONTROL_URL", "http://localhost:8080")
 BEIR_ROOT = "/tmp/beir"
 
 
+def _auth_header():
+    """
+    Basic credentials from the environment, when the stack has authentication enabled.
+
+    Every bench script routes through this module's get/post, so this is the only place that needs
+    to know -- and it has to live here rather than in each script, because the alternative was
+    discovering that authentication works by watching six harnesses fail with 401. Absent
+    credentials send no header at all, which keeps the unauthenticated default working unchanged.
+    """
+    user = os.environ.get("VECTORSYNC_USER")
+    password = os.environ.get("VECTORSYNC_PASSWORD")
+    if not user or not password:
+        return {}
+    token = base64.b64encode(("%s:%s" % (user, password)).encode()).decode()
+    return {"Authorization": "Basic " + token}
+
+
 def post(url, body, timeout=3600):
-    request = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    headers.update(_auth_header())
+    request = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
@@ -50,8 +69,12 @@ def post(url, body, timeout=3600):
 
 
 def get(url, timeout=600):
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        return json.load(response)
+    request = urllib.request.Request(url, headers=_auth_header())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("GET %s -> %s: %s" % (url, e.code, e.read().decode()[:400]))
 
 
 # ---------------------------------------------------------------- corpus loading

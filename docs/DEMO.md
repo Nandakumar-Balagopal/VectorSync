@@ -216,6 +216,14 @@ tuning this on recall alone would over-provision probes by 8x.
   Say this before being asked.
 - **Derivation is slow**: 569s for 20,000 vectors, roughly 28ms each, where embedding itself is about
   1ms. Over 95% is per-batch overhead, not inference.
+- **Every cluster figure on this page predates a change to what gets indexed, and is therefore not
+  directly comparable to a fresh run.** `ClusterIndexService.build` now deduplicates by content hash
+  before fitting centroids, so the clustered index holds one vector per distinct content rather than
+  one per Tier-1 row. On these corpora the effect is small — NFCorpus dedups 1.1% and FiQA 0.00%, so
+  the vector counts move by at most that — but `totalRows`, `rowsScanned` and the fraction-read
+  percentages are all denominated in the old count. Re-run `bench/real.py` before quoting any of
+  them against current code. The recall and nDCG conclusions are unaffected: pruning quality is a
+  property of the partitioning, not of the duplicate rows that were removed.
 
 ---
 

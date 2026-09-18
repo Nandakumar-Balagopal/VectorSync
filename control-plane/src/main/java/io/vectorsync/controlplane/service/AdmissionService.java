@@ -314,15 +314,177 @@ public class AdmissionService {
     @Transactional
     public Optional<MaterializationEntity> resume(String id) {
         return materializationRepository.findById(id).map(entity -> {
+            if (entity.getState() == State.DEGRADED) {
+                return reanchor(entity);
+            }
             if (entity.getState() != State.PAUSED) {
                 throw new IllegalStateException(String.format(
-                        "Materialization %s is %s, not PAUSED", id, entity.getState()));
+                        "Materialization %s is %s, not PAUSED or DEGRADED", id, entity.getState()));
             }
             State target = isCaughtUp(entity) ? State.LIVE : State.VALIDATED;
             entity.transitionTo(target);
             entity.setLastError(null);
             return materializationRepository.save(entity);
         });
+    }
+
+    /**
+     * Recovers a DEGRADED materialization by pinning a fresh anchor and replanning against it.
+     *
+     * <p>DEGRADED was a one-way door. It is reached when {@code assess()} finds commits in the
+     * snapshot range that an incremental append scan cannot describe -- a delete, an overwrite --
+     * and refusing there is correct, because advancing the watermark past changes that were never
+     * materialized would serve deleted rows forever. But nothing could leave the state again:
+     * {@code resume} accepted only PAUSED, and the worker's {@code runnable()} does not ask for
+     * DEGRADED, so the entry simply stopped.
+     *
+     * <p>Clearing the state alone would not have worked either, and this is the part worth being
+     * explicit about. {@code anchor_snapshot_id} was written once at admission and never advanced,
+     * so the next cycle would assess the very same range, find the very same destructive commit, and
+     * degrade again -- an operator would see the state flicker and nothing progress. Recovery
+     * therefore has to re-anchor: the anchor moves to the source's current snapshot, the watermark
+     * resets, and the planner treats it as a fresh backfill from there.
+     *
+     * <p>What that costs is a full replan and a full re-read of the source, and what it does
+     * <em>not</em> cost is inference. Every content hash the store has seen before resolves on the
+     * dedup probe, so a re-anchor after a delete re-embeds only genuinely new text. This is the same
+     * argument the PAUSED path already makes, and it is the property that makes re-anchoring a
+     * reasonable recovery rather than a bill.
+     *
+     * <p>The anchor jump is deliberately not reconciliation: rows deleted between the old anchor and
+     * the new one are not tombstoned by this, so their content-map entries stay live and stale
+     * vectors remain servable until something removes them. That is a known gap, recorded in
+     * docs/ARCHITECTURE-REVIEW.md, and it is why the error is preserved on the entity rather than
+     * cleared -- an operator resuming needs to know the materialization skipped a range.
+     */
+    private MaterializationEntity reanchor(MaterializationEntity entity) {
+        Snapshot current;
+        try {
+            Table table = catalogService.getCatalog()
+                    .loadTable(toIdentifier(entity.getSourceTable(), entity.getCatalogName()));
+            current = table.currentSnapshot();
+        } catch (Exception e) {
+            throw new IllegalStateException(String.format(
+                    "Cannot re-anchor %s: source table %s does not resolve in the catalog (%s). "
+                            + "Fix the catalog or retire the materialization.",
+                    entity.getId(), entity.getSourceTable(), rootMessage(e)), e);
+        }
+        if (current == null) {
+            throw new IllegalStateException(String.format(
+                    "Cannot re-anchor %s: source table %s has no current snapshot, so there is no "
+                            + "version to anchor to.", entity.getId(), entity.getSourceTable()));
+        }
+
+        long previousAnchor = entity.getAnchorSnapshotId();
+        entity.setAnchorSnapshotId(current.snapshotId());
+        entity.setAnchorSequenceNumber(current.sequenceNumber());
+        // Back to zero so plan() takes the backfill branch against the new anchor rather than trying
+        // to continue an incremental range that no longer starts anywhere meaningful.
+        entity.setIncrementalWatermark(0L);
+        entity.transitionTo(State.BACKFILLING);
+        entity.setLastError(String.format(
+                "re-anchored from snapshot %d to %d after: %s",
+                previousAnchor, current.snapshotId(),
+                entity.getLastError() == null ? "degraded" : entity.getLastError()));
+        entity.setUpdatedAt(Instant.now());
+        return materializationRepository.save(entity);
+    }
+
+    /**
+     * @param promoted   the materialization now serving, when the gate passed
+     * @param demoted    the materialization that was serving and no longer is, or null
+     * @param blockers   why promotion was refused; empty exactly when {@code promoted} is set
+     */
+    public record PromotionResult(String promoted, String demoted, List<String> blockers) {
+    }
+
+    /**
+     * Makes a materialization the one a reader should query for its source table.
+     *
+     * <p>Promotion exists because a model migration has no cutover without it. Two configurations
+     * over one table can both be LIVE, each publishing its own Tier-2 projection, and nothing said
+     * which a reader should use -- so callers had to know a config id out of band and a rollback was
+     * a conversation rather than an operation.
+     *
+     * <p><b>What this gate checks, and what it deliberately does not.</b> It checks that the
+     * candidate is <em>complete</em>: LIVE, with a watermark that has actually advanced, and with
+     * coverage current against the content map. It does <b>not</b> check retrieval quality. A
+     * quality gate needs judged queries and relevance labels, and comparing a candidate's recall
+     * against the incumbent's is a different mechanism from this one -- so this refuses to promote
+     * something unfinished, and says nothing about whether it is any good. Conflating the two would
+     * be worse than having neither, because a green completeness check reads as an endorsement.
+     *
+     * <p>The swap is one transaction. A partial unique index enforces at most one serving
+     * materialization per source table, so two concurrent promotions cannot both succeed -- which is
+     * the failure the old alias log had to assume away by requiring a single promoting writer.
+     */
+    @Transactional
+    public PromotionResult promote(String id) {
+        MaterializationEntity candidate = materializationRepository.findById(id).orElse(null);
+        if (candidate == null) {
+            return new PromotionResult(null, null, List.of("no materialization with id " + id));
+        }
+
+        List<String> blockers = promotionBlockers(candidate);
+        if (!blockers.isEmpty()) {
+            return new PromotionResult(null, null, blockers);
+        }
+
+        String demoted = null;
+        for (MaterializationEntity serving
+                : materializationRepository.findBySourceTableAndServingTrue(
+                        candidate.getSourceTable())) {
+            if (!serving.getId().equals(candidate.getId())) {
+                serving.setServing(false);
+                serving.setUpdatedAt(Instant.now());
+                // Flushed, not just saved. JPA batches writes to the end of the transaction and
+                // does not guarantee it orders this demotion before the promotion below, so the
+                // candidate's serving=true could reach the database while the incumbent still held
+                // it -- which the partial unique index rejects, failing the whole swap. The
+                // constraint caught exactly that in test. Postgres cannot defer a partial unique
+                // index (only constraints are deferrable, and this is an index), so the ordering
+                // has to be made explicit here rather than relegated to commit time.
+                materializationRepository.saveAndFlush(serving);
+                demoted = serving.getId();
+            }
+        }
+
+        candidate.setServing(true);
+        candidate.setUpdatedAt(Instant.now());
+        materializationRepository.saveAndFlush(candidate);
+
+        log.info("Promoted materialization {} ({} / {}) to serving{}",
+                candidate.getId(), candidate.getSourceTable(), candidate.getConfigId(),
+                demoted == null ? "" : ", demoting " + demoted);
+        return new PromotionResult(candidate.getId(), demoted, List.of());
+    }
+
+    /**
+     * Why this materialization may not serve, or empty when it may.
+     *
+     * <p>Returned as a list rather than a boolean so an operator sees every reason at once. A gate
+     * that reports the first problem invites a sequence of retries, each discovering one more.
+     */
+    public List<String> promotionBlockers(MaterializationEntity candidate) {
+        List<String> blockers = new ArrayList<>();
+
+        if (candidate.getState() != State.LIVE) {
+            blockers.add(String.format(
+                    "state is %s, not LIVE: only a materialization that has finished its backfill "
+                            + "and is keeping up may serve", candidate.getState()));
+        }
+        if (candidate.getIncrementalWatermark() <= 0) {
+            blockers.add("the watermark has never advanced, so nothing has been materialized and "
+                    + "published for this configuration");
+        }
+        if (candidate.getLastError() != null && !candidate.getLastError().isBlank()) {
+            // Preserved on a re-anchor precisely so it can block here: a materialization recovered
+            // by skipping a range has coverage gaps it cannot know about, and promoting it silently
+            // would serve them.
+            blockers.add("an unresolved error is recorded and must be acknowledged first: "
+                    + candidate.getLastError());
+        }
+        return blockers;
     }
 
     /**

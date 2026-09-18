@@ -13,6 +13,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.types.Types;
@@ -57,8 +58,9 @@ public final class EmbeddingStore {
      * <p>{@code config_id} is present only because it is a filter column and <em>not</em> a
      * partition column. Iceberg builds the residual-filter evaluator against the projected schema,
      * so projecting a filter column away makes the scan fail with "Cannot find field" at read time.
-     * Partition columns ({@code model_version}, {@code hash_prefix}) are safe to omit because
-     * partition pruning removes them from the residual entirely.
+     * The one partition column ({@code model_version}) is safe to omit because partition pruning
+     * removes it from the residual entirely. {@code hash_prefix}, since its retirement from the
+     * spec, is simply not filtered on any more.
      */
     private static final List<String> PROBE_COLUMNS =
             List.of(Constants.CONTENT_HASH_COLUMN, Constants.CONFIG_ID_COLUMN);
@@ -97,17 +99,31 @@ public final class EmbeddingStore {
     }
 
     /**
-     * Partitioned by model version and then by hash prefix.
+     * Partitioned by model version, and by nothing else.
      *
-     * <p>Model version first because reading or migrating one embedding version must not scan every
-     * version ever materialized. Hash prefix second because content hashes are uniformly
-     * distributed, so a fixed-width prefix yields 256 evenly sized buckets without a global sort,
-     * and a point lookup on a known hash touches one of them instead of the whole store.
+     * <p>Model version because reading or migrating one embedding version must not scan every
+     * version ever materialized.
+     *
+     * <p>{@code hash_prefix} used to be the second partition field, on the reasoning that content
+     * hashes are uniformly distributed so a fixed-width prefix gives 256 evenly sized buckets for
+     * free, and a point lookup touches one. Measurement killed it on both sides. It does not prune
+     * reads: the hashes in any real batch are uniformly distributed <em>too</em>, so a 500-hash
+     * probe's prefix set covered all 256 buckets and the scan degraded to a full one -- 9.3s to
+     * 28.2s per table. And it fragmented writes 256 ways, producing 44,587 files averaging 9.2 KiB,
+     * which is the file count that makes planning itself the cost.
+     *
+     * <p>The column is deliberately still here, and still written on every row. Removing it from the
+     * <em>schema</em> is not an option: Iceberg 1.5.0 accepts {@code deleteColumn} without
+     * validating partition specs, and the table is then permanently unusable, because historical
+     * specs still source the now-missing field id and {@code PartitionSpec.partitionType()} throws
+     * on it in both scan planning and {@code newAppend}. {@code addColumn} cannot repair that -- it
+     * refuses with "Cannot create identity partition sourced from different field in schema". So the
+     * field id stays occupied forever and the column stays readable, which costs 2 bytes a row and
+     * keeps the store diagnosable.
      */
     public static PartitionSpec partitionSpec(Schema schema) {
         return PartitionSpec.builderFor(schema)
                 .identity(Constants.MODEL_VERSION_COLUMN)
-                .identity(Constants.HASH_PREFIX_COLUMN)
                 .build();
     }
 
@@ -136,6 +152,11 @@ public final class EmbeddingStore {
         if (tableExists) {
             Table existing = catalog.loadTable(identifier);
             requireCurrentFormat(existing);
+            retireHashPrefixPartition(existing);
+            // The existing-table branch is the one that matters: a warehouse created before the
+            // retry budget was raised is precisely the one whose appends are losing the
+            // compare-and-set. Commits only when the setting is absent.
+            SharedTableProperties.ensureTuned(existing);
             return existing;
         }
 
@@ -149,8 +170,7 @@ public final class EmbeddingStore {
                     identifier,
                     schema,
                     partitionSpec(schema),
-                    Map.of(Constants.FORMAT_VERSION_PROPERTY,
-                            String.valueOf(Constants.VECTOR_FORMAT_VERSION)));
+                    SharedTableProperties.forCreate());
         } catch (Exception e) {
             // Two workers can start a sync at once and race here; the loser just reloads.
             log.warn("Embedding store creation raced or failed, reloading: {}", e.getMessage());
@@ -158,7 +178,46 @@ public final class EmbeddingStore {
 
         Table created = catalog.loadTable(identifier);
         requireCurrentFormat(created);
+        // Warehouses created before the retry budget was raised are exactly the ones that hit the
+        // contention, so the settings are applied here too. Commits only when absent.
+        SharedTableProperties.ensureTuned(created);
         return created;
+    }
+
+    /**
+     * Drops {@code hash_prefix} from an existing store's partition spec, once.
+     *
+     * <p>Metadata only: {@code updateSpec} rewrites the spec and leaves every data file where it is,
+     * so a store that cost real money in inference is migrated without re-embedding anything and
+     * without a rewrite. Files written under the old spec keep it; Iceberg plans across both, which
+     * is why the read paths must not depend on the partition existing.
+     *
+     * <p>Idempotent by inspection rather than by catching: a second {@code removeField} for a name
+     * that is no longer a partition field throws, and this runs on the hot path -- {@code
+     * loadOrCreate} is called once per derive pass, not once per deployment.
+     *
+     * <p>A failure here is logged and swallowed deliberately. The old layout is slower, not wrong:
+     * the read paths no longer filter on the partition, so a store that stays two-level still
+     * returns correct results. Refusing to derive because a performance migration failed would turn
+     * a cosmetic problem into an outage.
+     */
+    private static void retireHashPrefixPartition(Table table) {
+        boolean stillPartitioned = table.spec().fields().stream()
+                .anyMatch(field -> Constants.HASH_PREFIX_COLUMN.equals(field.name()));
+        if (!stillPartitioned) {
+            return;
+        }
+
+        try {
+            table.updateSpec().removeField(Constants.HASH_PREFIX_COLUMN).commit();
+            log.info("Retired the {} partition field on {}; it now partitions by {} only. "
+                            + "Existing files keep the old spec and are still readable.",
+                    Constants.HASH_PREFIX_COLUMN, table.name(), Constants.MODEL_VERSION_COLUMN);
+        } catch (Exception e) {
+            log.warn("Could not retire the {} partition field on {}, continuing with the old "
+                            + "layout: {}",
+                    Constants.HASH_PREFIX_COLUMN, table.name(), e.getMessage());
+        }
     }
 
     /** Returns the embedding store, or {@code null} when it does not exist yet. */
@@ -227,12 +286,12 @@ public final class EmbeddingStore {
      * The dedup probe: which of these hashes does the store already hold for this model and
      * configuration? The hot path -- called once per batch for the whole pipeline.
      *
-     * <p>Every filter is pushed into the scan. {@code model_version} and {@code hash_prefix} are
-     * identity partitions, so they prune files before any are opened; the prefix set is derived from
-     * the requested hashes and is what keeps a probe for 500 hashes from scanning all 256 buckets.
-     * The {@code IN} on {@code content_hash} then prunes further on Parquet column statistics and
-     * filters the residual rows. Only the key columns are projected: deserializing a vector to
-     * answer a boolean is exactly the defect this design removes.
+     * <p>Every filter is pushed into the scan. {@code model_version} is an identity partition, so it
+     * prunes files before any is opened. {@code content_hash} is then bounded twice: a range
+     * predicate covering the batch, which prunes on the per-file bounds in the manifests, and the
+     * {@code IN} itself, which prunes on Parquet column statistics and filters the residual rows.
+     * Only the key columns are projected: deserializing a vector to answer a boolean is exactly the
+     * defect this design removes.
      */
     public static Set<String> findExistingHashes(Table table,
                                                  Collection<String> contentHashes,
@@ -247,7 +306,7 @@ public final class EmbeddingStore {
         try (CloseableIterable<Record> rows = IcebergGenerics.read(table)
                 .where(Expressions.equal(Constants.MODEL_VERSION_COLUMN, modelVersion))
                 .where(Expressions.equal(Constants.CONFIG_ID_COLUMN, configId))
-                .where(Expressions.in(Constants.HASH_PREFIX_COLUMN, prefixesOf(requested)))
+                .where(hashRange(requested))
                 .where(Expressions.in(Constants.CONTENT_HASH_COLUMN, requested))
                 .select(PROBE_COLUMNS)
                 .build()) {
@@ -292,7 +351,7 @@ public final class EmbeddingStore {
         try (CloseableIterable<Record> rows = IcebergGenerics.read(table)
                 .where(Expressions.equal(Constants.MODEL_VERSION_COLUMN, modelVersion))
                 .where(Expressions.equal(Constants.CONFIG_ID_COLUMN, configId))
-                .where(Expressions.in(Constants.HASH_PREFIX_COLUMN, prefixesOf(requested)))
+                .where(hashRange(requested))
                 .where(Expressions.in(Constants.CONTENT_HASH_COLUMN, requested))
                 .select(LOAD_COLUMNS)
                 .build()) {
@@ -407,13 +466,41 @@ public final class EmbeddingStore {
         return distinct;
     }
 
-    /** The partitions the requested hashes can possibly live in. At most 256 values. */
-    private static Set<String> prefixesOf(Collection<String> contentHashes) {
-        Set<String> prefixes = new LinkedHashSet<>();
-        for (String hash : contentHashes) {
-            prefixes.add(ContentHash.prefix(hash));
+    /**
+     * A closed range over {@code content_hash} covering every requested hash.
+     *
+     * <p>Replaces the {@code hash_prefix} {@code IN} predicate that partition pruning used to
+     * satisfy. A range prunes on the per-file {@code content_hash} lower and upper bounds Iceberg
+     * already writes into the manifests, so it works identically on files left behind by the old
+     * two-level spec and on files written under the new one -- which is what makes the partition
+     * retirement a metadata-only change rather than a rewrite.
+     *
+     * <p>Chosen over widening the {@code IN} list for two concrete reasons. Iceberg's metrics
+     * evaluators skip an {@code IN} predicate above a few hundred literals and fall back to reading
+     * the file, and a set of unique 64-character hashes can exhaust Parquet's dictionary budget and
+     * lose the encoding the {@code IN} was relying on. A range has no literal ceiling and no
+     * encoding dependency.
+     *
+     * <p>It prunes hard exactly when the batch is contiguous in hash order, which is the case that
+     * matters here: {@code ProjectionBuilder} sorts each block by content hash before loading its
+     * vectors, so a block's range is narrow by construction. For a scattered batch the range is wide
+     * and prunes little -- no worse than the prefix set it replaces, which measurement showed
+     * covered all 256 buckets for any realistic batch anyway.
+     */
+    private static Expression hashRange(Set<String> requested) {
+        String lowest = null;
+        String highest = null;
+        for (String hash : requested) {
+            if (lowest == null || hash.compareTo(lowest) < 0) {
+                lowest = hash;
+            }
+            if (highest == null || hash.compareTo(highest) > 0) {
+                highest = hash;
+            }
         }
-        return prefixes;
+        return Expressions.and(
+                Expressions.greaterThanOrEqual(Constants.CONTENT_HASH_COLUMN, lowest),
+                Expressions.lessThanOrEqual(Constants.CONTENT_HASH_COLUMN, highest));
     }
 
     private static List<Float> toFloatList(float[] embedding) {

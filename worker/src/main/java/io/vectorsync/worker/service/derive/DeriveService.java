@@ -98,6 +98,26 @@ public class DeriveService {
     private final EmbeddingService embeddingService;
     private final IcebergCatalogService catalogService;
 
+    /**
+     * Distinct novel hashes embedded and appended per sub-batch.
+     *
+     * <p>2,000 holds roughly 36 MB of boxed floats plus 6 MB of {@code float[]} at 384 dimensions,
+     * which is a bound a worker can carry alongside everything else in a pass.
+     *
+     * <p>Lower is not automatically safer, which is why {@link #embedBatchSize()} enforces a floor.
+     * Each sub-batch is one {@code EmbeddingStore.append}, so the commit count is
+     * {@code ceil(novel / this)}, and {@code loadOrCreate} runs per derive pass with
+     * {@code cache-enabled=false} -- so every commit re-parses a metadata.json whose snapshot list
+     * grew with the last one. Set this to 10 and a pass that used to be one commit becomes
+     * thousands, with the metadata read, not the model, as the cost.
+     *
+     * <p>A {@code @Value} default with no entry in application.yml, following the convention the
+     * runner's own knobs use: the default is the documented value and the property exists for an
+     * operator who has measured a reason to change it.
+     */
+    @Value("${vectorsync.derive.embed-batch-hashes:2000}")
+    private int embedBatchHashes;
+
     @Value("${iceberg.vector.namespace:vector}")
     private String vectorNamespace;
 
@@ -229,16 +249,37 @@ public class DeriveService {
         List<DeriveResult.Written> written = new ArrayList<>();
         int inferenceCalls = 0;
 
-        if (!novelByHash.isEmpty()) {
+        // Embedded and appended in sub-batches of distinct hashes, because this is the one place in
+        // the pass whose peak memory is not bounded by anything the caller controls. The work item
+        // is a source data file and the runner caps how many it leases, but neither a row count nor
+        // a byte count bounds the term that actually dominates here: held vectors scale with the
+        // number of NOVEL CHUNKS, and chunking multiplies rows. 2,000 rows of 32 KiB at a 512-char
+        // chunk size is roughly 128k novel chunks, which at 384 dimensions is about a gigabyte once
+        // EmbeddingStore.append has boxed every float into a List<Float> for the Parquet writer --
+        // with a row cap and a byte cap both green.
+        //
+        // The loop is deliberately inside derive() rather than around it. Splitting a file across
+        // several derive() calls looked equivalent and is not: textByHash would stop collapsing
+        // duplicate content across the whole file, and writtenChunkCounts -- which only merges by
+        // Math::max within one call -- would let a later batch tombstone chunks an earlier one
+        // wrote live for a source row id that appears in both, at the same sequence number, with
+        // the winner decided by wall-clock createdAt. Serving output would become a function of
+        // batch size. Keeping one textByHash, one writtenChunkCounts and one ContentMap.append
+        // leaves the committed result bit-identical to the unbatched path.
+        for (Map<String, String> novelBatch : hashBatches(novelByHash, embedBatchSize())) {
             List<EmbeddingEntry> newVectors = List.of();
             try {
-                newVectors = embed(spec, modelVersion, configId, novelByHash, firstRowByHash);
-                inferenceCalls = newVectors.size();
+                newVectors = embed(spec, modelVersion, configId, novelBatch, firstRowByHash);
+                inferenceCalls += newVectors.size();
             } catch (Exception e) {
-                // The provider batch is all-or-nothing, so nothing from it is trusted.
-                log.error("Embedding {} novel chunks failed for {}: {}",
-                        novelByHash.size(), spec.getSourceTable(), e.getMessage(), e);
-                unavailable.addAll(novelByHash.keySet());
+                // The provider batch is all-or-nothing, so nothing from it is trusted. Only this
+                // sub-batch is lost: earlier ones are already committed and a retry's dedup probe
+                // finds them, so a late failure no longer discards inference that was paid for.
+                log.error("Embedding {} of {} novel chunks failed for {}: {}",
+                        novelBatch.size(), novelByHash.size(), spec.getSourceTable(),
+                        e.getMessage(), e);
+                unavailable.addAll(novelBatch.keySet());
+                continue;
             }
 
             if (!newVectors.isEmpty()) {
@@ -252,11 +293,12 @@ public class DeriveService {
                                 entry.getContentHash(), entry.getEmbeddingDim()));
                     }
                 } catch (Exception e) {
-                    // A single commit, so a failure means none of these vectors landed. Inference
-                    // was still paid for and stays counted; the retry re-embeds only these hashes.
+                    // One commit per sub-batch, so a failure means none of THIS sub-batch landed.
+                    // Inference was still paid for and stays counted; the retry re-embeds only
+                    // these hashes.
                     log.error("Appending {} vectors to the embedding store failed for {}: {}",
                             newVectors.size(), spec.getSourceTable(), e.getMessage(), e);
-                    unavailable.addAll(novelByHash.keySet());
+                    unavailable.addAll(novelBatch.keySet());
                 }
             }
         }
@@ -407,6 +449,17 @@ public class DeriveService {
      * {@code id} and threw otherwise, which excluded every join table and every natural-key table
      * in the warehouse.
      */
+    /**
+     * The row id this spec would assign to a source row.
+     *
+     * <p>Exposed for the reconcile sweep, which has to compare the keys a source still holds
+     * against the keys the content map lists live -- and both sides must be computed by the same
+     * function or the comparison finds differences that are only a difference of spelling.
+     */
+    public String rowIdOf(MaterializationSpec spec, Record row) {
+        return rowId(spec, row);
+    }
+
     private String rowId(MaterializationSpec spec, Record row) {
         List<String> keyValues = new ArrayList<>(spec.getKeyColumns().size());
         for (String column : spec.getKeyColumns()) {
@@ -470,6 +523,54 @@ public class DeriveService {
      * <p>Every entry is staged before any is returned, so a hash missing from the response fails the
      * batch instead of committing a partial set of vectors that the mapping would then point past.
      */
+    /**
+     * The configured sub-batch size, floored.
+     *
+     * <p>Read through a method rather than used directly because {@link #embedBatchHashes} is field
+     * injected, so it is 0 until Spring has populated it -- and 0 or a negative value would make
+     * {@link #hashBatches} emit one sub-batch per hash, turning a single append into one commit per
+     * vector. The floor also stops a well-meant "smaller is safer" setting from doing that
+     * deliberately. 128 is low enough to be a real memory reduction and high enough that commit
+     * count stays in the same order as before.
+     */
+    private int embedBatchSize() {
+        return Math.max(128, embedBatchHashes);
+    }
+
+    /**
+     * Splits a hash-to-text map into insertion-ordered sub-maps of at most {@code size} entries.
+     *
+     * <p>Insertion order is preserved because {@code novelByHash} is built from a
+     * {@code LinkedHashMap} keyed in first-encounter order, and the embedding provider is given the
+     * hashes in that order. Keeping it makes a pass's provider calls reproducible rather than
+     * dependent on hash iteration order.
+     *
+     * <p>The sub-maps hold references to strings that already exist, so this costs map overhead and
+     * not a copy of the text.
+     */
+    private static List<Map<String, String>> hashBatches(Map<String, String> novelByHash, int size) {
+        if (novelByHash.isEmpty()) {
+            return List.of();
+        }
+        if (novelByHash.size() <= size) {
+            return List.of(novelByHash);
+        }
+
+        List<Map<String, String>> batches = new ArrayList<>();
+        Map<String, String> current = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : novelByHash.entrySet()) {
+            current.put(entry.getKey(), entry.getValue());
+            if (current.size() >= size) {
+                batches.add(current);
+                current = new LinkedHashMap<>();
+            }
+        }
+        if (!current.isEmpty()) {
+            batches.add(current);
+        }
+        return batches;
+    }
+
     private List<EmbeddingEntry> embed(MaterializationSpec spec,
                                        String modelVersion,
                                        String configId,

@@ -1,0 +1,61 @@
+# The build gate, and nothing else.
+#
+# The only goal of the first version of this workflow is to be GREEN on its first run, because a
+# red badge that everyone learns to ignore is worse than no badge. Coverage gates, static analysis
+# and image publishing are deliberately absent; add them one at a time, each one measured green
+# locally first.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A branch that is also an open PR would otherwise build twice at once and the two Maven runs would
+# race on the same cache entry. Keyed on the event as well as the ref so the push run and the PR run
+# do not cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: mvn clean test (JDK 17)
+    runs-on: ubuntu-latest
+    # Locally 'mvn -o clean test-compile' is ~9.5s, and the suite ran 117 tests when this gate was
+    # written (it grows; the number is here as an order of magnitude). On a runner the
+    # dependency download dominates: expect roughly 8-12 minutes on a cold Maven cache and 4-6
+    # minutes once the cache is warm. 30 fails fast on a hang without tripping on a slow runner.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          # setup-java's built-in cache keys on the hash of every pom in the tree, which is the
+          # behaviour we want and is one fewer moving part than an actions/cache block over ~/.m2.
+          cache: maven
+
+      # 'test', not 'verify', and that is a measured choice. 'test' is the command this project is
+      # known green on. 'verify' additionally runs spring-boot:repackage for the three services,
+      # first-resolving jar/resources plugin versions this build does not pin, and writes ~1.3 GB of
+      # fat jars -- cost and a new failure surface for no extra signal about the code.
+      #
+      # No '-o': the runner starts with an empty local repository, so offline resolution cannot work
+      # here. 'mvn -o clean test' stays the local gate (see CONTRIBUTING.md).
+      #
+      # DurableDedupTest starts postgres:16-alpine through Testcontainers. GitHub's ubuntu runners
+      # ship a working Docker daemon, so this needs no setup step and no 'services:' block --
+      # deliberately so: a service container would make the test read a CI-supplied JDBC URL, which
+      # is exactly the weakening its own javadoc rejects. Ryuk stays ENABLED here;
+      # TESTCONTAINERS_RYUK_DISABLED is a Colima-on-macOS workaround and disabling it on a runner
+      # only leaks containers.
+      #
+      # Most likely first-run flake: postgres:16-alpine is an unauthenticated Docker Hub pull, and a
+      # busy runner IP can hit Docker Hub's anonymous rate limit. That surfaces as a
+      # ContainerLaunchException with a 429, is not a test failure, and is fixed by re-running -- or,
+      # if it becomes routine, by authenticating the pull or mirroring the image.
+      - name: mvn clean test
+        run: mvn -B clean test

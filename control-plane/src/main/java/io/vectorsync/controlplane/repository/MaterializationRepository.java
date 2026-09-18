@@ -38,4 +38,13 @@ public interface MaterializationRepository extends JpaRepository<Materialization
 
     /** Retired datasets whose content-map rows an operator has marked reclaimable. */
     List<MaterializationEntity> findByStateAndPurgeEligibleTrue(State state);
+
+    /**
+     * The materialization currently serving a source table.
+     *
+     * <p>Returns a list rather than an Optional although a partial unique index allows at most one:
+     * a repository method that assumed uniqueness would throw on a database whose index was dropped,
+     * and promotion is the one place that should notice and repair that rather than fail.
+     */
+    List<MaterializationEntity> findBySourceTableAndServingTrue(String sourceTable);
 }

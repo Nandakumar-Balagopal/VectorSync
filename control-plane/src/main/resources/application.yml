@@ -3,10 +3,19 @@ spring:
     name: ${APP_NAME:vectorsync-control-api}
   flyway:
     enabled: ${FLYWAY_ENABLED:true}
-    # Adopts a database that predates Flyway (its tables came from ddl-auto) as version 1 rather
-    # than trying to re-create them.
+    # Baseline at 0, not 1, so V1 actually runs on an empty database.
+    #
+    # This was baseline-version: 1, intended to adopt a database that predated Flyway. The effect on
+    # a FRESH database was that Flyway stamped V1 as already applied and never executed it, so
+    # materializations and work_items were never created -- a fresh install could not start. It went
+    # unnoticed because the compose volume persisted a schema created by an earlier ddl-auto era;
+    # it surfaced the first time the volume was actually dropped.
+    #
+    # Baselining at 0 means an empty database runs V1 then V2 then V3, which is the path a new
+    # deployment takes. A database that predates Flyway and has no schema history must be baselined
+    # explicitly before upgrading, because V1 would otherwise try to create objects it already has.
     baseline-on-migrate: true
-    baseline-version: 1
+    baseline-version: 0
   jpa:
     hibernate:
       # Off: Flyway owns the schema. Left at "update" this would silently add columns that no
@@ -56,3 +65,23 @@ logging:
       vectorsync: ${LOG_LEVEL_APP:DEBUG}
   pattern:
     console: ${LOG_PATTERN_CONSOLE:%d{yyyy-MM-dd HH:mm:ss} - %msg%n}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Explicit allowlist. Boot exposes only health by default, which is why /actuator/metrics
+        # has been unreachable in every deployment despite actuator being on the classpath since
+        # the beginning -- the meters were being collected and nothing could read them.
+        #
+        # 'metrics' and not a Prometheus scrape endpoint: micrometer-registry-prometheus is not
+        # resolvable at the version this build's BOM manages, so adding it breaks offline builds.
+        # /actuator/metrics gives the same numbers over JSON and needs no new dependency.
+        #
+        # Deliberately NOT on a separate management.server.port: docker-compose publishes only the
+        # service ports, and the e2e scripts under deployment/ probe health on the main port, so a
+        # second port would be both unscrapable and a broken health check.
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized

@@ -27,4 +27,65 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              Bans Spring from this module mechanically, because "no framework here" was previously
+              only a convention and a convention is broken by whoever has not read it. This module's
+              DTOs and cosine utility are consumed by the Spring services, by Spark batch jobs and
+              eventually by a Trino plugin, none of which can share a framework container, so a
+              single Spring dependency here would be inherited by every one of them.
+
+              bannedDependencies rather than a CI grep for imports: it rejects the pom entry before
+              any import exists, and it runs inside every `mvn test-compile` and `mvn test` instead
+              of only after a push. It is bound to validate, whose dependency resolution the build
+              performs anyway.
+
+              Does not fire on the current tree: this module resolves only Lombok and JUnit.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <!--
+                  Pinned deliberately. An unpinned plugin version resolves to whatever is newest on
+                  the day, which turns an unrelated build into a failure nobody changed anything to
+                  cause; 3.5.0 is the version this rule was verified against and it requires Maven
+                  3.6.3 or newer.
+                -->
+                <version>3.5.0</version>
+                <executions>
+                    <execution>
+                        <id>ban-spring</id>
+                        <phase>validate</phase>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <bannedDependencies>
+                                    <!-- Matches org.springframework and every org.springframework.*
+                                         group: the enforcer turns a trailing * into a regex .* over
+                                         the whole groupId. -->
+                                    <excludes>
+                                        <exclude>org.springframework*</exclude>
+                                    </excludes>
+                                    <!-- Transitive too, so the ban cannot be reached through an
+                                         intermediate dependency that happens to drag Spring in. -->
+                                    <searchTransitive>true</searchTransitive>
+                                    <message>
+                                        vectorsync-common must not depend on Spring, in any scope,
+                                        directly or transitively. Its consumers (the Spring
+                                        services, Spark jobs, a future Trino plugin) cannot share a
+                                        framework container. Put the framework-facing code in the
+                                        service that needs it and keep this module pure Java.
+                                    </message>
+                                </bannedDependencies>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 </project>

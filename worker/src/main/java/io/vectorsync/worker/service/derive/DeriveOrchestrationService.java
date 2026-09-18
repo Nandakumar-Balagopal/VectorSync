@@ -33,7 +33,12 @@ public class DeriveOrchestrationService {
     private final IncrementalChangeDetector detector;
     private final DeriveService deriveService;
 
-    public DeriveOrchestrationService(IncrementalChangeDetector detector, DeriveService deriveService) {
+    private final DeriveMetricsRegistry metrics;
+
+    public DeriveOrchestrationService(IncrementalChangeDetector detector,
+                                      DeriveService deriveService,
+                                      DeriveMetricsRegistry metrics) {
+        this.metrics = metrics;
         this.detector = detector;
         this.deriveService = deriveService;
     }
@@ -131,9 +136,17 @@ public class DeriveOrchestrationService {
                     continue;
                 }
 
+                // Recorded here as well as in MaterializationRunner. Only the runner recorded
+                // before, so a pass driven through this path produced no meters at all -- an
+                // operator running a one-off derive got counters that silently stayed at zero, and
+                // /actuator/metrics listed no vectorsync meters whatsoever until the scheduler
+                // happened to do work. Same shape as the dedup record this path also skipped: a
+                // thinner entry point quietly bypassing a cross-cutting concern.
                 DeriveResult result = deriveService.derive(
                         spec, sourceRows, file.snapshotId(), file.sequenceNumber(),
                         file.committedAtMillis());
+
+                metrics.record(spec.getSourceTable(), spec.configId(), result);
 
                 rows += result.rowsProcessed();
                 chunks += result.chunksProcessed();

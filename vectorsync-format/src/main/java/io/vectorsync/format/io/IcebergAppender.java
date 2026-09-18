@@ -41,8 +41,33 @@ public final class IcebergAppender {
      *         not committing. Partial appends are never committed.
      */
     public static void append(Table table, List<Record> records) {
-        if (records.isEmpty()) {
+        List<DataFile> dataFiles = writeFiles(table, records);
+        if (dataFiles.isEmpty()) {
             return;
+        }
+
+        AppendFiles append = table.newAppend();
+        dataFiles.forEach(append::appendFile);
+        append.commit();
+
+        log.debug("Appended {} records across {} partitions to {}", records.size(), dataFiles.size(), table.name());
+    }
+
+    /**
+     * Writes records as partitioned Parquet and returns the data files <em>without committing</em>.
+     *
+     * <p>Exists because an append is not always the commit a caller needs. Replacing one slice of a
+     * table has to delete the old files and add the new ones in a single snapshot
+     * ({@code newOverwrite}), which means the write and the commit must be separable -- and because
+     * {@link #append} did not separate them, {@code ProjectionBuilder.writeBlock} reproduced this
+     * logic by hand, including the two details below that are easy to get wrong the second time.
+     *
+     * <p>The caller owns the commit and therefore the rollback: files returned here and never
+     * committed are orphans for the catalog's cleanup, not visible rows.
+     */
+    public static List<DataFile> writeFiles(Table table, List<Record> records) {
+        if (records == null || records.isEmpty()) {
+            return List.of();
         }
 
         Schema schema = table.schema();
@@ -59,16 +84,11 @@ public final class IcebergAppender {
                     .records.add(record);
         }
 
-        List<DataFile> dataFiles = new ArrayList<>();
+        List<DataFile> dataFiles = new ArrayList<>(batches.size());
         for (Batch batch : batches.values()) {
             dataFiles.add(writeBatch(schema, spec, outputFileFactory, batch));
         }
-
-        AppendFiles append = table.newAppend();
-        dataFiles.forEach(append::appendFile);
-        append.commit();
-
-        log.debug("Appended {} records across {} partitions to {}", records.size(), dataFiles.size(), table.name());
+        return dataFiles;
     }
 
     private static DataFile writeBatch(Schema schema,

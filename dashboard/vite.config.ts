@@ -18,12 +18,6 @@ export default defineConfig({
         secure: false,
         rewrite: (path) => path.replace(/^\/worker-api/, '/api')
       },
-      '/search-api': {
-        target: 'http://localhost:8083',
-        changeOrigin: true,
-        secure: false,
-        rewrite: (path) => path.replace(/^\/search-api/, '/api')
-      }
     }
   }
 })

@@ -114,4 +114,67 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              Enforces the constraint stated in this module's <description> instead of trusting it.
+              The claim that this is an engine-neutral format layer is only worth anything if a
+              Spark job or a Trino plugin can put it on the classpath, and the way that claim decays
+              is one convenient @Value or @Component pulling spring-context in, after which the next
+              dependency is free. Nothing detected that before this rule; review was the only gate.
+
+              bannedDependencies rather than a CI grep for imports: it rejects a pom entry before
+              any import exists, and it runs inside every `mvn test-compile` and `mvn test` rather
+              than only after a push. Bound to validate, whose dependency resolution the build
+              performs anyway.
+
+              Does not fire on the current tree: Iceberg, Hadoop, Parquet, the AWS SDK, slf4j,
+              Lombok, JUnit and vectorsync-common bring no org.springframework artifact.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <!--
+                  Pinned deliberately, matching common/pom.xml. An unpinned plugin version resolves
+                  to whatever is newest on the day, which turns an unrelated build into a failure
+                  nobody changed anything to cause; 3.5.0 is the version this rule was verified
+                  against and it requires Maven 3.6.3 or newer.
+                -->
+                <version>3.5.0</version>
+                <executions>
+                    <execution>
+                        <id>ban-spring</id>
+                        <phase>validate</phase>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <bannedDependencies>
+                                    <!-- Matches org.springframework and every org.springframework.*
+                                         group: the enforcer turns a trailing * into a regex .* over
+                                         the whole groupId. -->
+                                    <excludes>
+                                        <exclude>org.springframework*</exclude>
+                                    </excludes>
+                                    <!-- Transitive too, so the ban cannot be reached through an
+                                         intermediate dependency that happens to drag Spring in. -->
+                                    <searchTransitive>true</searchTransitive>
+                                    <message>
+                                        vectorsync-format must not depend on Spring, in any scope,
+                                        directly or transitively. Its consumers (the Spring
+                                        services, Spark jobs, a future Trino plugin) cannot share a
+                                        framework container. Keep the format contract on Iceberg,
+                                        Hadoop config, the AWS SDK and vectorsync-common, and put
+                                        the framework binding in a thin adapter inside the service.
+                                    </message>
+                                </bannedDependencies>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 </project>

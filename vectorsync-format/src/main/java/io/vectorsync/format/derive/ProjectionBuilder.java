@@ -12,6 +12,7 @@ import org.apache.iceberg.OverwriteFiles;
 import org.apache.iceberg.PartitionKey;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
@@ -291,6 +292,9 @@ public final class ProjectionBuilder {
      * is a history, so pinning the sequence number pins the exact set of content hashes, and the
      * embedding store is immutable, so the vectors behind them cannot have drifted either.
      *
+     * <p>An unbounded build that would reproduce the snapshot already published returns that
+     * snapshot's numbers without committing; see {@link #upToDateProjection}.
+     *
      * @param asOfSourceSequenceNumber source version to project, {@link Long#MAX_VALUE} for current
      * @throws IllegalStateException if Tier 1 is missing, unreadable, or so far behind the content
      *                               map that committing would empty a projection that is serving
@@ -313,14 +317,25 @@ public final class ProjectionBuilder {
                     spec.getSourceTable(), configId, contentMap != null, embeddingStore != null));
         }
 
+        // Before the content-map read, because that read is the expensive part and the whole point
+        // is not to pay for it when the answer cannot have changed.
+        Projection alreadyCurrent =
+                upToDateProjection(catalog, namespace, spec, contentMap, asOfSourceSequenceNumber);
+        if (alreadyCurrent != null) {
+            return alreadyCurrent;
+        }
+
         List<ContentMapEntry> live = new ArrayList<>(
                 ContentMap.liveEntriesAsOf(contentMap, spec.getSourceTable(), configId, asOfSourceSequenceNumber));
 
         // Sorted by content hash, which does two things at once: identical content lands in one
-        // block so its vector is fetched once, and a block's hashes cluster into few hash_prefix
-        // partitions of the embedding store, so each batched load prunes hard instead of touching
-        // all 256 buckets. Row id and ordinal only make the order total, and therefore the file
-        // layout deterministic across rebuilds.
+        // block so its vector is fetched once, and a block's hashes form a narrow contiguous range,
+        // which is what EmbeddingStore.load's range predicate prunes on. That second reason used to
+        // be about clustering into few hash_prefix partitions; hash_prefix has since been retired
+        // from the store's spec because it pruned nothing and fragmented writes 256 ways, but the
+        // sort is if anything more load-bearing now -- a range predicate over a scattered batch
+        // prunes far less than over a sorted one. Row id and ordinal only make the order total, and
+        // therefore the file layout deterministic across rebuilds.
         live.sort(Comparator.comparing(ContentMapEntry::getContentHash)
                 .thenComparing(ContentMapEntry::getSourceRowId)
                 .thenComparingInt(ContentMapEntry::getChunkOrdinal));
@@ -403,6 +418,107 @@ public final class ProjectionBuilder {
                 projection.name(), rows, distinctVectors, embeddingDim, coveredSequenceNumber);
 
         return new Projection(identifier(namespace, spec), rows, distinctVectors, embeddingDim, unresolvedRows);
+    }
+
+    /**
+     * The projection as already published, when rebuilding it would produce the same thing, or
+     * {@code null} when a build has to run.
+     *
+     * <p>This exists because the runner calls {@link #build} on every cycle in which any file was
+     * processed, and {@link #commitReplacement} is an {@code overwriteByRowFilter} over the whole
+     * {@code (source_table, model_version)} slice. Without this check, a cycle that touched one
+     * unrelated file deletes and rewrites every projected row -- the cost of a full rebuild for no
+     * change in content.
+     *
+     * <p>Why skipping is safe: the watermark compared here is the same one the build itself
+     * publishes into the snapshot summary, and {@code coveredSequenceNumber} guarantees that an
+     * incomplete projection publishes a value strictly <em>below</em> the content map's latest
+     * sequence number. An incomplete state therefore cannot satisfy the equality and cannot be
+     * skipped. The unresolved-rows check is belt and braces on the same property, and is what makes
+     * a projection that omitted rows keep retrying until the missing embeddings land.
+     *
+     * <p>A pinned as-of build never skips. It is a deliberate reproducibility request, so it
+     * rebuilds from the content map's history even when the current watermark happens to match.
+     *
+     * <p>Any summary value that is missing or unparseable falls through to a full rebuild. An absent
+     * summary is not evidence of being current -- it is evidence that whatever wrote that snapshot
+     * was not this code.
+     */
+    private static Projection upToDateProjection(Catalog catalog,
+                                                 String namespace,
+                                                 MaterializationSpec spec,
+                                                 Table contentMap,
+                                                 long asOfSourceSequenceNumber) {
+        if (asOfSourceSequenceNumber < Long.MAX_VALUE) {
+            return null;
+        }
+
+        TableIdentifier identifier = identifier(namespace, spec);
+        Table existing;
+        try {
+            // Not loadIfExists: that logs a warning for a projection that has never been built,
+            // which on a first build is normal rather than notable.
+            if (!catalog.tableExists(identifier)) {
+                return null;
+            }
+            existing = catalog.loadTable(identifier);
+        } catch (Exception e) {
+            log.warn("Could not load serving projection {} to check its watermark, rebuilding: {}",
+                    identifier, e.getMessage());
+            return null;
+        }
+
+        // Checked on this path too, not only in loadOrCreate: a skip that bypassed the version
+        // check would report a foreign-format projection as current and never refuse.
+        requireCurrentFormat(existing);
+
+        Snapshot current = existing.currentSnapshot();
+        if (current == null) {
+            return null;
+        }
+
+        Map<String, String> summary = current.summary();
+        if (summary == null || !spec.configId().equals(summary.get(SUMMARY_CONFIG_ID))) {
+            return null;
+        }
+
+        Long publishedSequenceNumber = summaryLong(summary, SUMMARY_SEQUENCE);
+        Long unresolvedRows = summaryLong(summary, SUMMARY_UNRESOLVED);
+        Long rows = summaryLong(summary, SUMMARY_ROWS);
+        Long distinctVectors = summaryLong(summary, SUMMARY_VECTORS);
+        Long embeddingDim = summaryLong(summary, SUMMARY_DIM);
+        if (publishedSequenceNumber == null || unresolvedRows == null
+                || rows == null || distinctVectors == null || embeddingDim == null) {
+            return null;
+        }
+        if (unresolvedRows != 0L) {
+            return null;
+        }
+
+        long latestSequenceNumber =
+                ContentMap.latestSequenceNumber(contentMap, spec.getSourceTable(), spec.configId());
+        if (latestSequenceNumber != publishedSequenceNumber) {
+            return null;
+        }
+
+        log.info("Serving projection {} already covers source sequence {}, skipping the rebuild: "
+                        + "{} rows over {} distinct vectors in snapshot {}",
+                identifier, publishedSequenceNumber, rows, distinctVectors, current.snapshotId());
+
+        return new Projection(identifier, rows, distinctVectors, embeddingDim.intValue(), 0L);
+    }
+
+    /** A snapshot summary value as a long, or {@code null} when it is absent or not a number. */
+    private static Long summaryLong(Map<String, String> summary, String key) {
+        String raw = summary.get(key);
+        if (raw == null) {
+            return null;
+        }
+        try {
+            return Long.valueOf(raw.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /**

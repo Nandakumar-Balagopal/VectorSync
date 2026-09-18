@@ -1,5 +1,8 @@
 package io.vectorsync.worker.service.derive;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tags;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -28,6 +31,27 @@ public class DeriveMetricsRegistry {
 
     private final Map<String, Counters> byScope = new ConcurrentHashMap<>();
 
+    /**
+     * Micrometer mirror of the same observations, so they are scrapeable rather than only readable
+     * over this service's own endpoint.
+     *
+     * <p>Deliberately counters and never a ratio gauge. The interesting number is the fraction of
+     * chunks that avoided inference, and publishing it as a gauge would make it unaggregatable
+     * across workers -- averaging two workers' ratios is not the fleet ratio -- and would freeze at
+     * its last value when a worker went idle, which reads as a healthy rate for a materialization
+     * that has stopped. Two counters let the consumer divide over whatever window it cares about.
+     *
+     * <p>The distinction between avoided-by-store-hit and avoided-by-within-batch-dedup is kept,
+     * because collapsing them is how the earlier {@code dedupRate} came to understate a freshly
+     * duplicated table to nearly zero: it counted only embedding-store hits and ignored the
+     * duplicates a single batch collapsed before probing.
+     */
+    private final MeterRegistry meters;
+
+    public DeriveMetricsRegistry(MeterRegistry meters) {
+        this.meters = meters;
+    }
+
     private static final class Counters {
         private final AtomicLong rows = new AtomicLong();
         private final AtomicLong chunks = new AtomicLong();
@@ -50,6 +74,43 @@ public class DeriveMetricsRegistry {
         counters.inferenceCalls.addAndGet(result.inferenceCalls());
         counters.failed.addAndGet(result.failed());
         counters.passes.incrementAndGet();
+
+        publish(sourceTable, configId, result);
+    }
+
+    /**
+     * Mirrors one pass into Micrometer.
+     *
+     * <p>Tagged by scope, which is the only tagging that makes the numbers actionable -- a fleet
+     * total cannot tell you which materialization stopped deduplicating. The cardinality that
+     * implies is real and is capped by {@code MeterFilterConfig}: source tables and configuration
+     * ids are both user-supplied and unbounded, and an uncapped tag on them is a metrics-backend
+     * incident rather than a monitoring feature.
+     */
+    private void publish(String sourceTable, String configId, DeriveResult result) {
+        Tags tags = Tags.of("source_table", sourceTable, "config_id", configId);
+
+        Counter.builder("vectorsync.inference.chunks")
+                .description("Chunks considered for embedding, whether or not the model was called")
+                .tags(tags).register(meters).increment(result.chunksProcessed());
+        Counter.builder("vectorsync.inference.calls")
+                .description("Model invocations actually made")
+                .tags(tags).register(meters).increment(result.inferenceCalls());
+        // chunks - calls, computed here rather than derived by the consumer, so the saving is
+        // visible without having to know the relationship between the other two.
+        Counter.builder("vectorsync.inference.avoided")
+                .description("Chunks that needed no model call, from a store hit or within-batch dedup")
+                .tags(tags).register(meters)
+                .increment(Math.max(0, result.chunksProcessed() - result.inferenceCalls()));
+        Counter.builder("vectorsync.inference.store.hits")
+                .description("Chunks whose vector was already in the embedding store")
+                .tags(tags).register(meters).increment(result.cacheHits());
+        Counter.builder("vectorsync.derive.chunks.failed")
+                .description("Chunks a pass could not map, so they are absent from serving")
+                .tags(tags).register(meters).increment(result.failed());
+        Counter.builder("vectorsync.derive.passes")
+                .description("Derive passes recorded, successful or not")
+                .tags(tags).register(meters).increment();
     }
 
     /** @return counters for one scope; zeros when nothing has been derived for it in this process */

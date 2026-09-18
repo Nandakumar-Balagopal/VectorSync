@@ -3,7 +3,10 @@ package io.vectorsync.format.derive;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.TreeSet;
 
 /**
  * Content identity for a unit of text about to be embedded.
@@ -73,18 +76,53 @@ public final class ContentHash {
     }
 
     /**
-     * Leading hex characters of a content hash, used as a partition column on the embedding store.
+     * Leading hex characters of a content hash. Still written on every embedding-store row, but no
+     * longer a partition column.
      *
-     * <p>Content hashes are uniformly distributed, so a fixed-width prefix gives evenly sized
-     * partitions without a global sort, and an equality lookup on a known hash prunes to one
-     * partition instead of scanning the store. Two characters is 256 buckets, which is the right
-     * order for a store that is read by point lookup and written in bulk.
+     * <p>It was one, on the reasoning that uniformly distributed hashes give 256 evenly sized
+     * buckets for free. Measurement went the other way on both sides -- a realistic probe's prefix
+     * set covered every bucket so reads degraded to a full scan, and writes fragmented into 44,587
+     * files averaging 9.2 KiB -- so {@code EmbeddingStore.partitionSpec} now partitions by model
+     * version alone. The column survives because removing it from the schema would brick the table:
+     * historical partition specs still source its field id.
      */
     public static String prefix(String contentHash) {
         if (contentHash == null || contentHash.length() < 2) {
             return "00";
         }
         return contentHash.substring(0, 2);
+    }
+
+    /**
+     * A digest identifying exactly which content a derived artifact covers.
+     *
+     * <p>This is what lets a vector index be identified by <em>what it contains</em> rather than by
+     * the source snapshot it was built from, and the difference is the whole point. An index keyed
+     * by snapshot id must be rebuilt whenever a new snapshot appears, because its key changed --
+     * even when the snapshot only moved bytes. Compaction, a data-file rewrite, a sort
+     * reorganisation and a partition rewrite all produce a new snapshot and change no content, so
+     * they all leave this digest identical and the existing index provably still correct.
+     *
+     * <p>Order-independent by sorting before hashing, because the caller's iteration order is a
+     * property of a scan rather than of the data: the same content read back in a different file
+     * order must not look like different coverage. Distinct-by-construction for the same reason --
+     * duplicate rows for one content hash are a legitimate state of the append-only embedding store
+     * and must not change what the index is said to cover.
+     *
+     * <p>An empty set has its own digest rather than hashing to the empty string, so "covers
+     * nothing" is distinguishable from "was never recorded".
+     */
+    public static String coverageDigest(Collection<String> contentHashes) {
+        if (contentHashes == null || contentHashes.isEmpty()) {
+            return sha256("vectorsync.coverage.empty");
+        }
+
+        List<String> sorted = new ArrayList<>(new TreeSet<>(contentHashes));
+        StringBuilder assembled = new StringBuilder(sorted.size() * 65);
+        for (String hash : sorted) {
+            assembled.append(hash == null ? "" : hash).append(SEPARATOR);
+        }
+        return sha256(assembled.toString());
     }
 
     private static String sha256(String value) {

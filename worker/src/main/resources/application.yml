@@ -1,6 +1,20 @@
 spring:
   application:
     name: ${APP_NAME:vectorsync-worker}
+  task:
+    scheduling:
+      pool:
+        # Spring Boot's default is 1, so every @Scheduled method in the worker would share one
+        # thread and a long cycle would delay whatever is behind it. One thread per scheduler:
+        # DerivationScheduler (always on), MaintenanceScheduler (on unless disabled) and
+        # ClusterIndexScheduler (opt-in). Maintenance is the reason this is no longer headroom --
+        # a compaction pass reads and rewrites data files, so it is the one @Scheduled method here
+        # that can occupy its thread for minutes, and sharing would stall derivation behind it.
+        #
+        # This is NOT the derivation concurrency knob. Cycle parallelism is
+        # vectorsync.runner.parallelism, which fans out inside one cycle rather than running cycles
+        # concurrently; @Scheduled(fixedDelay) never overlaps a method with itself.
+        size: ${SPRING_TASK_SCHEDULING_POOL_SIZE:3}
 
 server:
   port: ${SERVER_PORT:8081}
@@ -71,3 +85,23 @@ logging:
       vectorsync: ${LOG_LEVEL_APP:DEBUG}
   pattern:
     console: ${LOG_PATTERN_CONSOLE:%d{yyyy-MM-dd HH:mm:ss} - %msg%n}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Explicit allowlist. Boot exposes only health by default, which is why /actuator/metrics
+        # has been unreachable in every deployment despite actuator being on the classpath since
+        # the beginning -- the meters were being collected and nothing could read them.
+        #
+        # 'metrics' and not a Prometheus scrape endpoint: micrometer-registry-prometheus is not
+        # resolvable at the version this build's BOM manages, so adding it breaks offline builds.
+        # /actuator/metrics gives the same numbers over JSON and needs no new dependency.
+        #
+        # Deliberately NOT on a separate management.server.port: docker-compose publishes only the
+        # service ports, and the e2e scripts under deployment/ probe health on the main port, so a
+        # second port would be both unscrapable and a broken health check.
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized

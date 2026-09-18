@@ -63,9 +63,4 @@ public class EmbeddingEntry {
     public String storeKey() {
         return ContentHash.storeKey(contentHash, modelVersion, configId);
     }
-
-    /** Partition bucket of {@link #contentHash}, derived rather than stored on the entry. */
-    public String hashPrefix() {
-        return ContentHash.prefix(contentHash);
-    }
 }

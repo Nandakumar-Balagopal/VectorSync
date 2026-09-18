@@ -1,10 +1,7 @@
 package io.vectorsync.worker.controller;
 
-import io.vectorsync.common.dto.TableConfig;
 import io.vectorsync.worker.client.ControlApiClient;
 import io.vectorsync.worker.service.DemoSeedService;
-import io.vectorsync.worker.service.SyncOrchestrationService;
-import io.vectorsync.worker.service.VectorStoreService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -14,7 +11,6 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -25,17 +21,11 @@ public class DemoController {
 
     private final DemoSeedService demoSeedService;
     private final ControlApiClient controlApiClient;
-    private final SyncOrchestrationService syncOrchestrationService;
-    private final VectorStoreService vectorStoreService;
 
     public DemoController(DemoSeedService demoSeedService,
-                          ControlApiClient controlApiClient,
-                          SyncOrchestrationService syncOrchestrationService,
-                          VectorStoreService vectorStoreService) {
+                          ControlApiClient controlApiClient) {
         this.demoSeedService = demoSeedService;
         this.controlApiClient = controlApiClient;
-        this.syncOrchestrationService = syncOrchestrationService;
-        this.vectorStoreService = vectorStoreService;
     }
 
     @PostMapping("/seed")
@@ -44,16 +34,42 @@ public class DemoController {
     }
 
     /** Seeds an arbitrary source table, for exercising the flow across several tables. */
-    @PostMapping("/tables")
-    public ResponseEntity<?> seedTable(@RequestBody SeedTableRequest request) {
+    /** Copy-on-write replace, for the mutation benchmark. See DemoSeedService.replaceRows. */
+    @PostMapping("/tables/replace")
+    public ResponseEntity<?> replaceTable(@RequestBody SeedTableRequest request) {
         try {
-            return ResponseEntity.ok(demoSeedService.seedTable(request.tableName(), request.rows()));
+            return ResponseEntity.ok(
+                    demoSeedService.replaceRows(request.tableName(), request.rows()));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
         }
     }
 
-    public record SeedTableRequest(String tableName, List<DemoSeedService.SeedRow> rows) {
+    public record DeletePartitionRequest(String tableName, String column, String value) {
+    }
+
+    /** Partition-scoped DELETE, so the reconcile's partition scoping can be exercised. */
+    @PostMapping("/tables/delete-partition")
+    public ResponseEntity<?> deletePartition(@RequestBody DeletePartitionRequest request) {
+        try {
+            return ResponseEntity.ok(demoSeedService.deletePartition(
+                    request.tableName(), request.column(), request.value()));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
+        }
+    }
+
+    @PostMapping("/tables")
+    public ResponseEntity<?> seedTable(@RequestBody SeedTableRequest request) {
+        try {
+            return ResponseEntity.ok(demoSeedService.seedTable(request.tableName(), request.rows(), request.partitionColumn()));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
+        }
+    }
+
+    public record SeedTableRequest(String tableName, List<DemoSeedService.SeedRow> rows,
+                                   String partitionColumn) {
     }
 
     /** Appends to an existing table so its snapshot ancestry survives, unlike a re-seed. */
@@ -92,25 +108,6 @@ public class DemoController {
     @DeleteMapping("/products/{id}")
     public ResponseEntity<DemoSeedService.DemoMutationResult> deleteProduct(@PathVariable("id") String id) {
         return ResponseEntity.ok(demoSeedService.deleteProduct(id));
-    }
-
-    @PostMapping("/sync")
-    public ResponseEntity<Map<String, Object>> sync() {
-        List<TableConfig> tableConfigs = controlApiClient.getTableConfigs();
-        int synced = 0;
-
-        for (TableConfig config : tableConfigs) {
-            if (config.isEnabled()) {
-                syncOrchestrationService.syncTable(config);
-                synced++;
-            }
-        }
-
-        long vectorCount = vectorStoreService.getVectorCount();
-        Map<String, Object> response = new HashMap<>();
-        response.put("tablesSynced", synced);
-        response.put("vectorCount", vectorCount);
-        return ResponseEntity.ok(response);
     }
 
     public record DemoProductRequest(String id,

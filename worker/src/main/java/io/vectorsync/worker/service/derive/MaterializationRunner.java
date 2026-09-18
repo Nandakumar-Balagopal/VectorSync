@@ -16,8 +16,16 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * Closes the loop: plans work for each materialization, drains it through the queue, publishes the
@@ -49,6 +57,7 @@ public class MaterializationRunner {
     private final IcebergCatalogService catalogService;
     private final ContentHashIndex hashIndex;
     private final DeriveMetricsRegistry metrics;
+    private final ReconcileService reconcileService;
 
     /**
      * Lease owner. Defaults to host and pid rather than a constant, because the fence in the queue
@@ -60,21 +69,78 @@ public class MaterializationRunner {
 
     private String owner;
 
+    /**
+     * Configuration groups derived concurrently within one cycle.
+     *
+     * <p>Defaults to 1, so the shipped behaviour is exactly the sequential cycle this replaced. The
+     * deliverable here is that the knob exists and that raising it is checked, not that the default
+     * changed -- raising it is a deployment decision with a hard prerequisite, below.
+     */
+    @Value("${vectorsync.runner.parallelism:1}")
+    private int parallelism;
+
+    private ExecutorService executor;
+
+    /**
+     * Resolves the lease owner and builds the cycle pool.
+     *
+     * <p>Both belong here rather than in the constructor because {@link #parallelism} and
+     * {@link #configuredOwner} are field injected: in the constructor the int is still 0, and a pool
+     * sized from it would either be rejected outright or -- worse, if it were a semaphore -- block
+     * on the first acquire forever, behind the scheduler's re-entrancy skip, stopping derivation
+     * permanently with nothing logged above DEBUG.
+     */
     @jakarta.annotation.PostConstruct
-    void resolveOwner() {
+    void startUp() {
         if (configuredOwner != null && !configuredOwner.isBlank()) {
             owner = configuredOwner;
-            return;
+        } else {
+            String host;
+            try {
+                host = java.net.InetAddress.getLocalHost().getHostName();
+            } catch (Exception e) {
+                host = "unknown-host";
+            }
+            owner = host + ":" + ProcessHandle.current().pid();
         }
-        String host;
-        try {
-            host = java.net.InetAddress.getLocalHost().getHostName();
-        } catch (Exception e) {
-            host = "unknown-host";
-        }
-        owner = host + ":" + ProcessHandle.current().pid();
         log.info("Derivation runner lease owner: {}", owner);
+
+        int threads = Math.max(1, parallelism);
+        if (threads > 1) {
+            // Refusing to start, rather than warning. HadoopCatalog has no atomic commit: two
+            // writers can both succeed and one silently wins, which is data loss with no exception
+            // and no way to notice after the fact. IcebergCatalogConfig already refuses Hadoop on
+            // object storage for the same reason; this is the second half of that check, because
+            // parallelism is what turns a single-writer deployment into a multi-writer one.
+            String catalogType = catalogService.config().type();
+            if ("hadoop".equals(catalogType)) {
+                throw new IllegalStateException(String.format(
+                        "vectorsync.runner.parallelism is %d but the catalog type is hadoop, which "
+                                + "has no atomic commit: two concurrent commits can both succeed and "
+                                + "one is silently lost. Either set parallelism to 1, or move to a "
+                                + "catalog with real commit semantics (jdbc, rest, hive, glue, "
+                                + "nessie).", parallelism));
+            }
+            log.info("Derivation runner parallelism {} on a {} catalog", threads, catalogType);
+        }
+
+        executor = Executors.newFixedThreadPool(threads, runnable -> {
+            Thread thread = new Thread(runnable, "derive-cycle-" + POOL_THREADS.incrementAndGet());
+            // Daemon so a hung derive cannot keep a shutting-down worker alive.
+            thread.setDaemon(true);
+            return thread;
+        });
     }
+
+    @jakarta.annotation.PreDestroy
+    void shutDown() {
+        if (executor != null) {
+            executor.shutdownNow();
+        }
+    }
+
+    private static final java.util.concurrent.atomic.AtomicInteger POOL_THREADS =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     /** Files leased per cycle. Bounds heap and keeps a crash cheap; it is not a throughput knob. */
     @Value("${vectorsync.runner.lease-batch:8}")
@@ -93,18 +159,31 @@ public class MaterializationRunner {
     @Value("${vectorsync.runner.publish-projection:true}")
     private boolean publishProjection;
 
+    /**
+     * Whether a range containing deletes or overwrites is reconciled automatically.
+     *
+     * <p>On by default, because the alternative is the materialization stopping. The refusal it
+     * replaces was correct but terminal, and a reconcile that is correct is strictly better than a
+     * halt an operator has to notice. A deployment that would rather be told than repaired can turn
+     * it off and get the old behaviour exactly.
+     */
+    @Value("${vectorsync.runner.reconcile-enabled:true}")
+    private boolean reconcileEnabled;
+
     public MaterializationRunner(DerivationControlClient control,
                                  IncrementalChangeDetector detector,
                                  DeriveService deriveService,
                                  IcebergCatalogService catalogService,
                                  ContentHashIndex hashIndex,
-                                 DeriveMetricsRegistry metrics) {
+                                 DeriveMetricsRegistry metrics,
+                                 ReconcileService reconcileService) {
         this.control = control;
         this.detector = detector;
         this.deriveService = deriveService;
         this.catalogService = catalogService;
         this.hashIndex = hashIndex;
         this.metrics = metrics;
+        this.reconcileService = reconcileService;
     }
 
     public record CycleReport(int materializationsSeen,
@@ -127,43 +206,128 @@ public class MaterializationRunner {
             return new CycleReport(0, 0, 0, 0, 0, 0);
         }
 
-        int enqueued = 0;
-        int processed = 0;
-        int failed = 0;
-        int projected = 0;
-        int advanced = 0;
-
+        // Grouped by configuration id, and the group -- not the materialization -- is the unit of
+        // concurrency. Two materializations that share a configId address the same Tier-1 content
+        // space, so deriving them at once means both probe the dedup record before either has
+        // written, both miss, and both pay for the same inference. That breaks the one-row-per-
+        // content invariant Tier 1 exists to hold and falsifies the equal-inference claim
+        // ReproducibilityTest asserts. Groups run in parallel; members of a group run in sequence.
+        //
+        // Note configId deliberately excludes the source table, so a group is frequently more than
+        // one materialization rather than rarely.
+        Map<String, List<Materialization>> byConfig = new LinkedHashMap<>();
         for (Materialization materialization : runnable) {
-            try {
-                enqueued += plan(materialization);
-                int[] result = drain(materialization);
-                processed += result[0];
-                failed += result[1];
-
-                if (publish(materialization, result[0])) {
-                    projected++;
-                    advanced++;
-                }
-            } catch (IncrementalChangeDetector.ReanchorRequiredException e) {
-                // Never resolves by retrying: the anchor snapshot has been expired or the source
-                // table was replaced. Parked with the reason so it stops consuming a cycle and an
-                // operator can re-admit it, rather than throwing every interval forever.
-                log.warn("Materialization {} ({}) needs re-anchoring: {}",
-                        materialization.getId(), materialization.getSourceTable(), e.getMessage());
-                control.markDegraded(materialization.getId(), e.getMessage());
-            } catch (org.apache.iceberg.exceptions.NoSuchTableException e) {
-                // The source table is gone. Also terminal without intervention.
-                log.warn("Materialization {} ({}) has no source table; parking it",
-                        materialization.getId(), materialization.getSourceTable());
-                control.markDegraded(materialization.getId(),
-                        "source table no longer exists: " + e.getMessage());
-            } catch (Exception e) {
-                log.error("Materialization {} ({}) failed this cycle: {}",
-                        materialization.getId(), materialization.getSourceTable(), e.getMessage(), e);
-            }
+            byConfig.computeIfAbsent(configIdOf(materialization), key -> new ArrayList<>())
+                    .add(materialization);
         }
 
-        return new CycleReport(runnable.size(), enqueued, processed, failed, projected, advanced);
+        List<Callable<CycleReport>> tasks = new ArrayList<>(byConfig.size());
+        for (List<Materialization> group : byConfig.values()) {
+            tasks.add(() -> {
+                CycleReport groupReport = new CycleReport(0, 0, 0, 0, 0, 0);
+                for (Materialization materialization : group) {
+                    groupReport = add(groupReport, runOne(materialization));
+                }
+                return groupReport;
+            });
+        }
+
+        CycleReport total = new CycleReport(0, 0, 0, 0, 0, 0);
+        try {
+            // invokeAll rather than a semaphore or a stream: it bounds concurrency at the pool size,
+            // joins before returning so no work outlives the cycle, cannot leak a permit on an
+            // exception, and cannot be rejected. It also makes two concurrent drains of one
+            // materialization impossible by construction, which is what lets the lease owner stay
+            // per-process instead of becoming per-thread churn in a VARCHAR(128).
+            for (Future<CycleReport> future : executor.invokeAll(tasks)) {
+                try {
+                    total = add(total, future.get());
+                } catch (ExecutionException e) {
+                    // runOne catches everything, so reaching here means the group wrapper itself
+                    // broke. Logged rather than rethrown: one group must not void the cycle's report.
+                    log.error("A materialization group failed outside its own handler: {}",
+                            e.getCause() == null ? e.toString() : e.getCause().toString(), e);
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Derivation cycle interrupted; {} groups were in flight", tasks.size());
+        }
+
+        return new CycleReport(runnable.size(), total.filesEnqueued(), total.filesProcessed(),
+                total.filesFailed(), total.projectionsPublished(), total.watermarksAdvanced());
+    }
+
+    /**
+     * One materialization's plan, drain and publish, with every failure contained.
+     *
+     * <p>Extracted from the cycle loop unchanged. Failures are isolated per materialization for the
+     * same reason the table loop is: a stable iteration order means one broken entry would otherwise
+     * starve every entry behind it forever. Containing them here rather than at the group level also
+     * keeps a thrown exception from cancelling the peers in its own group.
+     */
+    private CycleReport runOne(Materialization materialization) {
+        try {
+            // The reconcile path drains its own queue, so its processed count has to reach publish()
+            // from here. It used to be discarded: plan() returned only an enqueued count, the
+            // drain() below then found an empty queue and returned 0, and publish() early-returns on
+            // processedThisCycle == 0 for a LIVE materialization -- so the watermark never advanced,
+            // the next cycle re-assessed the identical range, and the reconcile repeated every
+            // interval forever. Observed on real data as the same "206 of 495 rows retired" twice.
+            // This is hazard H3 from the architecture review, which named exactly this: plan()
+            // returning an int cannot carry what publish() needs to know.
+            Planned planned = plan(materialization);
+            int[] result = drain(materialization);
+            int processed = planned.processed() + result[0];
+            int failed = planned.failed() + result[1];
+            int projected = publish(materialization, processed) ? 1 : 0;
+            return new CycleReport(0, planned.enqueued(), processed, failed, projected, projected);
+        } catch (IncrementalChangeDetector.ReanchorRequiredException e) {
+            // Never resolves by retrying: the anchor snapshot has been expired or the source
+            // table was replaced. Parked with the reason so it stops consuming a cycle and an
+            // operator can re-admit it, rather than throwing every interval forever.
+            log.warn("Materialization {} ({}) needs re-anchoring: {}",
+                    materialization.getId(), materialization.getSourceTable(), e.getMessage());
+            control.markDegraded(materialization.getId(), e.getMessage());
+        } catch (org.apache.iceberg.exceptions.NoSuchTableException e) {
+            // The source table is gone. Also terminal without intervention.
+            log.warn("Materialization {} ({}) has no source table; parking it",
+                    materialization.getId(), materialization.getSourceTable());
+            control.markDegraded(materialization.getId(),
+                    "source table no longer exists: " + e.getMessage());
+        } catch (Exception e) {
+            log.error("Materialization {} ({}) failed this cycle: {}",
+                    materialization.getId(), materialization.getSourceTable(), e.getMessage(), e);
+        }
+        return new CycleReport(0, 0, 0, 0, 0, 0);
+    }
+
+    private static CycleReport add(CycleReport left, CycleReport right) {
+        return new CycleReport(
+                left.materializationsSeen() + right.materializationsSeen(),
+                left.filesEnqueued() + right.filesEnqueued(),
+                left.filesProcessed() + right.filesProcessed(),
+                left.filesFailed() + right.filesFailed(),
+                left.projectionsPublished() + right.projectionsPublished(),
+                left.watermarksAdvanced() + right.watermarksAdvanced());
+    }
+
+    /**
+     * Grouping key. Falls back to the materialization id when the spec cannot produce a
+     * configuration id, which keeps an unreadable entry in its own group rather than silently
+     * sharing one with every other broken entry.
+     */
+    private static String configIdOf(Materialization materialization) {
+        try {
+            MaterializationSpec spec = materialization.getSpec();
+            if (spec != null && spec.configId() != null) {
+                return spec.configId();
+            }
+        } catch (Exception e) {
+            log.warn("Could not derive a config id for materialization {}; isolating it: {}",
+                    materialization.getId(), e.getMessage());
+        }
+        return "unkeyed:" + materialization.getId();
     }
 
     /**
@@ -174,7 +338,21 @@ public class MaterializationRunner {
      * is far cheaper than tracking planning progress separately and risking it diverging from the
      * queue.
      */
-    private int plan(Materialization materialization) {
+    /**
+     * What one plan pass queued, and what it already processed itself.
+     *
+     * <p>{@code processed} and {@code failed} are non-zero only on the reconcile path, which drains
+     * its own queue so that the sweep cannot be separated from the derive it depends on. Everything
+     * else leaves them zero and is drained by the caller.
+     */
+    private record Planned(int enqueued, int processed, int failed) {
+
+        static Planned queued(int enqueued) {
+            return new Planned(enqueued, 0, 0);
+        }
+    }
+
+    private Planned plan(Materialization materialization) {
         MaterializationSpec spec = materialization.getSpec();
         TableConfig config = toTableConfig(spec);
 
@@ -189,11 +367,11 @@ public class MaterializationRunner {
             // 10,000 files of work, with the enqueue round trips, not derivation, setting the
             // wall-clock floor.
             if (depth != null && (depth.getPending() > 0 || depth.getLeased() > 0)) {
-                return 0;
+                return Planned.queued(0);
             }
             if (depth != null && depth.getDone() > 0 && depth.getFailed() == 0) {
                 // Everything planned has been derived; publish() advances from here.
-                return 0;
+                return Planned.queued(0);
             }
 
             control.beginBackfill(materialization.getId());
@@ -203,12 +381,12 @@ public class MaterializationRunner {
                 log.info("Materialization {} backfill: {} of {} files newly queued",
                         materialization.getId(), inserted, work.size());
             }
-            return inserted;
+            return Planned.queued(inserted);
         }
 
         IncrementalChangeDetector.SourceVersion current = detector.currentVersion(config);
         if (current.isEmpty() || current.snapshotId() == materialization.getAnchorSnapshotId()) {
-            return 0;
+            return Planned.queued(0);
         }
 
         // An append scan cannot see deletes or overwrites. Advancing anyway would move the watermark
@@ -217,17 +395,98 @@ public class MaterializationRunner {
         IncrementalChangeDetector.ScanAssessment assessment =
                 detector.assess(config, materialization.getAnchorSnapshotId(), current.snapshotId());
         if (!assessment.incrementalSafe()) {
+            if (assessment.reconcileRequired() && reconcileEnabled) {
+                return reconcile(materialization, spec, config, current, assessment);
+            }
             log.warn("Materialization {} needs a reconcile: {}", materialization.getId(),
                     assessment.verdict());
             control.markDegraded(materialization.getId(),
                     "incremental scan unsafe: " + assessment.verdict()
                             + " (deletes or overwrites between snapshots require a reconcile)");
-            return 0;
+            return Planned.queued(0);
         }
 
         List<SourceFileWork> work = detector.incrementalWork(
                 config, materialization.getAnchorSnapshotId(), current.snapshotId());
-        return control.enqueue(materialization.getId(), work, "INCREMENTAL");
+        return Planned.queued(control.enqueue(materialization.getId(), work, "INCREMENTAL"));
+    }
+
+    /**
+     * Repairs a range an append scan cannot describe: re-derive the source at the new version, then
+     * sweep away whatever no longer exists.
+     *
+     * <p><b>Why this is one operation and not two steps.</b> The obvious shape -- enqueue the files,
+     * let {@code drain} process them, then sweep in {@code publish} -- cannot be made safe here, and
+     * the reason is worth stating because it is not obvious. {@code publish} begins
+     * {@code if (processedThisCycle == 0 && live) return false;}, and {@code enqueue} is idempotent
+     * on {@code (materializationId, dataFilePath, snapshotId)} <em>including rows already DONE</em>.
+     * So a crash between the derive and the sweep leaves a cycle that enqueues nothing, drains
+     * nothing, and returns before sweeping -- permanently. The materialization would read LIVE and
+     * healthy while serving deleted rows, which is strictly worse than the loud refusal this
+     * replaces.
+     *
+     * <p>So the sweep runs here, in the same call that did the derive, before anything advances. If
+     * this method throws or the sweep refuses, no watermark moves and the range is re-assessed next
+     * cycle -- the same range, with the same verdict, arriving here again. Failure is a retry rather
+     * than a gap.
+     *
+     * <p>The sweep is deliberately ordered after the derive. A row that was rewritten rather than
+     * removed must already have its new content-map version committed before the sweep asks which
+     * keys exist, or the sweep and the derive would disagree about the same row.
+     *
+     * @return files enqueued, so the caller's accounting is unchanged
+     */
+    private Planned reconcile(Materialization materialization,
+                              MaterializationSpec spec,
+                              TableConfig config,
+                              IncrementalChangeDetector.SourceVersion target,
+                              IncrementalChangeDetector.ScanAssessment assessment) {
+        log.info("Materialization {} reconciling to snapshot {} (sequence {})",
+                materialization.getId(), target.snapshotId(), target.sequenceNumber());
+
+        // Pinned to the target version, not "current". The re-derive and the sweep have to describe
+        // the same source version or a commit landing between them tombstones rows the derive never
+        // looked at.
+        // Scoped to the partitions the assessment identified, which is what makes a reconcile
+        // proportional to the change rather than to the table. An empty set means the scope could
+        // not be narrowed -- an unpartitioned source, a spec evolution inside the range, or
+        // unreadable manifests -- and then the whole table is the only correct answer, which is why
+        // wholeTableReconcile() names that case rather than leaving it to be inferred.
+        Set<String> partitions = assessment.affectedPartitions();
+        List<SourceFileWork> work = assessment.wholeTableReconcile()
+                ? detector.backfillWork(config, target.snapshotId())
+                : detector.backfillWork(config, target.snapshotId(), partitions);
+        log.info("Materialization {} reconciling {} ({} files)", materialization.getId(),
+                assessment.wholeTableReconcile()
+                        ? "the whole table"
+                        : partitions.size() + " affected partition(s)",
+                work.size());
+        int enqueued = control.enqueue(materialization.getId(), work, "BACKFILL");
+
+        int[] drained = drain(materialization);
+        if (drained[1] > 0) {
+            control.markDegraded(materialization.getId(),
+                    drained[1] + " files failed during a reconcile; the sweep was not attempted "
+                            + "because tombstoning against a partial re-derive would retire rows "
+                            + "whose new version had not been written");
+            return new Planned(enqueued, drained[0], drained[1]);
+        }
+
+        ReconcileService.SweepResult swept = reconcileService.sweep(
+                spec, config, target.snapshotId(), target.sequenceNumber(),
+                System.currentTimeMillis());
+
+        if (!swept.complete()) {
+            log.warn("Materialization {} sweep refused: {}", materialization.getId(), swept.note());
+            control.markDegraded(materialization.getId(), "reconcile sweep refused: " + swept.note());
+            return new Planned(enqueued, drained[0], drained[1]);
+        }
+
+        log.info("Materialization {} reconciled: {} of {} mapped rows retired",
+                materialization.getId(), swept.tombstoned(), swept.liveBefore());
+        // The processed count is what lets publish() run and the watermark advance. Without it the
+        // reconcile repeats on every cycle against the same range.
+        return new Planned(enqueued, Math.max(drained[0], 1), 0);
     }
 
     /** @return {processed, failed} */

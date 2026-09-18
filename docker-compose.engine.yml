@@ -20,10 +20,3 @@ services:
       ICEBERG_CATALOG_URI: jdbc:postgresql://postgres:5432/vectorsync
       ICEBERG_CATALOG_JDBC_USER: vectorsync
       ICEBERG_CATALOG_JDBC_PASSWORD: vectorsync123
-
-  search-service:
-    environment:
-      ICEBERG_CATALOG_TYPE: jdbc
-      ICEBERG_CATALOG_URI: jdbc:postgresql://postgres:5432/vectorsync
-      ICEBERG_CATALOG_JDBC_USER: vectorsync
-      ICEBERG_CATALOG_JDBC_PASSWORD: vectorsync123

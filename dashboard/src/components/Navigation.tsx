@@ -6,8 +6,6 @@ import {
 } from '@carbon/react';
 import {
   Dashboard,
-  Version,
-  Search,
   Settings,
 } from '@carbon/icons-react';
 import './Navigation.scss';
@@ -20,8 +18,6 @@ export function Navigation() {
   // were removed along with the fabricated data that populated them.
   const navItems = [
     { path: '/', label: 'Overview', icon: Dashboard },
-    { path: '/lifecycle', label: 'Lifecycle', icon: Version },
-    { path: '/search', label: 'Semantic Search', icon: Search },
     { path: '/config', label: 'Configuration', icon: Settings },
   ];
 

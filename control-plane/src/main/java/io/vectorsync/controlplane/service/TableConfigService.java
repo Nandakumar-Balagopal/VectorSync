@@ -5,7 +5,6 @@ import io.vectorsync.controlplane.entity.SyncStateEntity;
 import io.vectorsync.controlplane.entity.TableConfigEntity;
 import io.vectorsync.controlplane.repository.SyncStateRepository;
 import io.vectorsync.controlplane.repository.TableConfigRepository;
-import io.vectorsync.controlplane.service.iceberg.VectorSyncAdminService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
@@ -22,14 +21,11 @@ public class TableConfigService {
 
     private final TableConfigRepository tableConfigRepository;
     private final SyncStateRepository syncStateRepository;
-    private final VectorSyncAdminService vectorSyncAdminService;
 
     public TableConfigService(TableConfigRepository tableConfigRepository,
-                              SyncStateRepository syncStateRepository,
-                              VectorSyncAdminService vectorSyncAdminService) {
+                              SyncStateRepository syncStateRepository) {
         this.tableConfigRepository = tableConfigRepository;
         this.syncStateRepository = syncStateRepository;
-        this.vectorSyncAdminService = vectorSyncAdminService;
     }
 
     public TableConfig registerTable(TableConfig config) {
@@ -169,7 +165,22 @@ public class TableConfigService {
         }
 
         if (deleteEmbeddings) {
-            vectorSyncAdminService.deleteEmbeddingsForTable(entity.get().getTableName());
+            // Refused rather than ignored. Vectors are keyed by (content_hash, model_version,
+            // config_id) and deduplicated across every table, so "delete this table's embeddings"
+            // has no well-defined meaning: the rows backing this table are the same rows backing
+            // any other table whose text hashed identically, and removing them would blank vectors
+            // belonging to datasets unrelated to this one. Because the store is what makes
+            // re-embedding cheap, the damage would only surface as a search returning nothing.
+            //
+            // Retiring a materialization is the supported operation. It withdraws this
+            // configuration's mapping and leaves shared content alone, and its purge flag marks
+            // rows for the reclaim sweeper -- the only component with the global view needed to
+            // decide that content is referenced by nothing.
+            throw new IllegalArgumentException(
+                    "deleteEmbeddings is not supported: vectors are content-addressed and shared "
+                            + "across tables, so deleting them per table would remove other "
+                            + "datasets' vectors. Retire the materialization instead "
+                            + "(POST /api/materializations/{id}/retire).");
         }
 
         syncStateRepository.findById(tableId).ifPresent(syncStateRepository::delete);

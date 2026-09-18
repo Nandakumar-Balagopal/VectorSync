@@ -1,0 +1,50 @@
+VectorSync
+Copyright 2026 Nandakumar B
+
+This product includes software developed by Nandakumar B, licensed under the
+Apache License, Version 2.0 (see LICENSE).
+
+---
+
+Scope of this NOTICE
+--------------------
+
+This NOTICE covers the SOURCE distribution of this repository only. Apart from
+the licence text in LICENSE, every tracked file is original work of the
+copyright holder above: no third-party source is vendored, copied or forked
+into this tree. Dependencies are declared in the Maven poms, in
+embedding-service/requirements.txt and in dashboard/package.json, and are
+fetched at build time, so the source tree carries no third-party attribution
+obligations beyond this file.
+
+Where binary attribution actually lives
+---------------------------------------
+
+The three Java services are packaged by spring-boot-maven-plugin as repackaged
+("fat") jars. Dependency jars are placed under BOOT-INF/lib/ inside that jar,
+each retaining its own META-INF/LICENSE and META-INF/NOTICE. The plugin does
+not aggregate them, so the fat jar's own top-level META-INF contains no combined
+NOTICE. The container images (deployment/Dockerfile.control-plane,
+Dockerfile.worker, Dockerfile.search-service) COPY only that jar out of the
+builder stage, so the same is true inside the images: dependency licences travel
+with the nested jars, not in a top-level aggregate.
+
+Anyone redistributing a binary is responsible for assembling the aggregated
+attribution that Apache-2.0 section 4(d) requires from those nested jars. This
+file deliberately does not enumerate a handful of dependencies: the runtime
+closure includes roughly fifteen non-Apache-licensed artifacts (permissive or
+dual-licensed: MIT, BSD, CDDL/EPL), reached mostly transitively through Hadoop,
+and a partial list would read as a complete one.
+
+Licence review as of this commit
+--------------------------------
+
+The declared dependencies are Apache-2.0 (Iceberg, Hadoop, Parquet, Lucene,
+Spring Boot, Flyway, MapStruct, Jackson, AWS SDK for Java v2), MIT (SLF4J API,
+Lombok, Testcontainers), BSD-2-Clause (PostgreSQL JDBC driver) and EPL-2.0
+(JUnit 5, test scope). Transitives brought in by hadoop-common add BSD
+(protobuf-java, jsch, dnsjava, and re2j under the BSD-style "Go License"),
+Apache-2.0-or-EPL-1.0 (Jetty 9.4) and
+CDDL-1.1-or-GPL-2.0-with-classpath-exception dual licences (javax.servlet-api,
+jersey 1.x, jsp-api) — for which the CDDL option is taken. No dependency is
+offered under GPL, LGPL or AGPL only.

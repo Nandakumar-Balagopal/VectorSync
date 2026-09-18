@@ -35,11 +35,27 @@ public class HttpClientConfig {
         return build(connectTimeoutMs, readTimeoutMs);
     }
 
+    /**
+     * The control-plane client, carrying the worker's credential when authentication is enabled.
+     *
+     * <p>Attached here rather than at each call site because there are thirteen outbound calls
+     * across two clients, and a credential added per-call is a credential that will be forgotten on
+     * the fourteenth. The interceptor is added only when a password is configured, so the
+     * unauthenticated default sends no Authorization header at all rather than an empty one.
+     */
     @Bean(CONTROL_API_CLIENT)
     public RestTemplate controlApiRestTemplate(
             @Value("${control.api.connect-timeout-ms:5000}") long connectTimeoutMs,
-            @Value("${control.api.timeout-ms:15000}") long readTimeoutMs) {
-        return build(connectTimeoutMs, readTimeoutMs);
+            @Value("${control.api.timeout-ms:15000}") long readTimeoutMs,
+            @Value("${vectorsync.auth.worker.username:vectorsync-worker}") String username,
+            @Value("${vectorsync.auth.worker.password:}") String password) {
+        RestTemplate client = build(connectTimeoutMs, readTimeoutMs);
+        if (password != null && !password.isBlank()) {
+            client.getInterceptors().add(
+                    new org.springframework.http.client.support.BasicAuthenticationInterceptor(
+                            username, password));
+        }
+        return client;
     }
 
     private static RestTemplate build(long connectTimeoutMs, long readTimeoutMs) {

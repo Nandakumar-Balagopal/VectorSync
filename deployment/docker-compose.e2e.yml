@@ -18,9 +18,6 @@ services:
   worker:
     container_name: vectorsync-e2e-worker
 
-  search-service:
-    container_name: vectorsync-e2e-search-service
-
   dashboard:
     container_name: vectorsync-e2e-dashboard
 

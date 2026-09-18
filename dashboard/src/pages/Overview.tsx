@@ -37,9 +37,12 @@ export function Overview() {
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    setError(null);
     try {
       const configs = await vectorSyncApi.getTables();
+      // Cleared after the fetch resolves, not before it starts. Clearing first is a setState that
+      // runs synchronously inside the effect, which cascades renders -- and it blanks a real error
+      // before knowing whether the retry works.
+      setError(null);
 
       const withStatus = await Promise.all(configs.map(async config => ({
         config,
